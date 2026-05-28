@@ -21,9 +21,10 @@ diesel = { version = "2.3.4", features = [
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 env_logger = "0.11.8"
 log = "0.4.28"
-reqwest = { version = "0.12.24", features = [
+reqwest = { version = "0.13", features = [
     "json",
-    "rustls-tls",
+    "query",
+    "rustls",
 ], default-features = false }
 diesel-derive-enum = { version = "3.0.0-beta.1", features = [
     "postgres",
@@ -31,10 +32,10 @@ diesel-derive-enum = { version = "3.0.0-beta.1", features = [
 chrono = { version = "0.4.42", features = ["serde"], default-features = false }
 actix = { version = "0.13.5", default-features = false }
 tokio-postgres = "0.7.15"
-diesel-async = { version = "0.7.4", features = ["postgres", "bb8"] }
+diesel-async = { version = "0.9.0", features = ["postgres", "bb8"] }
 futures-util = "0.3.31"
-rustls-platform-verifier = "0.5.0"
-tokio-postgres-rustls = "0.13.0"
+rustls-platform-verifier = "0.7.0"
+tokio-postgres-rustls = "0.14.0"
 tokio = { version = "1.45.0", features = ["macros", "rt", "sync"], default-features = false }
 actix-web-prom = "0.10.0"
 prometheus = "0.14"
@@ -46,17 +47,17 @@ dashmap = "6.1"
 # Distributed tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = "0.27"
-tracing-opentelemetry = "0.28"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.32"
+tracing-opentelemetry = "0.33"
 utoipa = { version = "5", features = ["chrono", "uuid", "actix_extras", "preserve_order"] }
 utoipa-swagger-ui = { version = "9", features = ["actix-web"] }
 mimalloc = "0.1.48"
 
 [dev-dependencies]
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tokio = { version = "1.45.0", features = ["full", "test-util"] }
 actix-rt = "2.10"
 actix-http = "3"

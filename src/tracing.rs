@@ -5,7 +5,7 @@
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Configuration for distributed tracing.
@@ -68,7 +68,7 @@ impl TracingConfig {
 ///
 /// If tracing is disabled, only sets up the log layer.
 /// If tracing is enabled, sets up both logging and OTLP trace export.
-pub fn init_tracing(config: &TracingConfig) -> Option<TracerProvider> {
+pub fn init_tracing(config: &TracingConfig) -> Option<SdkTracerProvider> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
@@ -96,7 +96,7 @@ pub fn init_tracing(config: &TracingConfig) -> Option<TracerProvider> {
 
     // Build the OTLP exporter
     let exporter = match opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
+        .with_http()
         .with_endpoint(endpoint)
         .build()
     {
@@ -113,12 +113,14 @@ pub fn init_tracing(config: &TracingConfig) -> Option<TracerProvider> {
 
     // Build tracer provider with sampling
     let sampler = opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(config.sampling_ratio);
-    let resource = opentelemetry_sdk::Resource::new(vec![KeyValue::new(
-        "service.name",
-        config.service_name.clone(),
-    )]);
-    let tracer_provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_attributes(vec![KeyValue::new(
+            "service.name",
+            config.service_name.clone(),
+        )])
+        .build();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_sampler(sampler)
         .with_resource(resource)
         .build();
@@ -143,7 +145,7 @@ pub fn init_tracing(config: &TracingConfig) -> Option<TracerProvider> {
 }
 
 /// Shutdown the tracer provider gracefully.
-pub fn shutdown_tracing(provider: Option<TracerProvider>) {
+pub fn shutdown_tracing(provider: Option<SdkTracerProvider>) {
     if let Some(provider) = provider
         && let Err(e) = provider.shutdown()
     {

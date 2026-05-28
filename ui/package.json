@@ -9,20 +9,20 @@
   },
   "dependencies": {
     "@solidjs/router": "^0.15.4",
-    "cytoscape": "^3.28.1",
+    "cytoscape": "^3.33.4",
     "cytoscape-dagre": "^2.5.0",
     "dagre": "^0.8.5",
-    "glass-ui-solid": "^0.4.2",
-    "solid-js": "^1.9.0",
+    "glass-ui-solid": "^0.4.6",
+    "solid-js": "^1.9.13",
     "three": "^0.170.0"
   },
   "devDependencies": {
-    "vite": "^6.3.5",
-    "vite-plugin-solid": "^2.11.6",
-    "vite-plugin-singlefile": "^2.0.3",
+    "vite": "^6.4.2",
+    "vite-plugin-solid": "^2.11.12",
+    "vite-plugin-singlefile": "^2.3.3",
     "@types/three": "^0.170.0",
-    "typescript": "^5.7.2",
-    "tailwindcss": "^4.1.8",
-    "@tailwindcss/vite": "^4.1.8"
+    "typescript": "^5.9.3",
+    "tailwindcss": "^4.3.0",
+    "@tailwindcss/vite": "^4.3.0"
   }
 }

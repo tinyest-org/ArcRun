@@ -52,7 +52,8 @@ pub async fn initialize_db_pool(pool_config: &config::PoolConfig) -> DbPool {
 fn establish_connection(config: &'_ str) -> BoxFuture<'_, ConnectionResult<AsyncPgConnection>> {
     let fut = async {
         // We first set up the way we want rustls to work.
-        let rustls_config = ClientConfig::with_platform_verifier();
+        let rustls_config = ClientConfig::with_platform_verifier()
+            .map_err(|e| ConnectionError::BadConnection(e.to_string()))?;
         let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config);
         let (client, conn) = tokio_postgres::connect(config, tls)
             .await

@@ -1,11 +1,9 @@
 import * as THREE from 'three';
 
-// Layout constants
 export const TASK_BOX_SIZE = 0.8;
 export const TASK_SPACING = 1.1;
 export const GROUP_PADDING = 0.5;
 
-// Shared geometries (reused across rebuilds)
 export const taskGeometry = new THREE.BoxGeometry(TASK_BOX_SIZE, TASK_BOX_SIZE, TASK_BOX_SIZE);
 export const arrowGeometry = new THREE.ConeGeometry(0.12, 0.3, 6);
 
@@ -35,7 +33,6 @@ export function createTextSprite(text: string, fontSize: number = 48): THREE.Spr
 
 export function disposeObject(obj: THREE.Object3D): void {
   if (obj instanceof THREE.Mesh) {
-    // Don't dispose shared geometries — they're reused across rebuilds
     if (obj.geometry !== taskGeometry && obj.geometry !== arrowGeometry) {
       obj.geometry.dispose();
     }
