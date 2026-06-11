@@ -141,6 +141,46 @@ pub struct TaskCounters {
     pub wait_success: i32,
 }
 
+/// Drive the webhook delivery loop (outbox) deterministically until it has no
+/// more mature rows to process (or `max_passes` is reached). Returns the total
+/// number of outbox rows delivered across all passes.
+///
+/// Use this in tests after a status transition to deliver end/cancel webhooks,
+/// which are now enqueued into the transactional outbox rather than fired inline.
+pub async fn drain_outbox(state: &AppState) -> usize {
+    drain_outbox_with(state, default_delivery_cfg(), 20).await
+}
+
+/// Default delivery config for tests (high max_attempts, small backoff).
+pub fn default_delivery_cfg() -> arcrun::workers::DeliveryConfig {
+    arcrun::workers::DeliveryConfig {
+        batch_size: 100,
+        max_attempts: 10,
+        backoff_base_secs: 2,
+        backoff_cap_secs: 300,
+    }
+}
+
+/// Like `drain_outbox` but with an explicit `DeliveryConfig` and pass cap.
+pub async fn drain_outbox_with(
+    state: &AppState,
+    cfg: arcrun::workers::DeliveryConfig,
+    max_passes: usize,
+) -> usize {
+    let mut total = 0usize;
+    for _ in 0..max_passes {
+        let mut conn = state.pool.get().await.unwrap();
+        let n = arcrun::workers::run_delivery_once(&state.action_executor, &mut conn, cfg)
+            .await
+            .expect("run_delivery_once should not error");
+        total += n;
+        if n == 0 {
+            break;
+        }
+    }
+    total
+}
+
 /// Read wait_finished and wait_success counters directly from the task table.
 pub async fn read_wait_counters(pool: &arcrun::DbPool, task_id: uuid::Uuid) -> (i32, i32) {
     let mut conn = pool.get().await.unwrap();

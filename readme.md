@@ -12,6 +12,7 @@
 - **Cascading Propagation**: Failures and cancellations automatically propagate through the dependency chain
 - **Concurrency Control**: Limit concurrent task execution per task kind using rules
 - **Webhook Actions**: Execute webhooks on task start, success, failure, or cancellation
+- **At-least-once Webhook Delivery**: End/cancel webhooks use a transactional outbox — committed in the status-change transaction (so the API response reflects durable state), delivered asynchronously with retries and exponential backoff, surviving crashes. `on_start` stays synchronous (control-flow). Inspect deliveries via `GET /webhook-deliveries?status=exhausted`
 - **Task States**: Waiting, Pending, Claimed, Running, Success, Failure, Canceled, Paused
 - **DAG Visualization**: Built-in web UI for visualizing task DAGs with auto-layout
 - **Batch Operations**: Batch stats, stop, and live rule updates
@@ -93,7 +94,10 @@ cargo run --bin server
   - Propagates completions to dependent children
 - **Timeout Loop**: Background loop that:
   - Finds running tasks where `last_updated` exceeds the timeout duration
-  - Marks them as failed, propagates to children, fires on_failure webhooks
+  - Marks them as failed, propagates to children, enqueues on_failure outbox rows
+- **Delivery Loop**: Background loop that drains the webhook outbox:
+  - Selects mature `pending` end/cancel rows (`FOR UPDATE SKIP LOCKED`), gated so `start` is delivered before `end` per task
+  - Delivers via the shared HTTP client; marks `success`, or retries with exponential backoff, or `exhausted` after the max attempts
 - **Batch Updater**: High-throughput counter updates using:
   - `DashMap` for lock-free concurrent access (per-shard locking)
   - Atomic counters (`AtomicI32`) for success/failure counts

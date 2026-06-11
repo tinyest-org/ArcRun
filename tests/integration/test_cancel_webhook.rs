@@ -154,6 +154,9 @@ async fn test_cancel_webhook_fires_after_on_start_registers_cancel_action() {
     )
     .await;
 
+    // The cancel webhook is enqueued into the outbox; drive delivery.
+    drain_outbox(&state).await;
+
     // Give the cancel webhook a moment to fire
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 

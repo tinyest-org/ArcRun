@@ -137,6 +137,12 @@ async fn test_timeout_loop_fires_on_failure_webhook() {
 
     let updated = get_task_ok(&app, task_id).await;
     assert_eq!(updated.status, StatusKind::Failure, "task should be failed");
+
+    // The timeout loop enqueued the on_failure notification into the outbox;
+    // drive the delivery loop to send it.
+    drain_outbox(&state).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     let hit_count = hits.load(Ordering::SeqCst);
     assert_eq!(
         hit_count, 1,

@@ -33,6 +33,11 @@ pub fn test_config() -> Arc<Config> {
             dead_end_cancel_enabled: true,
             start_batch_size: 50,
             webhook_concurrency: 10,
+            webhook_delivery_interval: std::time::Duration::from_millis(1000),
+            webhook_delivery_batch_size: 50,
+            webhook_max_attempts: 10,
+            webhook_retry_backoff_base_secs: 2,
+            webhook_retry_backoff_cap_secs: 300,
         },
         circuit_breaker: arcrun::config::CircuitBreakerConfig {
             enabled: true,

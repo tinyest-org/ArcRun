@@ -95,6 +95,17 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
                 vec![]
             };
 
+            // Enqueue on_failure outbox rows (task + cascade + ancestors) in-tx.
+            crate::workers::enqueue_end_outbox_with_cascade(
+                &task_id,
+                models::StatusKind::Failure,
+                &cascade_failed,
+                conn,
+            )
+            .await?;
+            crate::workers::enqueue_outbox_for_canceled_ancestors(&canceled_ancestors, conn)
+                .await?;
+
             Ok(Some((t, cascade_failed, canceled_ancestors)))
         })
     })

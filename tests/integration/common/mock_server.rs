@@ -61,6 +61,86 @@ pub fn spawn_500_webhook_server() -> (String, tokio::sync::oneshot::Sender<()>) 
     )
 }
 
+/// Spawn a mock webhook server that returns 500 for the first `fail_count` requests
+/// and 200 OK thereafter. `hits` counts every incoming request. Useful for testing
+/// outbox retry-then-succeed behavior.
+pub fn spawn_flaky_webhook_server(
+    hits: Arc<AtomicUsize>,
+    fail_count: usize,
+) -> (String, tokio::sync::oneshot::Sender<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    if let Ok((mut stream, _)) = result {
+                        let hits = hits.clone();
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let _ = stream.read(&mut buf).await;
+                            // 0-indexed request number BEFORE this increment.
+                            let n = hits.fetch_add(1, Ordering::SeqCst);
+                            let response = if n < fail_count {
+                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+                            } else {
+                                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                            };
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+                _ = &mut shutdown_rx => break,
+            }
+        }
+    });
+
+    (format!("http://{}/webhook", addr), shutdown_tx)
+}
+
+/// Spawn a mock webhook server that always returns 200 OK after a fixed delay,
+/// counting incoming requests. Used to assert that the API path stays fast even
+/// when the downstream consumer is slow.
+pub fn spawn_slow_200_webhook_server(
+    hits: Arc<AtomicUsize>,
+    delay: std::time::Duration,
+) -> (String, tokio::sync::oneshot::Sender<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    if let Ok((mut stream, _)) = result {
+                        let hits = hits.clone();
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let _ = stream.read(&mut buf).await;
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(delay).await;
+                            let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+                _ = &mut shutdown_rx => break,
+            }
+        }
+    });
+
+    (format!("http://{}/webhook", addr), shutdown_tx)
+}
+
 /// Spawn a mock webhook server that always returns 302 Found with a redirect Location.
 pub fn spawn_302_redirect_server() -> (String, tokio::sync::oneshot::Sender<()>) {
     spawn_mock_tcp_server(

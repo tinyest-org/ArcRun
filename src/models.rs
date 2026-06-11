@@ -129,21 +129,32 @@ pub enum TriggerCondition {
 }
 
 /// Status of a webhook execution record for idempotency tracking.
-#[derive(Debug, PartialEq, Serialize, diesel_derive_enum::DbEnum, Deserialize, Clone, Copy)]
+#[derive(
+    Debug,
+    PartialEq,
+    Serialize,
+    diesel_derive_enum::DbEnum,
+    Deserialize,
+    Clone,
+    Copy,
+    utoipa::ToSchema,
+)]
 #[db_enum(existing_type_path = "crate::schema::sql_types::WebhookExecutionStatus")]
 pub enum WebhookExecutionStatus {
-    /// Webhook execution claimed but not yet completed.
+    /// Webhook execution claimed but not yet completed (also: outbox row awaiting delivery).
     Pending,
     /// Webhook executed successfully.
     Success,
-    /// Webhook execution failed.
+    /// Webhook execution failed (transient — eligible for retry by the delivery loop).
     Failure,
+    /// Webhook delivery permanently failed after exhausting the max retry attempts.
+    Exhausted,
 }
 
 /// Tracks webhook executions for idempotency. Each trigger event for a task
 /// gets at most one record, keyed by `idempotency_key`.
 /// Note: for Start/Cancel triggers, `condition` is stored as `Success` sentinel.
-#[derive(Identifiable, Queryable, Selectable, Debug, Clone)]
+#[derive(Identifiable, Queryable, QueryableByName, Selectable, Debug, Clone)]
 #[diesel(table_name = crate::schema::webhook_execution)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct WebhookExecution {
@@ -156,6 +167,11 @@ pub struct WebhookExecution {
     pub attempts: i32,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
+    /// When this outbox row becomes eligible for (re)delivery. Defaults to now()
+    /// on insert (mature immediately); bumped forward on each failed attempt.
+    pub next_attempt_at: chrono::DateTime<Utc>,
+    /// Last delivery error message (for diagnostics via GET /webhook-deliveries).
+    pub last_error: Option<String>,
 }
 
 /// Insertable struct for creating a new webhook execution record.

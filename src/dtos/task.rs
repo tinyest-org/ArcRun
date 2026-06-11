@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    models::{Action, ActionKindEnum, StatusKind, Task, TriggerKind},
+    models::{
+        Action, ActionKindEnum, StatusKind, Task, TriggerCondition, TriggerKind, WebhookExecution,
+        WebhookExecutionStatus,
+    },
     rule::{Matcher, Rules},
 };
 
@@ -237,6 +240,53 @@ pub struct TaskDto {
     pub dead_end_barrier: bool,
     /// Scheduling priority. Higher values are processed first.
     pub priority: i32,
+}
+
+/// A webhook delivery (outbox) record, returned by `GET /webhook-deliveries`.
+/// Use this for observability — e.g. listing `exhausted` deliveries that need
+/// manual attention.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct WebhookDeliveryDto {
+    /// Outbox row UUID.
+    pub id: uuid::Uuid,
+    /// The task this notification is for.
+    pub task_id: uuid::Uuid,
+    /// Lifecycle trigger (End or Cancel; Start rows are delivered synchronously).
+    pub trigger: TriggerKind,
+    /// For End triggers, whether this is the success or failure notification.
+    pub condition: TriggerCondition,
+    /// The `Idempotency-Key` header sent to the consumer.
+    pub idempotency_key: String,
+    /// Delivery status: pending, success, failure (transient), or exhausted (gave up).
+    pub status: WebhookExecutionStatus,
+    /// Number of delivery attempts made so far.
+    pub attempts: i32,
+    /// Last delivery error, if any.
+    pub last_error: Option<String>,
+    /// When this row becomes eligible for the next delivery attempt.
+    pub next_attempt_at: chrono::DateTime<Utc>,
+    /// When the outbox row was created (transition time).
+    pub created_at: chrono::DateTime<Utc>,
+    /// When the row was last updated (last attempt / terminal transition).
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+impl From<WebhookExecution> for WebhookDeliveryDto {
+    fn from(w: WebhookExecution) -> Self {
+        Self {
+            id: w.id,
+            task_id: w.task_id,
+            trigger: w.trigger,
+            condition: w.condition,
+            idempotency_key: w.idempotency_key,
+            status: w.status,
+            attempts: w.attempts,
+            last_error: w.last_error,
+            next_attempt_at: w.next_attempt_at,
+            created_at: w.created_at,
+            updated_at: w.updated_at,
+        }
+    }
 }
 
 // =============================================================================

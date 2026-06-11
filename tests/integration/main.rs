@@ -22,6 +22,7 @@ mod test_edge_cases;
 mod test_filtering;
 mod test_health;
 mod test_idempotency;
+mod test_outbox;
 mod test_parallel_webhooks;
 mod test_priority;
 mod test_propagation;

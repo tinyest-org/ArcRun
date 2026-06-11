@@ -185,6 +185,7 @@ struct WorkerHandles {
     timeout: tokio::task::JoinHandle<()>,
     batch: tokio::task::JoinHandle<()>,
     retention: tokio::task::JoinHandle<()>,
+    delivery: tokio::task::JoinHandle<()>,
 }
 
 impl WorkerHandles {
@@ -194,6 +195,7 @@ impl WorkerHandles {
             let _ = self.timeout.await;
             let _ = self.batch.await;
             let _ = self.retention.await;
+            let _ = self.delivery.await;
         })
         .await;
     }
@@ -266,10 +268,27 @@ fn spawn_workers(
         })
     };
 
+    let delivery = {
+        let pool = pool.clone();
+        let executor = action_executor.clone();
+        let interval = config.worker.webhook_delivery_interval;
+        let delivery_cfg = arcrun::workers::DeliveryConfig {
+            batch_size: config.worker.webhook_delivery_batch_size,
+            max_attempts: config.worker.webhook_max_attempts,
+            backoff_base_secs: config.worker.webhook_retry_backoff_base_secs,
+            backoff_cap_secs: config.worker.webhook_retry_backoff_cap_secs,
+        };
+        let shutdown = shutdown_rx.clone();
+        actix_web::rt::spawn(async move {
+            arcrun::workers::delivery_loop(executor, pool, interval, delivery_cfg, shutdown).await;
+        })
+    };
+
     WorkerHandles {
         start,
         timeout,
         batch,
         retention,
+        delivery,
     }
 }

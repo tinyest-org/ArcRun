@@ -36,6 +36,19 @@ Actions are webhook calls triggered by task lifecycle events:
 
 The `on_start` action can return a `NewActionDto` in the response body to register a cancel action for the task.
 
+### Webhook Delivery Contract (transactional outbox — Lot 2)
+
+End and cancel webhooks are **at-least-once notifications** delivered via a transactional outbox (`webhook_execution`), not fired inline in the request/worker call path:
+
+1. **API response = durable state.** When `PATCH /task/{id}` (or cancel/timeout/stop_batch) responds, the status transition, all propagation, AND the outbox rows for the end/cancel notifications are committed in one transaction. No reqwest runs in the call path, so the connection is released immediately (no pool starvation from slow consumers).
+2. **At-least-once delivery.** Every lifecycle notification (end, cancel) is delivered at least once, surviving crash/redeploy (the `pending` outbox row is durable). Consumers dedupe via the `Idempotency-Key` header (= `idempotency_key(task_id, trigger, condition)`).
+3. **Ordering.** No order guaranteed *between* tasks (a parent's `on_success` may arrive after a child's `on_start`). Order guaranteed *per task*: `start` is delivered before `end` (the delivery loop holds an `end`/`cancel` row until the task's `start` row is no longer `pending`).
+4. **`on_start` is control-flow, NOT a notification.** It stays synchronous in `start_loop` (its response can register a cancel action; its failure marks the task Failed). It does **not** go through the outbox.
+
+The delivery loop (`src/workers/delivery_loop.rs`, the 5th worker) drains mature `pending` outbox rows with `FOR UPDATE SKIP LOCKED`, executes the actions, and marks `success` / retries with exponential backoff / `exhausted` after `WEBHOOK_MAX_ATTEMPTS`. End/cancel webhook bodies are enriched with the task's final status + `ended_at` + trigger under a reserved `arcrun` key (merged non-destructively into any custom body). Inspect deliveries via `GET /webhook-deliveries?status=exhausted`.
+
+**Outbox enqueue is unconditional** (a `pending` row is inserted even if the task has no matching action); the delivery loop marks zero-action rows `success` immediately. This keeps the transition transaction minimal (one INSERT, no action lookup). `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` makes re-runs of a transition idempotent.
+
 ### Dependency Propagation
 When a task completes, `propagate_to_children` in `src/workers.rs` handles:
 1. **Success**: Decrements `wait_finished` and `wait_success` counters on children
@@ -43,20 +56,26 @@ When a task completes, `propagate_to_children` in `src/workers.rs` handles:
 3. **Transition to Pending**: When `wait_finished=0` and `wait_success=0`, child becomes `Pending`
 
 ### Worker Loops
-There are two separate loops in `src/workers.rs`:
+There are five background workers (spawned in `src/main.rs::spawn_workers`): `start_loop`, `timeout_loop`, `batch_updater`, `retention_cleanup_loop`, and `delivery_loop`. All share the same `watch::Receiver<bool>` shutdown channel.
 
-**Start Loop** (`start_loop`):
-1. Finds `Pending` tasks (ordered by priority DESC, then created_at ASC)
+**Start Loop** (`start_loop`, `src/workers/start_loop.rs`):
+1. Finds `Pending` tasks (ordered by priority DESC, then created_at ASC) via paginated keyset scan
 2. Checks concurrency rules against running tasks
-3. Claims eligible tasks atomically (Pending → Running)
-4. Executes on_start webhooks
-5. On webhook failure: marks task as Failed, propagates to children, fires on_failure webhooks
+3. Claims eligible tasks atomically (Pending → Claimed → Running)
+4. Executes on_start webhooks **synchronously** (control-flow — its response can register a cancel action; its failure marks the task Failed)
+5. On webhook failure: marks task as Failed, propagates to children, enqueues on_failure outbox rows (in-tx)
 
-**Timeout Loop** (`timeout_loop`):
+**Timeout Loop** (`timeout_loop`, `src/workers/timeout_loop.rs`):
 1. Finds `Running` tasks where `last_updated < now - timeout` (in seconds)
 2. Marks them as `Failure` with reason "Timeout"
 3. Propagates failure to dependent children
-4. Fires on_failure webhooks
+4. Enqueues on_failure outbox rows (in the same transaction)
+
+**Delivery Loop** (`delivery_loop`, `src/workers/delivery_loop.rs`) — the webhook outbox drainer:
+1. Selects mature `pending` end/cancel outbox rows (`next_attempt_at <= now()`) with `FOR UPDATE SKIP LOCKED`, gated so an `end`/`cancel` row waits until the task's `start` row is no longer `pending` (per-task ordering)
+2. Loads the task + its actions for the trigger/condition and executes them (enriched payload)
+3. Success ⇒ `status='success'`; failure ⇒ `attempts+1`, `last_error`, `next_attempt_at = now() + backoff`; after `WEBHOOK_MAX_ATTEMPTS` ⇒ `status='exhausted'` + metric
+4. Exposed as `run_delivery_once` for deterministic test driving
 
 **Important**: The timeout is based on `last_updated`, NOT `started_at`. This means batch counter updates (via `PUT /task/{id}`) reset the timeout clock, preventing active tasks from being incorrectly timed out.
 
@@ -78,6 +97,7 @@ All HTTP handler functions and route configuration:
 - `batch_task_updater` - PUT /task/{task_id} (high-throughput counter updates)
 - `cancel_task` - DELETE /task/{task_id}
 - `pause_task` - PATCH /task/pause/{task_id}
+- `list_webhook_deliveries` - GET /webhook-deliveries (outbox observability; `?status=exhausted`, paginated)
 - `get_dag` - GET /dag/{batch_id}
 - `view_dag_page` - GET /view (serves static HTML)
 
@@ -193,8 +213,11 @@ Uses testcontainers for PostgreSQL. Split into focused test files with shared he
 - `test_batch_update.rs` — Batch counter updates (3 tests)
 - `test_bug_audit1.rs` — Bug regressions: bugs #1-4, #8 (9 tests)
 - `test_bug_audit2.rs` — Bug regressions: bugs #9-11, #16, #18-19 (8 tests)
-- `test_regressions.rs` — Regression tests: on_start failure, timeout+webhook, batch keepalive timeout, pagination overflow (4 tests)
+- `test_regressions.rs` — Regression tests: on_start failure, timeout+webhook, batch keepalive timeout, pagination overflow (5 tests)
 - `test_priority.rs` — Priority scheduling (6 tests)
+- `test_outbox.rs` — Webhook transactional outbox (Lot 2): crash-window delivery, retry-then-success, no double delivery, start-before-end ordering, exhausted + `/webhook-deliveries`, fast PATCH under slow downstream (6 tests)
+
+(Test files live in `tests/integration/`, declared in `tests/integration/main.rs`; shared helpers in `tests/integration/common/`. The list above is indicative, not exhaustive — also present: `test_claim_loop`, `test_cancel_webhook`, `test_idempotency`, `test_parallel_webhooks`, `test_stop_batch`, `test_dead_end_cancel`, `test_batch_rules`, `test_batch_stats`, `test_propagation_edge`, `test_requeue_stale`, `test_validation_e2e`, `test_webhook_flows`.)
 
 ### Manual Testing (`test/test.ts`)
 Bun script for manual API testing:
@@ -256,8 +279,13 @@ task (id, name, kind, status, metadata, timeout, batch_id, start_condition,
       created_at, started_at, ended_at, last_updated, priority)
 action (id, task_id, kind, trigger, condition, params, success)
 link (parent_id, child_id, requires_success)
-webhook_execution (id, task_id, trigger, condition, idempotency_key, status,
-                   attempts, created_at, updated_at)
+webhook_execution (id, task_id, trigger, condition, idempotency_key,
+                   status, attempts, created_at, updated_at,
+                   next_attempt_at, last_error)
+  -- status: pending | success | failure | exhausted
+  -- doubles as the transactional outbox for end/cancel webhooks (Lot 2):
+  --   next_attempt_at = when the row is eligible for (re)delivery (DEFAULT now())
+  --   last_error      = last delivery error (diagnostics)
 
 -- FK constraints (relevant for cleanup ordering)
 action.task_id -> task.id
@@ -272,6 +300,7 @@ link_parent_id_idx ON link(parent_id)
 link_child_id_idx ON link(child_id)
 idx_webhook_execution_task_id ON webhook_execution(task_id)
 idx_webhook_execution_status ON webhook_execution(status)
+idx_webhook_execution_pending_due ON webhook_execution(next_attempt_at) WHERE status = 'pending'
 idx_task_priority ON task(status, priority DESC, created_at ASC)
 ```
 
@@ -283,6 +312,7 @@ Prometheus metrics in `src/metrics.rs`:
 - Concurrency blocks
 - Worker loop duration, iterations, tasks processed per loop
 - Webhook executions and duration
+- Webhook outbox delivery: retries, exhausted, delivery lag (now - created_at at delivery time)
 - Task execution duration and wait time
 - Dependency propagations, unblocked tasks
 - Batch update failures, DB save failures
@@ -308,6 +338,11 @@ All configuration is via environment variables (loaded in `src/config.rs`):
 - `WORKER_LOOP_INTERVAL_MS` (default: 1000) - Worker loop interval
 - `WORKER_START_BATCH_SIZE` (default: 50) - Max claims per start_loop iteration (claim cap). The Pending backlog is scanned page-by-page via keyset pagination (internal page size ~500) so the full backlog stays visible; only the number of claims per iteration is capped, never visibility. Early stop only fires once this cap is reached.
 - `WORKER_WEBHOOK_CONCURRENCY` (default: 10) - Max concurrent on_start webhook executions (should not exceed `POOL_MAX_SIZE`)
+- `WEBHOOK_DELIVERY_INTERVAL_MS` (default: 1000) - Interval between webhook delivery-loop iterations (outbox drain)
+- `WEBHOOK_DELIVERY_BATCH_SIZE` (default: 50) - Max outbox rows claimed per delivery-loop iteration
+- `WEBHOOK_MAX_ATTEMPTS` (default: 10) - Delivery attempts before an outbox row is marked `exhausted`
+- `WEBHOOK_RETRY_BACKOFF_BASE_SECS` (default: 2) - Base of the exponential retry backoff (delay = base^attempt, capped)
+- `WEBHOOK_RETRY_BACKOFF_CAP_SECS` (default: 300) - Cap on the retry backoff delay
 - `BATCH_CHANNEL_CAPACITY` (default: 100) - Batch update channel size
 - `CIRCUIT_BREAKER_ENABLED` (default: 1) - Enable circuit breaker
 - `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default: 5) - Failures before opening

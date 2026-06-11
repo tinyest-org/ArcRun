@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use utoipa::IntoParams;
 
-use crate::{config::Config, models::StatusKind};
+use crate::{
+    config::Config,
+    models::{StatusKind, WebhookExecutionStatus},
+};
 
 /// Resolved pagination parameters ready for DB queries.
 pub struct Pagination {
@@ -73,6 +76,34 @@ pub struct Filter {
     pub status: Option<StatusKind>,
     pub timeout: Option<i32>,
     pub batch_id: Option<uuid::Uuid>,
+}
+
+/// Filter parameters for `GET /webhook-deliveries`.
+#[derive(Debug, Serialize, Deserialize, Default, IntoParams)]
+pub struct WebhookDeliveryFilterDto {
+    /// Filter by delivery status (case-insensitive). One of: `pending`, `success`,
+    /// `failure`, `exhausted`. Example: `?status=exhausted`.
+    pub status: Option<String>,
+}
+
+impl WebhookDeliveryFilterDto {
+    /// Parse the optional `status` string (case-insensitive) into the enum.
+    /// Returns `Ok(None)` when no filter is supplied, `Err` on an unknown value.
+    pub fn resolve_status(&self) -> Result<Option<WebhookExecutionStatus>, String> {
+        match self.status.as_deref() {
+            None => Ok(None),
+            Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "pending" => Ok(Some(WebhookExecutionStatus::Pending)),
+                "success" => Ok(Some(WebhookExecutionStatus::Success)),
+                "failure" => Ok(Some(WebhookExecutionStatus::Failure)),
+                "exhausted" => Ok(Some(WebhookExecutionStatus::Exhausted)),
+                other => Err(format!(
+                    "invalid status '{}': expected one of pending, success, failure, exhausted",
+                    other
+                )),
+            },
+        }
+    }
 }
 
 impl FilterDto {

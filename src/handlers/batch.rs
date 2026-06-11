@@ -1,7 +1,7 @@
 use actix_web::{HttpResponse, web};
 use uuid::Uuid;
 
-use crate::{db_operation, dtos, error::ApiError, metrics, validation, workers};
+use crate::{db_operation, dtos, error::ApiError, metrics, validation};
 
 use super::AppState;
 use super::response::validation_error_response;
@@ -34,19 +34,8 @@ pub async fn stop_batch(
         .await
         .map_err(ApiError::from)?;
 
-    // Fire cancel webhooks for formerly-Running tasks (best-effort)
-    for task_id in &result.canceled_running_ids {
-        if let Err(e) =
-            workers::fire_cancel_webhooks(&state.action_executor, task_id, &mut conn).await
-        {
-            log::error!(
-                "stop_batch: failed to fire cancel webhooks for task {}: {:?}",
-                task_id,
-                e
-            );
-        }
-    }
-
+    // Cancel webhooks for formerly-Running tasks were enqueued into the outbox
+    // inside the stop_batch transaction; the delivery loop delivers them async.
     let canceled_running = result.canceled_running_ids.len() as i64;
 
     // Record metrics for each canceled task

@@ -8,6 +8,7 @@ mod dag;
 mod health;
 pub mod response;
 mod task;
+mod webhook;
 
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ pub use health::{favicon, health_check, readiness_check};
 pub use task::{
     add_task, batch_task_updater, cancel_task, get_task, list_task, pause_task, update_task,
 };
+pub use webhook::list_webhook_deliveries;
 
 /// Shared application state
 #[derive(Clone)]
@@ -145,6 +147,7 @@ pub async fn get_conn_with_retry<'a>(
         batch::stop_batch,
         batch::update_batch_rules,
         batch::list_batches,
+        webhook::list_webhook_deliveries,
         dag::get_dag,
         dag::view_dag_page,
     ),
@@ -165,7 +168,9 @@ pub async fn get_conn_with_retry<'a>(
         dtos::BatchSummaryDto,
         dtos::BatchStatsDto,
         dtos::BatchStatusCounts,
+        dtos::WebhookDeliveryDto,
         crate::models::StatusKind,
+        crate::models::WebhookExecutionStatus,
         crate::models::ActionKindEnum,
         crate::models::TriggerKind,
         crate::models::TriggerCondition,
@@ -181,6 +186,7 @@ pub async fn get_conn_with_retry<'a>(
         (name = "health", description = "Health and readiness probes. Use GET /health for liveness and GET /ready for readiness."),
         (name = "tasks", description = "Task CRUD and lifecycle management. Tasks are created in batches via POST /task, forming a DAG. The worker loop picks up Pending tasks and calls their on_start webhook. External systems report completion via PATCH or PUT on /task/{task_id}."),
         (name = "batches", description = "Batch discovery. List all batches with aggregated task statistics, supporting filtering and pagination."),
+        (name = "webhooks", description = "Webhook delivery observability. Inspect the transactional outbox of end/cancel webhook notifications, filtered by status (e.g. exhausted deliveries)."),
         (name = "dag", description = "DAG visualization. Retrieve the full graph (tasks + dependency links) for a batch, or render the built-in HTML viewer."),
     ),
     info(
@@ -214,6 +220,10 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             web::patch().to(update_batch_rules),
         )
         .route("/batches", web::get().to(list_batches))
+        .route(
+            "/webhook-deliveries",
+            web::get().to(list_webhook_deliveries),
+        )
         .route("/dag/{batch_id}", web::get().to(get_dag))
         .route("/view", web::get().to(view_dag_page))
         .route("/icon.png", web::get().to(favicon))

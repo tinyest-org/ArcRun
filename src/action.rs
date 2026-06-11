@@ -89,6 +89,49 @@ pub fn idempotency_key(
     }
 }
 
+/// Extra fields merged into the webhook request body for end/cancel notifications,
+/// so the consumer learns the task's final state without a follow-up GET.
+///
+/// Merge strategy (backwards compatible): the fields below are injected into the
+/// JSON body under a reserved top-level object key `arcrun`. If the action defines
+/// a custom `body` object, we add the `arcrun` key alongside the existing fields
+/// (existing keys are never overwritten — only a pre-existing `arcrun` key would be
+/// replaced). If there is no custom body, the request body is `{"arcrun": {...}}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebhookEnrichment {
+    /// Final task status at the moment of the transition (e.g. "Success", "Failure", "Canceled").
+    pub status: crate::models::StatusKind,
+    /// When the task reached its terminal state.
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The lifecycle trigger that produced this notification ("end" or "cancel").
+    pub trigger: String,
+}
+
+/// Merge the optional [`WebhookEnrichment`] into a webhook body.
+///
+/// - No enrichment: returns the original body unchanged.
+/// - Body is a JSON object: inserts an `arcrun` key holding the enrichment (any
+///   pre-existing keys are preserved; only a prior `arcrun` key is overwritten).
+/// - Body is absent or not an object: returns `{"arcrun": {...}}` (when the body is
+///   a non-object value we wrap it under `body` to avoid losing it).
+fn merge_enrichment(
+    body: Option<serde_json::Value>,
+    enrichment: Option<&WebhookEnrichment>,
+) -> Option<serde_json::Value> {
+    let Some(enrichment) = enrichment else {
+        return body;
+    };
+    let enrichment_val = serde_json::to_value(enrichment).unwrap_or(serde_json::Value::Null);
+    match body {
+        Some(serde_json::Value::Object(mut map)) => {
+            map.insert("arcrun".to_string(), enrichment_val);
+            Some(serde_json::Value::Object(map))
+        }
+        Some(other) => Some(serde_json::json!({ "arcrun": enrichment_val, "body": other })),
+        None => Some(serde_json::json!({ "arcrun": enrichment_val })),
+    }
+}
+
 #[derive(Clone)]
 pub struct ActionContext {
     pub host_address: String,
@@ -120,6 +163,21 @@ impl ActionExecutor {
         task: &Task,
         idem_key: Option<&str>,
     ) -> Result<Option<NewActionDto>, String> {
+        self.execute_with_enrichment(action, task, idem_key, None)
+            .await
+    }
+
+    /// Like [`execute`], but optionally merges [`WebhookEnrichment`] (final task
+    /// status + ended_at + trigger) into the request body under the `arcrun` key.
+    /// Used by the delivery loop for end/cancel notifications.
+    #[tracing::instrument(name = "webhook_execute", level = "debug", skip(self, action, task, enrichment), fields(task_id = %task.id, action_id = %action.id))]
+    pub async fn execute_with_enrichment(
+        &self,
+        action: &Action,
+        task: &Task,
+        idem_key: Option<&str>,
+        enrichment: Option<&WebhookEnrichment>,
+    ) -> Result<Option<NewActionDto>, String> {
         match action.kind {
             ActionKindEnum::Webhook => {
                 let my_address = &self.ctx.host_address;
@@ -135,7 +193,10 @@ impl ActionExecutor {
                 let mut request = self.client.request(params.verb.into(), &url);
                 // enable the runner to send update of the task
                 request = request.query(&[("handle", format!("{}/task/{}", my_address, &task.id))]);
-                if let Some(body) = params.body {
+                // Merge the optional enrichment object into the body (backwards
+                // compatible: added under the reserved `arcrun` key).
+                let body = merge_enrichment(params.body, enrichment);
+                if let Some(body) = body {
                     request = request.json(&body);
                 }
                 if let Some(headers) = params.headers {

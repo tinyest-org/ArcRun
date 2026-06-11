@@ -202,6 +202,29 @@ register_int_counter!(
 );
 
 // ============================================================================
+// Webhook Outbox / Delivery Metrics (Lot 2)
+// ============================================================================
+
+register_int_counter_vec!(
+    WEBHOOK_DELIVERY_RETRIES,
+    "webhook_delivery_retries_total",
+    "Number of outbox webhook delivery attempts that failed and were rescheduled",
+    &["trigger"]
+);
+register_int_counter_vec!(
+    WEBHOOK_DELIVERY_EXHAUSTED,
+    "webhook_delivery_exhausted_total",
+    "Number of outbox webhook deliveries that exhausted all retry attempts",
+    &["trigger"]
+);
+register_histogram!(
+    WEBHOOK_DELIVERY_LAG_SECONDS,
+    "webhook_delivery_lag_seconds",
+    "Lag between outbox row creation and successful delivery, in seconds",
+    vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0]
+);
+
+// ============================================================================
 // Concurrency Metrics
 // ============================================================================
 
@@ -383,6 +406,20 @@ pub fn record_webhook_idempotent_conflict() {
     WEBHOOK_IDEMPOTENT_CONFLICTS.inc();
 }
 
+pub fn record_webhook_delivery_retry(trigger: &str) {
+    WEBHOOK_DELIVERY_RETRIES.with_label_values(&[trigger]).inc();
+}
+
+pub fn record_webhook_delivery_exhausted(trigger: &str) {
+    WEBHOOK_DELIVERY_EXHAUSTED
+        .with_label_values(&[trigger])
+        .inc();
+}
+
+pub fn record_webhook_delivery_lag(lag_secs: f64) {
+    WEBHOOK_DELIVERY_LAG_SECONDS.observe(lag_secs);
+}
+
 pub fn record_webhook_execution(trigger: &str, outcome: &str, duration_secs: f64) {
     WEBHOOK_EXECUTIONS
         .with_label_values(&[trigger, outcome])
@@ -507,6 +544,9 @@ pub fn init_metrics() {
     let _ = &*WEBHOOK_EXECUTIONS;
     let _ = &*WEBHOOK_DURATION_SECONDS;
     let _ = &*WEBHOOK_IDEMPOTENT_SKIPS;
+    let _ = &*WEBHOOK_DELIVERY_RETRIES;
+    let _ = &*WEBHOOK_DELIVERY_EXHAUSTED;
+    let _ = &*WEBHOOK_DELIVERY_LAG_SECONDS;
     let _ = &*TASKS_BLOCKED_BY_CONCURRENCY;
     let _ = &*TASK_DURATION_SECONDS;
     let _ = &*TASK_WAIT_SECONDS;

@@ -38,8 +38,11 @@ async fn test_on_success_webhook_fires() {
     let created = create_tasks_ok(&app, &[task_payload]).await;
     let task_id = created[0].id;
 
-    // Complete the task as Success (claim -> running -> success)
+    // Complete the task as Success (claim -> running -> success). The on_success
+    // webhook is now enqueued into the transactional outbox; drive the delivery
+    // loop to deliver it.
     succeed_task(&state, task_id).await;
+    drain_outbox(&state).await;
 
     // Give webhook a moment to fire
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -81,8 +84,10 @@ async fn test_on_failure_webhook_fires_on_explicit_failure() {
     let created = create_tasks_ok(&app, &[task_payload]).await;
     let task_id = created[0].id;
 
-    // Mark task as Failure via claim_and_complete
+    // Mark task as Failure via claim_and_complete, then drain the outbox so the
+    // on_failure notification is delivered.
     fail_task(&state, task_id, "explicit test failure").await;
+    drain_outbox(&state).await;
 
     // Give webhook a moment to fire
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

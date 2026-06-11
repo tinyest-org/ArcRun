@@ -99,6 +99,21 @@ pub struct WorkerConfig {
 
     /// Maximum number of concurrent webhook executions in start_loop
     pub webhook_concurrency: usize,
+
+    /// Interval between webhook delivery-loop iterations (outbox drain)
+    pub webhook_delivery_interval: Duration,
+
+    /// Max outbox rows claimed per delivery-loop iteration
+    pub webhook_delivery_batch_size: i64,
+
+    /// Max delivery attempts before an outbox row is marked `exhausted`
+    pub webhook_max_attempts: i32,
+
+    /// Base of the exponential retry backoff, in seconds (delay = base^attempts)
+    pub webhook_retry_backoff_base_secs: i64,
+
+    /// Cap on the retry backoff delay, in seconds
+    pub webhook_retry_backoff_cap_secs: i64,
 }
 
 /// Circuit breaker configuration for connection pool resilience.
@@ -203,6 +218,11 @@ impl Default for WorkerConfig {
             dead_end_cancel_enabled: true,
             start_batch_size: 50,
             webhook_concurrency: 10,
+            webhook_delivery_interval: Duration::from_millis(1000),
+            webhook_delivery_batch_size: 50,
+            webhook_max_attempts: 10,
+            webhook_retry_backoff_base_secs: 2,
+            webhook_retry_backoff_cap_secs: 300,
         }
     }
 }
@@ -347,6 +367,14 @@ impl Config {
             dead_end_cancel_enabled: parse_env_or("DEAD_END_CANCEL_ENABLED", 1)? != 0,
             start_batch_size: parse_env_or("WORKER_START_BATCH_SIZE", 50)?,
             webhook_concurrency: parse_env_or("WORKER_WEBHOOK_CONCURRENCY", 10)?,
+            webhook_delivery_interval: Duration::from_millis(parse_env_or(
+                "WEBHOOK_DELIVERY_INTERVAL_MS",
+                1000,
+            )?),
+            webhook_delivery_batch_size: parse_env_or("WEBHOOK_DELIVERY_BATCH_SIZE", 50)?,
+            webhook_max_attempts: parse_env_or("WEBHOOK_MAX_ATTEMPTS", 10)?,
+            webhook_retry_backoff_base_secs: parse_env_or("WEBHOOK_RETRY_BACKOFF_BASE_SECS", 2)?,
+            webhook_retry_backoff_cap_secs: parse_env_or("WEBHOOK_RETRY_BACKOFF_CAP_SECS", 300)?,
             ..Default::default()
         };
 
@@ -483,6 +511,34 @@ impl Config {
             return Err(ConfigError {
                 field: "WORKER_WEBHOOK_CONCURRENCY".to_string(),
                 message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        if self.worker.webhook_delivery_batch_size <= 0 {
+            return Err(ConfigError {
+                field: "WEBHOOK_DELIVERY_BATCH_SIZE".to_string(),
+                message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        if self.worker.webhook_max_attempts <= 0 {
+            return Err(ConfigError {
+                field: "WEBHOOK_MAX_ATTEMPTS".to_string(),
+                message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        if self.worker.webhook_retry_backoff_base_secs < 1 {
+            return Err(ConfigError {
+                field: "WEBHOOK_RETRY_BACKOFF_BASE_SECS".to_string(),
+                message: "Must be greater than or equal to 1".to_string(),
+            });
+        }
+
+        if self.worker.webhook_retry_backoff_cap_secs < 1 {
+            return Err(ConfigError {
+                field: "WEBHOOK_RETRY_BACKOFF_CAP_SECS".to_string(),
+                message: "Must be greater than or equal to 1".to_string(),
             });
         }
 

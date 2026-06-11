@@ -101,7 +101,21 @@ rules apparaît en pratique (elles ne sont pas cachables dans `ko`, cf. commenta
 
 ---
 
-## Lot 2 — Outbox transactionnel — TODO (après Lot 1)
+## Lot 2 — Outbox transactionnel — ✅ FAIT (2026-06-11)
+
+Validation : 162 tests d'intégration (156 + 6 nouveaux dans `test_outbox.rs`) + 30
+unitaires verts, vérifiés indépendamment de l'agent d'implémentation. Décisions prises
+à l'implémentation : enqueue inconditionnel (la boucle marque `success` les lignes sans
+action) ; `next_attempt_at NOT NULL DEFAULT now()` ; payload enrichi sous une clé
+réservée `arcrun` (merge non destructif dans un body custom) ; la boucle de livraison
+ne traite que les triggers `end`/`cancel` (les `start` restent synchrones).
+
+Suivi noté en relecture (non bloquant) : `run_delivery_once` exécute tout le batch
+(appels HTTP compris) dans UNE transaction qui tient les locks `FOR UPDATE` — livraison
+séquentielle, 1 connexion tenue pendant tout le batch, et une erreur DB en cours de
+batch rollback les marks `success` déjà posés (⇒ relivraison, acceptable en
+at-least-once). Si le débit de livraison devient un goulot : claim court (marquage
+in-flight) puis livraison hors-tx en parallèle.
 
 Transforme `webhook_execution` (déjà : `idempotency_key UNIQUE`, `status`, `attempts`)
 en transactional outbox. Résout : pool starvation par webhooks lents dans le chemin HTTP

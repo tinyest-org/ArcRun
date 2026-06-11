@@ -1,17 +1,16 @@
-use crate::{DbPool, action::ActionExecutor, db_operation, metrics, models::StatusKind};
+use crate::{DbPool, action::ActionExecutor, db_operation, metrics};
 use actix_web::rt;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use super::webhooks::{fire_end_webhooks_with_cascade, fire_webhooks_for_canceled_ancestors};
-
 /// Background loop that detects timed-out Running tasks and failed stale claims.
 ///
-/// For each timed-out task, the mark-failed + child propagation runs inside a
-/// single transaction so a crash between the two cannot leave children stuck in
-/// Waiting. Webhooks are fired best-effort after the transaction commits.
+/// For each timed-out task, the mark-failed + child propagation + outbox enqueue
+/// runs inside a single transaction so a crash between them cannot leave children
+/// stuck in Waiting or lose the on_failure notification. Webhooks themselves are
+/// delivered async by the delivery loop (Lot 2).
 pub async fn timeout_loop(
-    evaluator: Arc<ActionExecutor>,
+    _evaluator: Arc<ActionExecutor>,
     pool: DbPool,
     interval: std::time::Duration,
     claim_timeout: std::time::Duration,
@@ -73,26 +72,12 @@ pub async fn timeout_loop(
                         .await;
 
                 match result {
-                    Ok(Some((failed_task, cascade_failed, canceled_ancestors))) => {
+                    Ok(Some((_failed_task, _cascade_failed, _canceled_ancestors))) => {
                         metrics::record_task_timeout();
                         metrics::record_status_transition("Running", "Failure");
-
-                        // Best-effort webhooks (outside transaction)
-                        fire_end_webhooks_with_cascade(
-                            evaluator.as_ref(),
-                            &failed_task.id,
-                            StatusKind::Failure,
-                            &cascade_failed,
-                            &mut conn,
-                        )
-                        .await;
-
-                        fire_webhooks_for_canceled_ancestors(
-                            evaluator.as_ref(),
-                            &canceled_ancestors,
-                            &mut conn,
-                        )
-                        .await;
+                        // on_failure notifications (task + cascade + dead-end
+                        // ancestors) were enqueued into the outbox inside the
+                        // transaction; the delivery loop sends them async.
                     }
                     Ok(None) => {
                         // Task already transitioned concurrently, nothing to do
