@@ -1,6 +1,5 @@
-use crate::{DbPool, action::ActionExecutor, db_operation, metrics};
+use crate::{DbPool, db_operation, metrics};
 use actix_web::rt;
-use std::sync::Arc;
 use tokio::sync::watch;
 
 /// Background loop that detects timed-out Running tasks and failed stale claims.
@@ -10,7 +9,6 @@ use tokio::sync::watch;
 /// stuck in Waiting or lose the on_failure notification. Webhooks themselves are
 /// delivered async by the delivery loop (Lot 2).
 pub async fn timeout_loop(
-    _evaluator: Arc<ActionExecutor>,
     pool: DbPool,
     interval: std::time::Duration,
     claim_timeout: std::time::Duration,

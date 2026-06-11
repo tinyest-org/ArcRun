@@ -41,10 +41,10 @@ pub use cleanup::cleanup_old_terminal_tasks;
 
 // Re-exports from webhook_execution
 pub use webhook_execution::{
-    BatchCompletionStats, batch_completion_stats, claim_due_outbox, enqueue_batch_complete_outbox,
-    enqueue_outbox, insert_batch, list_webhook_deliveries, load_batch_on_complete,
-    mark_outbox_exhausted, mark_outbox_retry, mark_outbox_success, maybe_enqueue_batch_complete,
-    maybe_enqueue_batch_complete_for_task,
+    BatchCompletionStats, batch_completion_stats, claim_due_outbox, claim_due_outbox_leased,
+    enqueue_batch_complete_outbox, enqueue_outbox, insert_batch, list_webhook_deliveries,
+    load_batch_on_complete, mark_outbox_exhausted, mark_outbox_retry, mark_outbox_success,
+    maybe_enqueue_batch_complete, maybe_enqueue_batch_complete_for_task,
 };
 pub use webhook_execution::{complete_webhook_execution, try_claim_webhook_execution};
 

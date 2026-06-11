@@ -44,7 +44,7 @@ The `on_start` action can return a `NewActionDto` in the response body to regist
 `on_batch_complete` registers a batch-level webhook fired exactly once (at-least-once via the outbox) when the **last** task of the batch becomes terminal. A `batch` row is created only when the field is provided (batches without it cost nothing). SSRF/param validation runs on the batch-level actions like any other action. Tasks are inserted in **grouped multi-row INSERTs** (Lot 3a): contiguous runs of tasks *without* a `dedupe_strategy` are flushed in one `task` / `link` / `action` INSERT each; UUIDs are app-generated (`Uuid::new_v4()`) so the full `id_mapping` is known before any insert. A task carrying a `dedupe_strategy` ends the current run (the run is flushed first so the dedupe check can match tasks inserted earlier in the same batch) — same guard philosophy as the Lot 1 batch-claim.
 
 ### Batch-complete detection (`BatchComplete` trigger — Lot 3b)
-When any task of a batch reaches a terminal state, the transition transaction calls `maybe_enqueue_batch_complete[_for_task]` (`src/db/webhook_execution.rs`): if a `batch` row exists AND `NOT EXISTS (task WHERE batch_id = $1 AND status NOT IN (terminal))`, it enqueues one outbox row keyed `batch:<batch_id>:complete`. The unique idempotency key + `ON CONFLICT DO NOTHING` make concurrent detection inoffensive (a single row even if two tasks finish "at once"). The check is centralised in ONE helper, called from every terminal site: `update_running_task`, `fail_task_and_propagate`, `stop_batch` (`task_lifecycle.rs`), `timeout_task_and_propagate` (`task_query.rs`), `cancel_task` (`propagation.rs`), and `add_task` (for the vacuously-complete empty / all-dedupe-skipped batch). The delivery loop (`delivery_loop.rs::deliver_batch_complete_row`) loads `batch.on_complete`, executes each action **without** a `?handle=`, with an `arcrun` body enrichment `{batch_id, counts:{success,failure,canceled}, completed_at}` (counts / `completed_at = max(ended_at)` computed at delivery time). Retry/backoff/exhausted are identical to task-level rows. Retention (`src/db/cleanup.rs`) also deletes orphaned `batch` rows (and their batch-level `webhook_execution` rows) once their tasks are gone.
+When any task of a batch reaches a terminal state, the transition transaction calls `maybe_enqueue_batch_complete[_for_task]` (`src/db/webhook_execution.rs`): if a `batch` row exists AND `NOT EXISTS (task WHERE batch_id = $1 AND status NOT IN (terminal))`, it enqueues one outbox row keyed `batch:<batch_id>:complete`. The unique idempotency key + `ON CONFLICT DO NOTHING` make concurrent detection inoffensive (a single row even if two tasks finish "at once"). The check is centralised in ONE helper, called from every terminal site: `update_running_task`, `fail_task_and_propagate`, `stop_batch` (`task_lifecycle.rs`), `timeout_task_and_propagate` (`task_query.rs`), `cancel_task` (`propagation.rs`), and `add_task` (for the vacuously-complete empty / all-dedupe-skipped batch). The delivery loop (`delivery_loop.rs`: `prepare_batch_complete_row` prefetch + `deliver_plan`) loads `batch.on_complete`, executes each action **without** a `?handle=`, with an `arcrun` body enrichment `{batch_id, counts:{success,failure,canceled}, completed_at}` (counts / `completed_at = max(ended_at)` computed at delivery time). Retry/backoff/exhausted are identical to task-level rows. Retention (`src/db/cleanup.rs`) also deletes orphaned `batch` rows (and their batch-level `webhook_execution` rows) once their tasks are gone.
 
 ### Webhook Delivery Contract (transactional outbox — Lot 2)
 
@@ -81,11 +81,13 @@ There are five background workers (spawned in `src/main.rs::spawn_workers`): `st
 3. Propagates failure to dependent children
 4. Enqueues on_failure outbox rows (in the same transaction)
 
-**Delivery Loop** (`delivery_loop`, `src/workers/delivery_loop.rs`) — the webhook outbox drainer:
-1. Selects mature `pending` end/cancel outbox rows (`next_attempt_at <= now()`) with `FOR UPDATE SKIP LOCKED`, gated so an `end`/`cancel` row waits until the task's `start` row is no longer `pending` (per-task ordering)
-2. Loads the task + its actions for the trigger/condition and executes them (enriched payload)
-3. Success ⇒ `status='success'`; failure ⇒ `attempts+1`, `last_error`, `next_attempt_at = now() + backoff`; after `WEBHOOK_MAX_ATTEMPTS` ⇒ `status='exhausted'` + metric
-4. Exposed as `run_delivery_once` for deterministic test driving
+**Delivery Loop** (`delivery_loop`, `src/workers/delivery_loop.rs`) — the webhook outbox drainer. `run_delivery_once` runs in **four phases** instead of one long transaction (so HTTP never holds a lock or a connection, and deliveries within a batch run in parallel):
+1. **Claim (short tx, lease).** `claim_due_outbox_leased` selects mature `pending` end/cancel/batch_complete rows (`next_attempt_at <= now()`, `FOR UPDATE SKIP LOCKED`, gated so an `end`/`cancel` row waits until the task's `start` row is no longer `pending` — per-task ordering) AND pushes their `next_attempt_at = now() + WEBHOOK_DELIVERY_LEASE_SECS` in one `UPDATE … FROM (SELECT … FOR UPDATE SKIP LOCKED) … RETURNING` statement, then commits. The **lease** is a soft lock: a concurrent worker / next iteration won't re-claim a leased row; on crash mid-delivery the lease expires and the row matures again (at-least-once). The lease does **not** bump `attempts`.
+2. **Prefetch (autocommit reads).** For each row, load its delivery inputs (task + actions, or `batch.on_complete` + stats — terminal state is immutable, so the reads are stable). Fast-paths resolved here: task/batch gone ⇒ mark `success`; malformed batch payload ⇒ `exhausted`; zero actions ⇒ `success`.
+3. **Deliver (parallel, no DB).** HTTP executions run concurrently via `futures_util::stream::buffer_unordered(WEBHOOK_DELIVERY_CONCURRENCY)`; no connection is held during HTTP. Actions of a *single* row stay sequential.
+4. **Mark (short autocommit statements).** Each outcome is posted with the existing `mark_outbox_*` helpers: success ⇒ `status='success'`; failure ⇒ `attempts+1`, `last_error`, `next_attempt_at = now() + backoff` (overwrites the lease); after `WEBHOOK_MAX_ATTEMPTS` ⇒ `status='exhausted'` + metric. A failed mark is logged and skipped (it does **not** roll back marks already posted for other rows; the lease re-delivers — at-least-once).
+
+Exposed as `run_delivery_once` for deterministic test driving (signature unchanged: `(evaluator, conn, cfg)` → number of rows processed).
 
 **Important**: The timeout is based on `last_updated`, NOT `started_at`. This means batch counter updates (via `PUT /task/{id}`) reset the timeout clock, preventing active tasks from being incorrectly timed out.
 
@@ -135,6 +137,7 @@ All HTTP handler functions and route configuration:
 **`src/db_operation.rs`**:
 - `insert_task_batch` - Creates a whole batch of tasks (grouped multi-row INSERTs, dedupe-aware, Lot 3a)
 - `maybe_enqueue_batch_complete[_for_task]` / `insert_batch` / `load_batch_on_complete` / `batch_completion_stats` - Batch-complete webhook support (Lot 3b)
+- `claim_due_outbox_leased` - Lease-based outbox claim for the delivery loop (selects mature rows + pushes `next_attempt_at` a lease into the future in one statement, so HTTP delivery runs out-of-tx and in parallel)
 - `update_running_task` - Updates status, calls `end_task` and `propagate_to_children`
 - `find_detailed_task_by_id` - Single query with LEFT JOIN for task + actions
 - `list_task_filtered_paged` - Filtered listing with pagination
@@ -363,6 +366,8 @@ All configuration is via environment variables (loaded in `src/config.rs`):
 - `WORKER_WEBHOOK_CONCURRENCY` (default: 10) - Max concurrent on_start webhook executions (should not exceed `POOL_MAX_SIZE`)
 - `WEBHOOK_DELIVERY_INTERVAL_MS` (default: 1000) - Interval between webhook delivery-loop iterations (outbox drain)
 - `WEBHOOK_DELIVERY_BATCH_SIZE` (default: 50) - Max outbox rows claimed per delivery-loop iteration
+- `WEBHOOK_DELIVERY_LEASE_SECS` (default: 120, must be >= 1) - Lease applied to an outbox row at claim time; the row is not re-claimable until the lease expires. Must exceed the worst-case single-row delivery time so an in-flight delivery is never double-claimed.
+- `WEBHOOK_DELIVERY_CONCURRENCY` (default: 10, must be >= 1) - Max concurrent HTTP deliveries within one delivery-loop batch (`buffer_unordered` bound)
 - `WEBHOOK_MAX_ATTEMPTS` (default: 10) - Delivery attempts before an outbox row is marked `exhausted`
 - `WEBHOOK_RETRY_BACKOFF_BASE_SECS` (default: 2) - Base of the exponential retry backoff (delay = base^attempt, capped)
 - `WEBHOOK_RETRY_BACKOFF_CAP_SECS` (default: 300) - Cap on the retry backoff delay

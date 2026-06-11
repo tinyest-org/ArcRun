@@ -225,15 +225,10 @@ async fn test_concurrency_blocks_when_limit_reached() {
     arcrun::db_operation::mark_task_running(&mut conn, &id1)
         .await
         .unwrap();
-    let update_result = arcrun::db_operation::update_running_task(
-        &state.action_executor,
-        &mut conn,
-        id1,
-        success_dto(),
-        true,
-    )
-    .await
-    .unwrap();
+    let update_result =
+        arcrun::db_operation::update_running_task(&mut conn, id1, success_dto(), true)
+            .await
+            .unwrap();
     assert_eq!(
         update_result,
         arcrun::db_operation::UpdateTaskResult::Updated,
@@ -1123,15 +1118,10 @@ async fn test_capacity_combined_with_concurrency() {
     );
 
     // Complete task 1 so concurrency has room (count=2)
-    let update_result = arcrun::db_operation::update_running_task(
-        &state.action_executor,
-        &mut conn,
-        ids[0],
-        success_dto(),
-        true,
-    )
-    .await
-    .unwrap();
+    let update_result =
+        arcrun::db_operation::update_running_task(&mut conn, ids[0], success_dto(), true)
+            .await
+            .unwrap();
     assert_eq!(
         update_result,
         arcrun::db_operation::UpdateTaskResult::Updated

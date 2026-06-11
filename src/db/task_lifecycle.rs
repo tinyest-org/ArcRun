@@ -1,7 +1,5 @@
 use crate::{
-    Conn,
-    action::ActionExecutor,
-    dtos, metrics,
+    Conn, dtos, metrics,
     models::{self, StatusKind, Task},
     workers,
 };
@@ -23,9 +21,8 @@ pub enum UpdateTaskResult {
     NotFound,
 }
 
-#[tracing::instrument(name = "update_running_task", level = "debug", skip(_evaluator, conn, dto), fields(task_id = %task_id))]
+#[tracing::instrument(name = "update_running_task", level = "debug", skip(conn, dto), fields(task_id = %task_id))]
 pub async fn update_running_task<'a>(
-    _evaluator: &ActionExecutor,
     conn: &mut Conn<'a>,
     task_id: Uuid,
     dto: dtos::UpdateTaskDto,
@@ -231,11 +228,10 @@ pub(crate) async fn mark_task_failed<'a>(
     Ok(updated == 1)
 }
 
-/// Mark a task as failed, propagate failure to children (in a transaction),
-/// then fire on_failure webhooks (best-effort, outside transaction).
+/// Mark a task as failed and propagate failure to children, enqueueing the
+/// on_failure outbox rows in the same transaction (delivery is async, Lot 2).
 /// Used when on_start webhook fails after claim.
 pub(crate) async fn fail_task_and_propagate<'a>(
-    _evaluator: &ActionExecutor,
     conn: &mut Conn<'a>,
     task_id: &uuid::Uuid,
     reason: &str,

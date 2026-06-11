@@ -117,11 +117,9 @@ async fn test_timeout_loop_fires_on_failure_webhook() {
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let evaluator = Arc::new(state.action_executor.clone());
     let pool = state.pool.clone();
     let handle = tokio::spawn(async move {
         arcrun::workers::timeout_loop(
-            evaluator,
             pool,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
@@ -219,11 +217,9 @@ async fn test_recent_batch_update_prevents_timeout() {
 
     // Run timeout loop — it should NOT timeout this task because last_updated is fresh
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let evaluator = Arc::new(state.action_executor.clone());
     let pool = state.pool.clone();
     let handle = tokio::spawn(async move {
         arcrun::workers::timeout_loop(
-            evaluator,
             pool,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
@@ -292,11 +288,9 @@ async fn test_timeout_propagates_failure_to_children() {
 
     // Run timeout loop
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let evaluator = Arc::new(state.action_executor.clone());
     let pool = state.pool.clone();
     let handle = tokio::spawn(async move {
         arcrun::workers::timeout_loop(
-            evaluator,
             pool,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),

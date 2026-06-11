@@ -232,14 +232,12 @@ fn spawn_workers(
 
     let timeout = {
         let pool = pool.clone();
-        let executor = action_executor.clone();
         let interval = config.worker.timeout_check_interval;
         let claim_timeout = config.worker.claim_timeout;
         let dead_end_enabled = config.worker.dead_end_cancel_enabled;
         let shutdown = shutdown_rx.clone();
         actix_web::rt::spawn(async move {
             arcrun::workers::timeout_loop(
-                executor,
                 pool,
                 interval,
                 claim_timeout,
@@ -277,6 +275,8 @@ fn spawn_workers(
             max_attempts: config.worker.webhook_max_attempts,
             backoff_base_secs: config.worker.webhook_retry_backoff_base_secs,
             backoff_cap_secs: config.worker.webhook_retry_backoff_cap_secs,
+            lease_secs: config.worker.webhook_delivery_lease_secs,
+            concurrency: config.worker.webhook_delivery_concurrency,
         };
         let shutdown = shutdown_rx.clone();
         actix_web::rt::spawn(async move {

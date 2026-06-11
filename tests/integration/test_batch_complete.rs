@@ -412,11 +412,9 @@ async fn test_batch_complete_via_timeout() {
 
     // Run the timeout loop briefly.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let evaluator = Arc::new(state.action_executor.clone());
     let pool = state.pool.clone();
     let handle = tokio::spawn(async move {
         arcrun::workers::timeout_loop(
-            evaluator,
             pool,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
@@ -602,6 +600,8 @@ async fn test_batch_complete_retry_and_exhausted() {
         max_attempts: 2,
         backoff_base_secs: 1,
         backoff_cap_secs: 1,
+        lease_secs: 120,
+        concurrency: 10,
     };
     drain_outbox_with(&state, cfg, 1).await; // attempt 1 -> fail, retry scheduled
     assert_eq!(

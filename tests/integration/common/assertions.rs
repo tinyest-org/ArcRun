@@ -100,11 +100,7 @@ pub async fn claim_and_complete(
         priority: None,
     };
     let result = arcrun::db_operation::update_running_task(
-        &state.action_executor,
-        &mut conn,
-        task_id,
-        dto,
-        true, // dead_end_cancel_enabled
+        &mut conn, task_id, dto, true, // dead_end_cancel_enabled
     )
     .await
     .unwrap();
@@ -158,6 +154,8 @@ pub fn default_delivery_cfg() -> arcrun::workers::DeliveryConfig {
         max_attempts: 10,
         backoff_base_secs: 2,
         backoff_cap_secs: 300,
+        lease_secs: 120,
+        concurrency: 10,
     }
 }
 

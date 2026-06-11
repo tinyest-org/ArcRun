@@ -31,8 +31,11 @@ réintroduire un problème déjà tranché.
    seulement si non vides (colonnes NOT NULL ⇒ équivalent).
 4. Migration `2026-06-11-000001_drop_redundant_status_index` : drop de `idx_task_status`
    (couvert par `idx_task_priority(status,…)` et `idx_task_status_kind(status,kind)`).
-   ⚠️ Avant déploiement prod : valider par `EXPLAIN` que les requêtes de la `timeout_loop`
-   basculent sur `idx_task_priority`. Rollback : `down.sql`.
+   ✅ Validé par `EXPLAIN ANALYZE` (2026-06-11, Postgres 18, 200k lignes seedées, ANALYZE) :
+   `find_timed_out_tasks` et `requeue_stale_claimed_tasks` font un Bitmap Index Scan sur
+   `idx_task_status_kind` (le planner la préfère à `idx_task_priority` prédite — les deux
+   sont status-leading, conclusion identique : aucun seq scan), et la page Pending de la
+   `start_loop` utilise `idx_task_priority`. Rollback : `down.sql`.
 
 ---
 
@@ -110,12 +113,22 @@ action) ; `next_attempt_at NOT NULL DEFAULT now()` ; payload enrichi sous une cl
 réservée `arcrun` (merge non destructif dans un body custom) ; la boucle de livraison
 ne traite que les triggers `end`/`cancel` (les `start` restent synchrones).
 
-Suivi noté en relecture (non bloquant) : `run_delivery_once` exécute tout le batch
-(appels HTTP compris) dans UNE transaction qui tient les locks `FOR UPDATE` — livraison
-séquentielle, 1 connexion tenue pendant tout le batch, et une erreur DB en cours de
-batch rollback les marks `success` déjà posés (⇒ relivraison, acceptable en
-at-least-once). Si le débit de livraison devient un goulot : claim court (marquage
-in-flight) puis livraison hors-tx en parallèle.
+Suivi noté en relecture — ✅ FAIT (2026-06-11) : `run_delivery_once` ne tient plus UNE
+transaction sur tout le batch. Découpage en 4 phases : (1) **claim court avec lease**
+(`claim_due_outbox_leased` : SELECT mûr + `next_attempt_at = now() + WEBHOOK_DELIVERY_LEASE_SECS`
+en un `UPDATE … FROM (SELECT … FOR UPDATE SKIP LOCKED) … RETURNING`, puis commit ; le bail
+empêche le re-claim concurrent, expire au crash ⇒ at-least-once, et n'incrémente PAS
+`attempts`) ; (2) **prefetch hors-lock** (lectures autocommit, états terminaux immuables ;
+fast-paths task/batch absent ⇒ success, payload batch malformé ⇒ exhausted, zéro action ⇒
+success) ; (3) **livraison HTTP hors-tx en parallèle** via
+`futures_util::stream::buffer_unordered(WEBHOOK_DELIVERY_CONCURRENCY)`, aucune connexion
+tenue, actions d'une même ligne séquentielles ; (4) **marks en statements courts autocommit**
+(`mark_outbox_*` ; une erreur de mark est loggée et ignorée — ne rollback plus les marks déjà
+posés ; le bail relivre). Signature de `run_delivery_once(evaluator, conn, cfg)` inchangée
+(pilotage déterministe des tests). 2 nouveaux env : `WEBHOOK_DELIVERY_LEASE_SECS` (120,
+>= 1), `WEBHOOK_DELIVERY_CONCURRENCY` (10, >= 1). 4 nouveaux tests d'intégration dans
+`tests/integration/test_delivery_lease.rs` (anti double-claim, expiration du bail,
+parallélisme wall-clock, indépendance des marks). 180 tests d'intégration verts.
 
 Transforme `webhook_execution` (déjà : `idempotency_key UNIQUE`, `status`, `attempts`)
 en transactional outbox. Résout : pool starvation par webhooks lents dans le chemin HTTP

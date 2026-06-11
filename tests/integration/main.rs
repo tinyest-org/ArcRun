@@ -19,6 +19,7 @@ mod test_crud;
 mod test_dag;
 mod test_dead_end_cancel;
 mod test_dedupe;
+mod test_delivery_lease;
 mod test_edge_cases;
 mod test_filtering;
 mod test_health;

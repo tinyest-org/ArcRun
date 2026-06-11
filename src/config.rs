@@ -114,6 +114,14 @@ pub struct WorkerConfig {
 
     /// Cap on the retry backoff delay, in seconds
     pub webhook_retry_backoff_cap_secs: i64,
+
+    /// Lease applied to an outbox row at claim time (seconds): the row is not
+    /// re-claimable until the lease expires. Must exceed the worst-case single-row
+    /// delivery time so an in-flight delivery is never double-claimed.
+    pub webhook_delivery_lease_secs: i64,
+
+    /// Max concurrent HTTP deliveries within one delivery-loop batch.
+    pub webhook_delivery_concurrency: usize,
 }
 
 /// Circuit breaker configuration for connection pool resilience.
@@ -223,6 +231,8 @@ impl Default for WorkerConfig {
             webhook_max_attempts: 10,
             webhook_retry_backoff_base_secs: 2,
             webhook_retry_backoff_cap_secs: 300,
+            webhook_delivery_lease_secs: 120,
+            webhook_delivery_concurrency: 10,
         }
     }
 }
@@ -326,6 +336,8 @@ impl Config {
     /// - `CIRCUIT_BREAKER_FAILURE_WINDOW_SECS`: Failure counting window (default: 10)
     /// - `CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECS`: Time before half-open (default: 30)
     /// - `CIRCUIT_BREAKER_SUCCESS_THRESHOLD`: Successes to close (default: 2)
+    /// - `WEBHOOK_DELIVERY_LEASE_SECS`: Lease applied to an outbox row at claim time, in seconds; must be >= 1 and exceed worst-case single-row delivery time (default: 120)
+    /// - `WEBHOOK_DELIVERY_CONCURRENCY`: Max concurrent HTTP deliveries per delivery-loop batch; must be >= 1 (default: 10)
     /// - `SLOW_QUERY_THRESHOLD_MS`: Threshold for slow query warnings in ms (default: 100)
     /// - `TRACING_ENABLED`: Enable distributed tracing (default: false)
     /// - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint URL for trace export
@@ -375,6 +387,8 @@ impl Config {
             webhook_max_attempts: parse_env_or("WEBHOOK_MAX_ATTEMPTS", 10)?,
             webhook_retry_backoff_base_secs: parse_env_or("WEBHOOK_RETRY_BACKOFF_BASE_SECS", 2)?,
             webhook_retry_backoff_cap_secs: parse_env_or("WEBHOOK_RETRY_BACKOFF_CAP_SECS", 300)?,
+            webhook_delivery_lease_secs: parse_env_or("WEBHOOK_DELIVERY_LEASE_SECS", 120)?,
+            webhook_delivery_concurrency: parse_env_or("WEBHOOK_DELIVERY_CONCURRENCY", 10)?,
             ..Default::default()
         };
 
@@ -500,7 +514,9 @@ impl Config {
             });
         }
 
-        if self.worker.start_batch_size == 0 {
+        // Negative values would silently mean "unlimited claims" (the start_loop
+        // guards are all `claim_cap > 0`); reject them along with 0.
+        if self.worker.start_batch_size <= 0 {
             return Err(ConfigError {
                 field: "WORKER_START_BATCH_SIZE".to_string(),
                 message: "Must be greater than 0".to_string(),
@@ -539,6 +555,20 @@ impl Config {
             return Err(ConfigError {
                 field: "WEBHOOK_RETRY_BACKOFF_CAP_SECS".to_string(),
                 message: "Must be greater than or equal to 1".to_string(),
+            });
+        }
+
+        if self.worker.webhook_delivery_lease_secs < 1 {
+            return Err(ConfigError {
+                field: "WEBHOOK_DELIVERY_LEASE_SECS".to_string(),
+                message: "Must be greater than or equal to 1".to_string(),
+            });
+        }
+
+        if self.worker.webhook_delivery_concurrency == 0 {
+            return Err(ConfigError {
+                field: "WEBHOOK_DELIVERY_CONCURRENCY".to_string(),
+                message: "Must be greater than 0".to_string(),
             });
         }
 

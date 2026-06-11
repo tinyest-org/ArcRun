@@ -1,7 +1,6 @@
 use crate::common::*;
 
 use arcrun::models::StatusKind;
-use std::sync::Arc;
 
 /// Priority 1 — Requeue of stale Claimed tasks (timeout loop).
 /// Simulates worker crash leaving tasks stuck in Claimed state.
@@ -42,11 +41,9 @@ async fn test_stale_claimed_task_requeued_to_pending() {
     // Run timeout_loop which includes requeue_stale_claimed_tasks
     // claim_timeout = 30s, our task is 120s stale, so it should be requeued
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let evaluator = Arc::new(state.action_executor.clone());
     let pool = state.pool.clone();
     let handle = tokio::spawn(async move {
         arcrun::workers::timeout_loop(
-            evaluator,
             pool,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30), // claim_timeout
@@ -93,11 +90,9 @@ async fn test_recently_claimed_task_not_requeued() {
 
     // Run timeout loop with 30s claim_timeout — task was just claimed, should stay Claimed
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let evaluator = Arc::new(state.action_executor.clone());
     let pool = state.pool.clone();
     let handle = tokio::spawn(async move {
         arcrun::workers::timeout_loop(
-            evaluator,
             pool,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
@@ -152,11 +147,9 @@ async fn test_requeued_task_picked_up_by_start_loop() {
 
     // Run timeout_loop to requeue
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let evaluator = Arc::new(state.action_executor.clone());
     let pool = state.pool.clone();
     let handle = tokio::spawn(async move {
         arcrun::workers::timeout_loop(
-            evaluator,
             pool,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),

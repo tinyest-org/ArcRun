@@ -68,7 +68,6 @@ pub async fn update_task(
     let mut conn = state.conn().await?;
 
     let result = db_operation::update_running_task(
-        &state.action_executor,
         &mut conn,
         *task_id,
         form.0,
@@ -315,7 +314,6 @@ pub async fn cancel_task(
     let mut conn = state.conn().await?;
 
     match workers::cancel_task(
-        &state.action_executor,
         &task_id,
         state.config.worker.dead_end_cancel_enabled,
         &mut conn,

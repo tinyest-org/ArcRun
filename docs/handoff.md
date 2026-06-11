@@ -4,7 +4,7 @@ Contexte de reprise pour la prochaine session. La référence de design est
 `docs/perf-correctness-plan.md` — **lire ce fichier en premier**, il contient le contrat
 API cible, les décisions actées avec leurs raisons, et l'historique des lots.
 
-## État au 2026-06-11 (soir)
+## État au 2026-06-12
 
 - **Lots 0, 1, 2 et 3 : faits, testés, committés — le plan perf & correctness est
   terminé.** Lot 3 (insertion groupée + webhook `on_batch_complete`) : 206 tests verts
@@ -13,6 +13,20 @@ API cible, les décisions actées avec leurs raisons, et l'historique des lots.
   réels (write-skew sur la détection batch-complete ⇒ verrou FOR UPDATE sur la ligne
   `batch` ; orphan-sweep de rétention vs signal `pending` d'un batch vide) — détail et
   tests de régression dans la section Lot 3 du plan.
+- **Les 4 suivis de relecture sont soldés (2026-06-12)** — il ne reste rien d'ouvert :
+  1. *Delivery loop* : `run_delivery_once` réécrit en 4 phases — claim court avec lease
+     (`claim_due_outbox_leased`, env `WEBHOOK_DELIVERY_LEASE_SECS`), prefetch hors-lock,
+     HTTP parallèle borné (`WEBHOOK_DELIVERY_CONCURRENCY`), marks autocommit indépendants.
+     Détail dans la section Lot 2 du plan ; 4 nouveaux tests dans
+     `tests/integration/test_delivery_lease.rs`. La relecture indépendante a corrigé un
+     double comptage de la métrique `exhausted` (payload batch malformé).
+  2. *Paramètres `_evaluator` morts* : retirés de `update_running_task`,
+     `fail_task_and_propagate`, `cancel_task`, `timeout_loop` (+ tous les call sites).
+  3. *`WORKER_START_BATCH_SIZE`* : la validation rejette désormais `<= 0` (les négatifs
+     signifiaient silencieusement « claims illimités »).
+  4. *Migration drop d'index* : validée par `EXPLAIN ANALYZE` sur Postgres 18 seedé —
+     aucune requête de la `timeout_loop` ne fait de seq scan (résultat consigné dans le
+     plan, section Lot 0). Bon pour la prod.
 - Le contrat webhooks (at-least-once, ordre par tâche, `on_start` = control-flow hors
   outbox, signal `on_batch_complete`) est documenté dans `CLAUDE.md` et implémenté.
 

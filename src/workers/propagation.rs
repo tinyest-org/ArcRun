@@ -1,6 +1,5 @@
 use crate::{
     Conn,
-    action::ActionExecutor,
     db_operation::{self, DbError},
     metrics,
     models::{StatusKind, Task},
@@ -278,7 +277,6 @@ pub(crate) async fn cancel_dead_end_ancestors<'a>(
 }
 
 pub async fn cancel_task<'a>(
-    _evaluator: &ActionExecutor,
     task_id: &uuid::Uuid,
     dead_end_enabled: bool,
     conn: &mut Conn<'a>,

@@ -94,15 +94,9 @@ async fn test_bug2_double_update_no_negative_counters() {
         .unwrap();
 
     // First update: should succeed and propagate
-    let res1 = arcrun::db_operation::update_running_task(
-        &state.action_executor,
-        &mut conn,
-        parent_id,
-        success_dto(),
-        true,
-    )
-    .await
-    .unwrap();
+    let res1 = arcrun::db_operation::update_running_task(&mut conn, parent_id, success_dto(), true)
+        .await
+        .unwrap();
     assert_eq!(
         res1,
         arcrun::db_operation::UpdateTaskResult::Updated,
@@ -110,15 +104,9 @@ async fn test_bug2_double_update_no_negative_counters() {
     );
 
     // Second update: should be no-op (task is no longer Running)
-    let res2 = arcrun::db_operation::update_running_task(
-        &state.action_executor,
-        &mut conn,
-        parent_id,
-        success_dto(),
-        true,
-    )
-    .await
-    .unwrap();
+    let res2 = arcrun::db_operation::update_running_task(&mut conn, parent_id, success_dto(), true)
+        .await
+        .unwrap();
     assert_eq!(
         res2,
         arcrun::db_operation::UpdateTaskResult::NotFound,
@@ -171,26 +159,14 @@ async fn test_bug3_double_success_update_returns_zero_second_time() {
         .await
         .unwrap();
 
-    let res1 = arcrun::db_operation::update_running_task(
-        &state.action_executor,
-        &mut conn,
-        task_id,
-        success_dto(),
-        true,
-    )
-    .await
-    .unwrap();
+    let res1 = arcrun::db_operation::update_running_task(&mut conn, task_id, success_dto(), true)
+        .await
+        .unwrap();
     assert_eq!(res1, arcrun::db_operation::UpdateTaskResult::Updated);
 
-    let res2 = arcrun::db_operation::update_running_task(
-        &state.action_executor,
-        &mut conn,
-        task_id,
-        success_dto(),
-        true,
-    )
-    .await
-    .unwrap();
+    let res2 = arcrun::db_operation::update_running_task(&mut conn, task_id, success_dto(), true)
+        .await
+        .unwrap();
     assert_eq!(
         res2,
         arcrun::db_operation::UpdateTaskResult::NotFound,

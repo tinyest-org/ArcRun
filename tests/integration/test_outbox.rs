@@ -125,6 +125,8 @@ async fn test_outbox_retry_then_success() {
         max_attempts: 10,
         backoff_base_secs: 1,
         backoff_cap_secs: 1,
+        lease_secs: 120,
+        concurrency: 10,
     };
 
     // First pass: delivery fails (500), row stays pending with attempts incremented.
@@ -297,6 +299,8 @@ async fn test_outbox_exhausted_visible_via_endpoint() {
         max_attempts: 2,
         backoff_base_secs: 1,
         backoff_cap_secs: 1,
+        lease_secs: 120,
+        concurrency: 10,
     };
 
     drain_outbox_with(&state, cfg, 1).await; // attempt 1 -> fail, retry scheduled

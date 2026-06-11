@@ -351,6 +351,57 @@ pub async fn claim_due_outbox<'a>(
     Ok(rows)
 }
 
+/// Claim up to `limit` mature `pending` outbox rows for delivery AND push their
+/// `next_attempt_at` `lease_secs` into the future, in one statement.
+///
+/// This is the lease-based variant of [`claim_due_outbox`]: instead of holding the
+/// `FOR UPDATE` locks for the whole delivery (HTTP included), it commits a short
+/// claim that sets a *lease* on each row. While the lease is in effect the row is no
+/// longer mature, so a concurrent worker / next iteration won't re-claim it. If the
+/// process crashes mid-delivery, the lease expires and the row becomes mature again
+/// (at-least-once preserved). The lease does **not** bump `attempts` — `attempts`
+/// counts observed delivery failures, not interrupted (leased) attempts.
+///
+/// Same selection predicates as [`claim_due_outbox`]: `status = 'pending'`, triggers
+/// in `('end','cancel','batch_complete')`, `next_attempt_at <= now()`, the per-task
+/// start-before-end gate, `ORDER BY created_at ASC`, `LIMIT`, `FOR UPDATE SKIP LOCKED`.
+///
+/// `lease_secs` must be >= 1 and should exceed the worst-case delivery time of a single
+/// row (otherwise a slow delivery could be double-claimed while still in flight).
+pub async fn claim_due_outbox_leased<'a>(
+    conn: &mut Conn<'a>,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<WebhookExecution>, DbError> {
+    let rows = diesel::sql_query(
+        "UPDATE webhook_execution we
+         SET next_attempt_at = now() + ($2::bigint * interval '1 second')
+         FROM (
+             SELECT c.id FROM webhook_execution c
+             WHERE c.status = 'pending'
+               AND c.trigger IN ('end', 'cancel', 'batch_complete')
+               AND c.next_attempt_at <= now()
+               AND NOT EXISTS (
+                     SELECT 1 FROM webhook_execution s
+                     WHERE s.task_id = c.task_id
+                       AND s.trigger = 'start'
+                       AND s.status = 'pending'
+               )
+             ORDER BY c.created_at ASC
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED
+         ) AS claimed
+         WHERE we.id = claimed.id
+         RETURNING we.*",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(limit)
+    .bind::<diesel::sql_types::BigInt, _>(lease_secs)
+    .load::<WebhookExecution>(conn)
+    .await?;
+
+    Ok(rows)
+}
+
 /// Mark an outbox row delivered (terminal success).
 pub async fn mark_outbox_success<'a>(conn: &mut Conn<'a>, key: &str) -> Result<(), DbError> {
     use crate::schema::webhook_execution::dsl;

@@ -400,7 +400,6 @@ async fn execute_webhook_for_task(
                 e
             );
             if let Err(e2) = db_operation::fail_task_and_propagate(
-                evaluator,
                 &mut conn,
                 &task.id,
                 "on_start webhook failed",
