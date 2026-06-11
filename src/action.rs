@@ -86,7 +86,18 @@ pub fn idempotency_key(
             format!("{}:end:{}", task_id, cond)
         }
         TriggerKind::Cancel => format!("{}:cancel", task_id),
+        // BatchComplete is batch-level (not keyed by a task id); callers must use
+        // `batch_complete_idempotency_key` instead. We return a clearly-marked key to
+        // avoid a silent collision if this branch is ever hit by mistake.
+        TriggerKind::BatchComplete => format!("{}:batch_complete_misuse", task_id),
     }
+}
+
+/// Idempotency key for a batch-complete webhook event: `batch:<batch_id>:complete`.
+/// One per batch — the unique constraint makes concurrent batch-complete detection
+/// (two tasks finishing "at the same time") enqueue at most one outbox row.
+pub fn batch_complete_idempotency_key(batch_id: uuid::Uuid) -> String {
+    format!("batch:{}:complete", batch_id)
 }
 
 /// Extra fields merged into the webhook request body for end/cancel notifications,
@@ -116,12 +127,11 @@ pub struct WebhookEnrichment {
 ///   a non-object value we wrap it under `body` to avoid losing it).
 fn merge_enrichment(
     body: Option<serde_json::Value>,
-    enrichment: Option<&WebhookEnrichment>,
+    enrichment: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
-    let Some(enrichment) = enrichment else {
+    let Some(enrichment_val) = enrichment else {
         return body;
     };
-    let enrichment_val = serde_json::to_value(enrichment).unwrap_or(serde_json::Value::Null);
     match body {
         Some(serde_json::Value::Object(mut map)) => {
             map.insert("arcrun".to_string(), enrichment_val);
@@ -180,100 +190,146 @@ impl ActionExecutor {
     ) -> Result<Option<NewActionDto>, String> {
         match action.kind {
             ActionKindEnum::Webhook => {
-                let my_address = &self.ctx.host_address;
                 let params: WebhookParams = serde_json::from_value(action.params.clone())
                     .map_err(|e| format!("Failed to parse webhook params: {}", e))?;
-                let url = params.url;
                 let trigger_str = match action.trigger {
                     TriggerKind::Start => "start",
                     TriggerKind::End => "end",
                     TriggerKind::Cancel => "cancel",
+                    TriggerKind::BatchComplete => "batch_complete",
                 };
-                let started_at = std::time::Instant::now();
-                let mut request = self.client.request(params.verb.into(), &url);
-                // enable the runner to send update of the task
-                request = request.query(&[("handle", format!("{}/task/{}", my_address, &task.id))]);
-                // Merge the optional enrichment object into the body (backwards
-                // compatible: added under the reserved `arcrun` key).
-                let body = merge_enrichment(params.body, enrichment);
-                if let Some(body) = body {
-                    request = request.json(&body);
-                }
-                if let Some(headers) = params.headers {
-                    for (key, value) in headers {
-                        request = request.header(key, value);
-                    }
-                }
-                // Inject idempotency and diagnostics headers
-                if let Some(key) = idem_key {
-                    request = request.header("Idempotency-Key", key);
-                }
-                request = request
-                    .header("X-Task-Id", task.id.to_string())
-                    .header("X-Task-Trigger", trigger_str);
+                // Task-level webhooks carry a `?handle=` callback URL and X-Task-* headers.
+                let handle = format!("{}/task/{}", &self.ctx.host_address, &task.id);
+                let body = merge_enrichment(
+                    params.body.clone(),
+                    enrichment.map(serde_json::to_value).and_then(Result::ok),
+                );
+                self.send_webhook(
+                    params,
+                    body,
+                    Some(&handle),
+                    idem_key,
+                    trigger_str,
+                    Some(&task.id.to_string()),
+                )
+                .await
+            }
+        }
+    }
 
-                let response = request.send().await.map_err(|e| {
-                    metrics::record_webhook_execution(
-                        trigger_str,
-                        "failure",
-                        started_at.elapsed().as_secs_f64(),
-                    );
-                    format!("Failed to send request: {}", e)
-                })?;
-                let status = response.status();
-                if status.is_redirection() {
-                    metrics::record_webhook_execution(
-                        trigger_str,
-                        "failure",
-                        started_at.elapsed().as_secs_f64(),
-                    );
-                    log::warn!(
-                        "Webhook for task {} returned redirect status {} — redirects are disabled for SSRF protection",
-                        task.id,
-                        status
-                    );
-                    return Err(format!(
-                        "Webhook returned redirect status {} — redirects are disabled",
-                        status
-                    ));
-                }
-                if status.is_success() {
-                    metrics::record_webhook_execution(
-                        trigger_str,
-                        "success",
-                        started_at.elapsed().as_secs_f64(),
-                    );
-                    // try to parse cancel
-                    Ok(match response.text().await {
-                        Ok(body) => {
-                            log::info!("query with success: -> {}", &body);
-                            match serde_json::from_str(&body) {
-                                Ok(dto) => Some(dto),
-                                Err(e) => {
-                                    log::debug!(
-                                        "Response body did not parse as NewActionDto: {}",
-                                        e
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            log::info!("query with success");
+    /// Execute a single batch-level webhook (`on_batch_complete`). Unlike task-level
+    /// webhooks there is NO `?handle=` callback (no task to drive) and no X-Task-Id;
+    /// the `arcrun` enrichment object (batch_id / counts / completed_at) is merged into
+    /// the body. The `Idempotency-Key` is the batch-complete key.
+    pub async fn execute_batch_action(
+        &self,
+        action: &NewActionDto,
+        idem_key: Option<&str>,
+        enrichment_value: serde_json::Value,
+    ) -> Result<(), String> {
+        match action.kind {
+            ActionKindEnum::Webhook => {
+                let params: WebhookParams = serde_json::from_value(action.params.clone())
+                    .map_err(|e| format!("Failed to parse webhook params: {}", e))?;
+                let body = merge_enrichment(params.body.clone(), Some(enrichment_value));
+                self.send_webhook(params, body, None, idem_key, "batch_complete", None)
+                    .await
+                    .map(|_| ())
+            }
+        }
+    }
+
+    /// Core HTTP execution shared by task-level and batch-level webhooks.
+    ///
+    /// `handle` adds the `?handle=` query param (task-level only); `task_id_header`
+    /// adds the `X-Task-Id` header. `body` is the already-merged JSON body (the
+    /// caller is responsible for merging any `arcrun` enrichment).
+    async fn send_webhook(
+        &self,
+        params: WebhookParams,
+        body: Option<serde_json::Value>,
+        handle: Option<&str>,
+        idem_key: Option<&str>,
+        trigger_str: &str,
+        task_id_header: Option<&str>,
+    ) -> Result<Option<NewActionDto>, String> {
+        let url = params.url;
+        let started_at = std::time::Instant::now();
+        let mut request = self.client.request(params.verb.into(), &url);
+        if let Some(handle) = handle {
+            request = request.query(&[("handle", handle)]);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        if let Some(headers) = params.headers {
+            for (key, value) in headers {
+                request = request.header(key, value);
+            }
+        }
+        if let Some(key) = idem_key {
+            request = request.header("Idempotency-Key", key);
+        }
+        if let Some(tid) = task_id_header {
+            request = request.header("X-Task-Id", tid);
+        }
+        request = request.header("X-Task-Trigger", trigger_str);
+
+        let response = request.send().await.map_err(|e| {
+            metrics::record_webhook_execution(
+                trigger_str,
+                "failure",
+                started_at.elapsed().as_secs_f64(),
+            );
+            format!("Failed to send request: {}", e)
+        })?;
+        let status = response.status();
+        if status.is_redirection() {
+            metrics::record_webhook_execution(
+                trigger_str,
+                "failure",
+                started_at.elapsed().as_secs_f64(),
+            );
+            log::warn!(
+                "Webhook returned redirect status {} — redirects are disabled for SSRF protection",
+                status
+            );
+            return Err(format!(
+                "Webhook returned redirect status {} — redirects are disabled",
+                status
+            ));
+        }
+        if status.is_success() {
+            metrics::record_webhook_execution(
+                trigger_str,
+                "success",
+                started_at.elapsed().as_secs_f64(),
+            );
+            Ok(match response.text().await {
+                Ok(body) => {
+                    log::info!("query with success: -> {}", &body);
+                    match serde_json::from_str(&body) {
+                        Ok(dto) => Some(dto),
+                        Err(e) => {
+                            log::debug!("Response body did not parse as NewActionDto: {}", e);
                             None
                         }
-                    })
-                } else {
-                    metrics::record_webhook_execution(
-                        trigger_str,
-                        "failure",
-                        started_at.elapsed().as_secs_f64(),
-                    );
-                    let body = response.text().await.unwrap_or_default();
-                    log::error!("Response ({}): {}", status, body);
-                    Err(format!("Request failed with status: {}", status))
+                    }
                 }
-            }
+                Err(_) => {
+                    log::info!("query with success");
+                    None
+                }
+            })
+        } else {
+            metrics::record_webhook_execution(
+                trigger_str,
+                "failure",
+                started_at.elapsed().as_secs_f64(),
+            );
+            let body = response.text().await.unwrap_or_default();
+            log::error!("Response ({}): {}", status, body);
+            Err(format!("Request failed with status: {}", status))
         }
     }
 }

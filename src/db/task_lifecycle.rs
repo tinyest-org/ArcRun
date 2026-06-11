@@ -9,6 +9,9 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use uuid::Uuid;
 
+use super::webhook_execution::{
+    maybe_enqueue_batch_complete, maybe_enqueue_batch_complete_for_task,
+};
 use super::{DbError, run_in_transaction, task_crud::insert_actions};
 
 /// Result of attempting to update a running task.
@@ -98,6 +101,12 @@ pub async fn update_running_task<'a>(
                         )
                         .await?;
                         workers::enqueue_outbox_for_canceled_ancestors(&ancestors, conn).await?;
+
+                        // Batch-complete detection (Lot 3b): if this task's batch now
+                        // has no non-terminal tasks and registered an on_batch_complete
+                        // webhook, enqueue the batch_complete outbox row in this same tx.
+                        maybe_enqueue_batch_complete_for_task(conn, task_id, "update_running_task")
+                            .await?;
                     }
                 }
 
@@ -254,6 +263,9 @@ pub(crate) async fn fail_task_and_propagate<'a>(
                 workers::enqueue_end_outbox_with_cascade(&tid, StatusKind::Failure, &cascade, conn)
                     .await?;
                 workers::enqueue_outbox_for_canceled_ancestors(&ancestors, conn).await?;
+
+                // Batch-complete detection (Lot 3b).
+                maybe_enqueue_batch_complete_for_task(conn, tid, "fail_task_and_propagate").await?;
             }
             Ok(updated)
         })
@@ -401,6 +413,10 @@ pub(crate) async fn stop_batch<'a>(
             for rid in &canceled_running_ids {
                 crate::workers::enqueue_cancel_outbox(rid, conn).await?;
             }
+
+            // Batch-complete detection (Lot 3b): stopping a batch makes every task
+            // terminal, so this fires the batch_complete webhook (if registered).
+            maybe_enqueue_batch_complete(conn, batch_id, "stop_batch").await?;
 
             Ok(StopBatchResult {
                 canceled_waiting,

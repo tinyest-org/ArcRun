@@ -30,11 +30,21 @@ ArcRun is a Rust-based task orchestration service that manages task execution wi
 
 ### Action Model
 Actions are webhook calls triggered by task lifecycle events:
-- **TriggerKind**: `Start`, `End`, `Cancel`
-- **TriggerCondition**: `Success`, `Failure` (only meaningful for `End` triggers — determines which end action fires). For `Start` and `Cancel` triggers, the condition column is always stored as `Success` (sentinel value, since the column is NOT NULL).
+- **TriggerKind**: `Start`, `End`, `Cancel`, `BatchComplete`
+- **TriggerCondition**: `Success`, `Failure` (only meaningful for `End` triggers — determines which end action fires). For `Start`, `Cancel`, and `BatchComplete` triggers, the condition column is always stored as `Success` (sentinel value, since the column is NOT NULL).
 - **ActionKindEnum**: `Webhook` (only kind currently)
 
 The `on_start` action can return a `NewActionDto` in the response body to register a cancel action for the task.
+
+### POST /task body shapes (Lot 3)
+`POST /task` accepts two JSON shapes (serde `untagged`, fully backwards compatible):
+- The legacy bare array `[NewTaskDto, …]`.
+- An object `{ "tasks": [NewTaskDto, …], "on_batch_complete": [NewActionDto, …] }`.
+
+`on_batch_complete` registers a batch-level webhook fired exactly once (at-least-once via the outbox) when the **last** task of the batch becomes terminal. A `batch` row is created only when the field is provided (batches without it cost nothing). SSRF/param validation runs on the batch-level actions like any other action. Tasks are inserted in **grouped multi-row INSERTs** (Lot 3a): contiguous runs of tasks *without* a `dedupe_strategy` are flushed in one `task` / `link` / `action` INSERT each; UUIDs are app-generated (`Uuid::new_v4()`) so the full `id_mapping` is known before any insert. A task carrying a `dedupe_strategy` ends the current run (the run is flushed first so the dedupe check can match tasks inserted earlier in the same batch) — same guard philosophy as the Lot 1 batch-claim.
+
+### Batch-complete detection (`BatchComplete` trigger — Lot 3b)
+When any task of a batch reaches a terminal state, the transition transaction calls `maybe_enqueue_batch_complete[_for_task]` (`src/db/webhook_execution.rs`): if a `batch` row exists AND `NOT EXISTS (task WHERE batch_id = $1 AND status NOT IN (terminal))`, it enqueues one outbox row keyed `batch:<batch_id>:complete`. The unique idempotency key + `ON CONFLICT DO NOTHING` make concurrent detection inoffensive (a single row even if two tasks finish "at once"). The check is centralised in ONE helper, called from every terminal site: `update_running_task`, `fail_task_and_propagate`, `stop_batch` (`task_lifecycle.rs`), `timeout_task_and_propagate` (`task_query.rs`), `cancel_task` (`propagation.rs`), and `add_task` (for the vacuously-complete empty / all-dedupe-skipped batch). The delivery loop (`delivery_loop.rs::deliver_batch_complete_row`) loads `batch.on_complete`, executes each action **without** a `?handle=`, with an `arcrun` body enrichment `{batch_id, counts:{success,failure,canceled}, completed_at}` (counts / `completed_at = max(ended_at)` computed at delivery time). Retry/backoff/exhausted are identical to task-level rows. Retention (`src/db/cleanup.rs`) also deletes orphaned `batch` rows (and their batch-level `webhook_execution` rows) once their tasks are gone.
 
 ### Webhook Delivery Contract (transactional outbox — Lot 2)
 
@@ -110,6 +120,8 @@ All HTTP handler functions and route configuration:
 
 ### DTOs (`src/dtos.rs`)
 - `NewTaskDto` - Input for creating tasks (includes local `id` for dependency resolution, optional priority)
+- `CreateTaskBody` - Untagged `POST /task` body: bare `Vec<NewTaskDto>` OR `CreateTaskBatchDto`
+- `CreateTaskBatchDto` - Object form: `{ tasks, on_batch_complete }`
 - `TaskDto` - Full task response with actions and priority
 - `BasicTaskDto` - Lightweight task for listings (includes priority)
 - `DagDto` - Tasks + links for visualization
@@ -121,7 +133,8 @@ All HTTP handler functions and route configuration:
 ### Key Functions
 
 **`src/db_operation.rs`**:
-- `insert_new_task` - Creates task with dependencies and actions
+- `insert_task_batch` - Creates a whole batch of tasks (grouped multi-row INSERTs, dedupe-aware, Lot 3a)
+- `maybe_enqueue_batch_complete[_for_task]` / `insert_batch` / `load_batch_on_complete` / `batch_completion_stats` - Batch-complete webhook support (Lot 3b)
 - `update_running_task` - Updates status, calls `end_task` and `propagate_to_children`
 - `find_detailed_task_by_id` - Single query with LEFT JOIN for task + actions
 - `list_task_filtered_paged` - Filtered listing with pagination
@@ -216,6 +229,7 @@ Uses testcontainers for PostgreSQL. Split into focused test files with shared he
 - `test_regressions.rs` — Regression tests: on_start failure, timeout+webhook, batch keepalive timeout, pagination overflow (5 tests)
 - `test_priority.rs` — Priority scheduling (6 tests)
 - `test_outbox.rs` — Webhook transactional outbox (Lot 2): crash-window delivery, retry-then-success, no double delivery, start-before-end ordering, exhausted + `/webhook-deliveries`, fast PATCH under slow downstream (6 tests)
+- `test_batch_complete.rs` — Lot 3: grouped insertion (mixed batch state, intra-batch dedupe match, dedupe-skipped-parent child Pending) + `on_batch_complete` webhook (both body shapes, fires-once-on-last-terminal, via stop_batch/timeout, single row under concurrent detection, empty-batch immediate signal, payload contents, retry+exhausted, SSRF validation) (12 tests)
 
 (Test files live in `tests/integration/`, declared in `tests/integration/main.rs`; shared helpers in `tests/integration/common/`. The list above is indicative, not exhaustive — also present: `test_claim_loop`, `test_cancel_webhook`, `test_idempotency`, `test_parallel_webhooks`, `test_stop_batch`, `test_dead_end_cancel`, `test_batch_rules`, `test_batch_stats`, `test_propagation_edge`, `test_requeue_stale`, `test_validation_e2e`, `test_webhook_flows`.)
 
@@ -279,17 +293,25 @@ task (id, name, kind, status, metadata, timeout, batch_id, start_condition,
       created_at, started_at, ended_at, last_updated, priority)
 action (id, task_id, kind, trigger, condition, params, success)
 link (parent_id, child_id, requires_success)
+batch (id, on_complete, created_at)
+  -- one row per batch that registered an on_batch_complete webhook (Lot 3b);
+  -- on_complete = JSONB array of NewActionDto. Batches without the webhook have no row.
 webhook_execution (id, task_id, trigger, condition, idempotency_key,
                    status, attempts, created_at, updated_at,
-                   next_attempt_at, last_error)
+                   next_attempt_at, last_error, batch_id)
   -- status: pending | success | failure | exhausted
-  -- doubles as the transactional outbox for end/cancel webhooks (Lot 2):
+  -- trigger: start | end | cancel | batch_complete
+  -- doubles as the transactional outbox for end/cancel webhooks (Lot 2) and the
+  -- batch_complete webhook (Lot 3b):
+  --   task_id  is NULL for batch_complete rows; batch_id is set instead
+  --   CHECK (task_id IS NOT NULL OR batch_id IS NOT NULL)
   --   next_attempt_at = when the row is eligible for (re)delivery (DEFAULT now())
   --   last_error      = last delivery error (diagnostics)
 
 -- FK constraints (relevant for cleanup ordering)
 action.task_id -> task.id
 webhook_execution.task_id -> task.id
+webhook_execution.batch_id -> batch.id
 link.parent_id -> task.id
 link.child_id -> task.id
 
@@ -301,6 +323,7 @@ link_child_id_idx ON link(child_id)
 idx_webhook_execution_task_id ON webhook_execution(task_id)
 idx_webhook_execution_status ON webhook_execution(status)
 idx_webhook_execution_pending_due ON webhook_execution(next_attempt_at) WHERE status = 'pending'
+idx_webhook_execution_batch_id ON webhook_execution(batch_id) WHERE batch_id IS NOT NULL
 idx_task_priority ON task(status, priority DESC, created_at ASC)
 ```
 

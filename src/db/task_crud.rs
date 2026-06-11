@@ -95,36 +95,95 @@ pub(crate) async fn insert_actions<'a>(
     Ok(r)
 }
 
-/// Insert a new task into the database with optional dependencies.
+/// A task DTO that has been resolved against the current `id_mapping` into the
+/// concrete rows to insert (task row + links + action specs), with its
+/// app-generated UUID already assigned. Built outside the DB so a contiguous run
+/// of these can be flushed in a few multi-row INSERTs (Lot 3a).
+struct PreparedTask {
+    id: Uuid,
+    new_task: models::NewTask,
+    /// Resolved parent links; `child_id` is already set to `id`.
+    links: Vec<Link>,
+    on_start: dtos::NewActionDto,
+    on_failure: Vec<dtos::NewActionDto>,
+    on_success: Vec<dtos::NewActionDto>,
+    wait_finished: i32,
+}
+
+/// Insert a whole batch of tasks, grouping contiguous runs of tasks WITHOUT a
+/// `dedupe_strategy` into multi-row INSERTs (one per `task` / `link` / `action`),
+/// while still evaluating dedupe tasks one-at-a-time so they can match tasks
+/// inserted earlier in the same batch.
 ///
-/// `id_mapping` maps local client IDs to database UUIDs for resolving dependencies
-/// within the same batch of tasks.
-/// `batch_id` groups all tasks created in the same request for tracing.
-pub(crate) async fn insert_new_task<'a>(
+/// UUIDs are generated app-side (`Uuid::new_v4()`) so the full `id_mapping` is
+/// known before any insert, letting links be built without intermediate RETURNINGs.
+///
+/// Semantics preserved exactly from the old per-task `insert_new_task`:
+/// - dedupe-skipped tasks are absent from `id_mapping` (so a child depending on a
+///   skipped parent has that dependency ignored with a warn),
+/// - `wait_*` counters, initial Waiting/Pending status, and per-task metrics are
+///   identical,
+/// - the returned `TaskDto`s preserve input order.
+pub(crate) async fn insert_task_batch<'a>(
     conn: &mut Conn<'a>,
-    dto: dtos::NewTaskDto,
-    id_mapping: &HashMap<String, Uuid>,
+    dtos_in: Vec<dtos::NewTaskDto>,
     batch_id: Option<Uuid>,
-) -> Result<Option<TaskDto>, DbError> {
-    use crate::schema::link::dsl::link;
-    use crate::schema::task::dsl::task;
+) -> Result<Vec<TaskDto>, DbError> {
+    let mut id_mapping: HashMap<String, Uuid> = HashMap::new();
+    let mut results: Vec<TaskDto> = Vec::with_capacity(dtos_in.len());
 
-    let should_write = if let Some(s) = dto.dedupe_strategy {
-        handle_dedupe(conn, s, &dto.metadata).await?
-    } else {
-        true
-    };
+    // Buffer of prepared, dedupe-free tasks in the current contiguous run.
+    let mut run: Vec<PreparedTask> = Vec::new();
 
-    if !should_write {
-        return Ok(None);
+    for dto in dtos_in.into_iter() {
+        let has_dedupe = dto.dedupe_strategy.is_some();
+
+        if has_dedupe {
+            // Flush the pending run FIRST so its tasks are visible to the dedupe
+            // check (a dedupe task may match a task inserted earlier in this batch).
+            flush_run(conn, &mut run, &mut results).await?;
+
+            let local_id = dto.id.clone();
+            let dedupe_rules = dto.dedupe_strategy.clone().unwrap();
+            let should_write = handle_dedupe(conn, dedupe_rules, &dto.metadata).await?;
+            if !should_write {
+                continue;
+            }
+
+            let task_id = Uuid::new_v4();
+            let prepared = resolve_task(dto, task_id, batch_id, &id_mapping);
+            id_mapping.insert(local_id, task_id);
+            // A dedupe task is its own one-element run (it may not be batched with
+            // others past it, but flushing it alone is fine and keeps the code simple).
+            run.push(prepared);
+            flush_run(conn, &mut run, &mut results).await?;
+        } else {
+            let local_id = dto.id.clone();
+            let task_id = Uuid::new_v4();
+            let prepared = resolve_task(dto, task_id, batch_id, &id_mapping);
+            id_mapping.insert(local_id, task_id);
+            run.push(prepared);
+        }
     }
 
-    // Compute wait counters from dependencies
+    // Flush any trailing run.
+    flush_run(conn, &mut run, &mut results).await?;
+
+    Ok(results)
+}
+
+/// Resolve a DTO into a [`PreparedTask`] against the provided `id_mapping`.
+/// (Standalone version that does not use the thread-local indirection.)
+fn resolve_task(
+    dto: dtos::NewTaskDto,
+    task_id: Uuid,
+    batch_id: Option<Uuid>,
+    id_mapping: &HashMap<String, Uuid>,
+) -> PreparedTask {
     let (wait_success, wait_finished, links) = if let Some(ref deps) = dto.dependencies {
         let mut ws = 0i32;
         let mut wf = 0i32;
         let mut resolved_links = Vec::new();
-
         for dep in deps {
             if let Some(&parent_id) = id_mapping.get(&dep.id) {
                 wf += 1;
@@ -133,7 +192,7 @@ pub(crate) async fn insert_new_task<'a>(
                 }
                 resolved_links.push(Link {
                     parent_id,
-                    child_id: Uuid::nil(), // Will be set after task creation
+                    child_id: task_id,
                     requires_success: dep.requires_success,
                 });
             } else {
@@ -145,7 +204,6 @@ pub(crate) async fn insert_new_task<'a>(
         (0, 0, Vec::new())
     };
 
-    // Set status based on whether there are dependencies
     let initial_status = if wait_finished > 0 {
         models::StatusKind::Waiting
     } else {
@@ -153,6 +211,7 @@ pub(crate) async fn insert_new_task<'a>(
     };
 
     let new_task = models::NewTask {
+        id: task_id,
         name: dto.name,
         kind: dto.kind,
         status: initial_status,
@@ -167,75 +226,115 @@ pub(crate) async fn insert_new_task<'a>(
         priority: dto.priority.unwrap_or(0),
     };
 
-    let new_task = diesel::insert_into(task)
-        .values(new_task)
+    PreparedTask {
+        id: task_id,
+        new_task,
+        links,
+        on_start: dto.on_start,
+        on_failure: dto.on_failure.unwrap_or_default(),
+        on_success: dto.on_success.unwrap_or_default(),
+        wait_finished,
+    }
+}
+
+/// Flush a run of prepared tasks into the DB with up to three multi-row INSERTs
+/// (task, link, action), then append their `TaskDto`s to `results` (preserving
+/// run order) and record per-task metrics. Clears `run`.
+async fn flush_run<'a>(
+    conn: &mut Conn<'a>,
+    run: &mut Vec<PreparedTask>,
+    results: &mut Vec<TaskDto>,
+) -> Result<(), DbError> {
+    use crate::schema::action::dsl::action as action_tbl;
+    use crate::schema::link::dsl::link as link_tbl;
+    use crate::schema::task::dsl::task as task_tbl;
+
+    if run.is_empty() {
+        return Ok(());
+    }
+
+    let prepared: Vec<PreparedTask> = std::mem::take(run);
+
+    // 1. Multi-row INSERT of task rows.
+    let new_tasks: Vec<&models::NewTask> = prepared.iter().map(|p| &p.new_task).collect();
+    let inserted_tasks: Vec<Task> = diesel::insert_into(task_tbl)
+        .values(new_tasks)
         .returning(Task::as_returning())
-        .get_result(conn)
+        .get_results(conn)
         .await?;
 
-    // Insert links with the actual child_id
-    if !links.is_empty() {
-        let links_to_insert: Vec<Link> = links
-            .into_iter()
-            .map(|mut l| {
-                l.child_id = new_task.id;
-                l
-            })
-            .collect();
+    // Map id -> inserted Task so we can return them in input order regardless of the
+    // order the DB returns rows.
+    let mut task_by_id: HashMap<Uuid, Task> =
+        inserted_tasks.into_iter().map(|t| (t.id, t)).collect();
 
-        diesel::insert_into(link)
-            .values(&links_to_insert)
+    // 2. Multi-row INSERT of all links across the run.
+    let all_links: Vec<Link> = prepared.iter().flat_map(|p| p.links.clone()).collect();
+    if !all_links.is_empty() {
+        diesel::insert_into(link_tbl)
+            .values(&all_links)
             .execute(conn)
             .await?;
     }
 
-    // Insert actions: on_start (single), on_failure (many), on_success (many)
-    let mut all_actions = Vec::new();
+    // 3. Multi-row INSERT of all actions across the run (start + failure + success).
+    let mut all_new_actions: Vec<NewAction> = Vec::new();
+    for p in &prepared {
+        all_new_actions.push(NewAction {
+            task_id: p.id,
+            kind: &p.on_start.kind,
+            params: p.on_start.params.clone(),
+            trigger: &models::TriggerKind::Start,
+            condition: &models::TriggerCondition::Success,
+        });
+        for a in &p.on_failure {
+            all_new_actions.push(NewAction {
+                task_id: p.id,
+                kind: &a.kind,
+                params: a.params.clone(),
+                trigger: &models::TriggerKind::End,
+                condition: &models::TriggerCondition::Failure,
+            });
+        }
+        for a in &p.on_success {
+            all_new_actions.push(NewAction {
+                task_id: p.id,
+                kind: &a.kind,
+                params: a.params.clone(),
+                trigger: &models::TriggerKind::End,
+                condition: &models::TriggerCondition::Success,
+            });
+        }
+    }
 
-    // Insert on_start action (condition doesn't matter for start, use Success as default)
-    let start_actions = insert_actions(
-        new_task.id,
-        &[dto.on_start],
-        &models::TriggerKind::Start,
-        &models::TriggerCondition::Success,
-        conn,
-    )
-    .await?;
-    all_actions.extend(start_actions);
-
-    // Insert on_failure actions
-    if let Some(failure_actions) = dto.on_failure {
-        let inserted = insert_actions(
-            new_task.id,
-            &failure_actions,
-            &models::TriggerKind::End,
-            &models::TriggerCondition::Failure,
-            conn,
-        )
+    let inserted_actions: Vec<Action> = diesel::insert_into(action_tbl)
+        .values(all_new_actions)
+        .returning(Action::as_returning())
+        .get_results(conn)
         .await?;
-        all_actions.extend(inserted);
+
+    // Group inserted actions by task_id to assemble per-task TaskDtos.
+    let mut actions_by_task: HashMap<Uuid, Vec<Action>> = HashMap::new();
+    for a in inserted_actions {
+        actions_by_task.entry(a.task_id).or_default().push(a);
     }
 
-    // Insert on_success actions
-    if let Some(success_actions) = dto.on_success {
-        let inserted = insert_actions(
-            new_task.id,
-            &success_actions,
-            &models::TriggerKind::End,
-            &models::TriggerCondition::Success,
-            conn,
-        )
-        .await?;
-        all_actions.extend(inserted);
+    // Assemble results in input (run) order + record metrics.
+    for p in &prepared {
+        let task = task_by_id
+            .remove(&p.id)
+            .expect("inserted task row missing for prepared id");
+        let actions = actions_by_task.remove(&p.id).unwrap_or_default();
+
+        metrics::record_task_created();
+        if p.wait_finished > 0 {
+            metrics::record_task_with_dependencies();
+        }
+
+        results.push(TaskDto::new(task, actions));
     }
 
-    // Record metrics
-    metrics::record_task_created();
-    if wait_finished > 0 {
-        metrics::record_task_with_dependencies();
-    }
-
-    Ok(Some(TaskDto::new(new_task, all_actions)))
+    Ok(())
 }
 
 /// Find a task by ID with all its actions using a single LEFT JOIN query.

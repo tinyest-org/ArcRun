@@ -182,7 +182,7 @@ pub async fn batch_task_updater(
 **Validation:** The entire batch is validated before any inserts. Circular dependencies, invalid webhook URLs, empty names/kinds, and SSRF attempts are rejected with 400.
 
 **Transaction:** All tasks are created in a single database transaction — either all succeed or none are created.",
-    request_body(content = Vec<dtos::NewTaskDto>, description = "Array of tasks to create. Order matters: a task can only depend on tasks defined earlier in the array (or in the same position — the server resolves local IDs). See NewTaskDto schema for field details."),
+    request_body(content = dtos::CreateTaskBody, description = "Either a bare array of tasks `[NewTaskDto, …]` (legacy, fully supported), or an object `{ \"tasks\": [NewTaskDto, …], \"on_batch_complete\": [NewActionDto, …] }`. Order matters: a task can only depend on tasks defined earlier in the array. `on_batch_complete` registers a batch-level webhook fired once (at-least-once) when the LAST task of the batch reaches a terminal state."),
     responses(
         (status = 201, description = "Tasks created successfully. Response body is the array of created tasks with their server-assigned UUIDs. The `X-Batch-ID` header contains the batch UUID.", body = Vec<dtos::BasicTaskDto>),
         (status = 204, description = "All tasks were deduplicated — nothing was created. The `X-Batch-ID` header is still returned."),
@@ -193,22 +193,24 @@ pub async fn batch_task_updater(
 /// Create new tasks (batch)
 pub async fn add_task(
     state: web::Data<AppState>,
-    form: web::Json<Vec<dtos::NewTaskDto>>,
+    form: web::Json<dtos::CreateTaskBody>,
 ) -> actix_web::Result<HttpResponse> {
-    use std::collections::HashMap;
-
     // Generate batch_id for tracing this entire DAG
     let batch_id = Uuid::new_v4();
 
+    // Accept both the legacy bare array and the object form
+    // `{ "tasks": [...], "on_batch_complete": [...] }`.
+    let (f, on_batch_complete) = form.0.into_parts();
+
     log::info!(
-        "[batch_id={}] Creating task batch from requester={}, task_count={}",
+        "[batch_id={}] Creating task batch from requester={}, task_count={}, on_batch_complete={}",
         batch_id,
         "",
-        form.len()
+        f.len(),
+        on_batch_complete.is_some()
     );
 
     // Validate the entire batch BEFORE acquiring a connection
-    let f = form.0;
     if let Err(errors) = validation::validate_task_batch(&f) {
         let error_messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
         log::warn!(
@@ -223,23 +225,45 @@ pub async fn add_task(
         })));
     }
 
+    // Validate the batch-complete actions (SSRF etc.) the same way as task actions.
+    if let Some(ref actions) = on_batch_complete {
+        for (i, action) in actions.iter().enumerate() {
+            if let Err(e) = validation::validate_action_params(&action.kind, &action.params) {
+                let msg = format!("on_batch_complete[{}].params: {}", i, e);
+                log::warn!(
+                    "[batch_id={}] Batch-complete action validation failed: {}",
+                    batch_id,
+                    msg
+                );
+                return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": "Validation failed",
+                    "batch_id": batch_id,
+                    "details": [msg]
+                })));
+            }
+        }
+    }
+
     let mut conn = state.conn().await?;
 
     let result = db_operation::run_in_transaction(&mut conn, |conn| {
         Box::pin(async move {
-            let mut result = vec![];
-            let mut id_mapping: HashMap<String, uuid::Uuid> = HashMap::new();
-
-            for i in f.into_iter() {
-                let local_id = i.id.clone();
-
-                let task =
-                    db_operation::insert_new_task(conn, i, &id_mapping, Some(batch_id)).await?;
-                if let Some(t) = task {
-                    id_mapping.insert(local_id, t.id);
-                    result.push(t);
-                }
+            // Register the batch-complete webhook payload first (if provided), so the
+            // empty-batch case still fires the signal in this same transaction.
+            if let Some(actions) = on_batch_complete {
+                let on_complete = serde_json::to_value(&actions)
+                    .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
+                db_operation::insert_batch(conn, batch_id, on_complete).await?;
             }
+
+            // Grouped insertion (Lot 3a): contiguous dedupe-free runs are inserted in
+            // a few multi-row INSERTs; dedupe tasks are still evaluated one-at-a-time.
+            let result = db_operation::insert_task_batch(conn, f, Some(batch_id)).await?;
+
+            // Empty batch (all tasks dedupe-skipped) with a registered webhook: the
+            // batch is vacuously complete — enqueue the signal now so the consumer
+            // doesn't wait forever. (No-op when no `batch` row was inserted.)
+            db_operation::maybe_enqueue_batch_complete(conn, batch_id, "add_task").await?;
 
             Ok(result)
         })

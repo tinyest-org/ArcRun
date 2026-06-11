@@ -6,13 +6,15 @@ API cible, les décisions actées avec leurs raisons, et l'historique des lots.
 
 ## État au 2026-06-11 (soir)
 
-- **Lots 0, 1 et 2 : faits, testés, committés.** Lot 2 (outbox transactionnel) :
-  192 tests verts (30 unitaires + 162 intégration dont 6 nouveaux `test_outbox.rs`),
-  validés indépendamment de l'agent d'implémentation.
-- **Lot 3 : uniquement sur preuve de besoin** (voir plan : insertion de batch groupée,
-  webhook `on_batch_complete`).
+- **Lots 0, 1, 2 et 3 : faits, testés, committés — le plan perf & correctness est
+  terminé.** Lot 3 (insertion groupée + webhook `on_batch_complete`) : 206 tests verts
+  (30 unitaires + 176 intégration dont 14 dans `test_batch_complete.rs`), validés
+  indépendamment de l'agent d'implémentation. La relecture a trouvé et corrigé 2 bugs
+  réels (write-skew sur la détection batch-complete ⇒ verrou FOR UPDATE sur la ligne
+  `batch` ; orphan-sweep de rétention vs signal `pending` d'un batch vide) — détail et
+  tests de régression dans la section Lot 3 du plan.
 - Le contrat webhooks (at-least-once, ordre par tâche, `on_start` = control-flow hors
-  outbox) est maintenant documenté dans `CLAUDE.md` et implémenté.
+  outbox, signal `on_batch_complete`) est documenté dans `CLAUDE.md` et implémenté.
 
 ## Process de travail utilisé (à reconduire)
 
@@ -33,9 +35,10 @@ API cible, les décisions actées avec leurs raisons, et l'historique des lots.
 - **Docker Desktop fragile** : un disque plein l'a fait crasher en laissant un
   `com.docker.backend` zombie qui survit au SIGTERM et fait croire à `open -a Docker`
   que tout tourne. Remède : `kill -9 <pid backend>` puis `open -a Docker`.
-- **Espace disque** : les builds cargo remplissent vite le disque (~22 Gi libres au moment
-  du handoff). En cas de `No space left on device` :
-  `rm -rf ~/.cargo/target/debug/incremental`.
+- **Espace disque** : les builds cargo remplissent vite le disque — il a saturé à 0
+  pendant le Lot 3 (les outils ne pouvaient même plus écrire dans /tmp). En cas de
+  `No space left on device` : `rm -rf ~/.cargo/target/debug/incremental`, ou
+  `cargo clean` si insuffisant (rebuild complet ensuite).
 - **Working tree partagé** : une autre session travaille sur `ui/` (Sidebar,
   CommandPalette…). Toujours **stager explicitement** les fichiers de son lot, jamais
   `git add -A`. Ne jamais toucher `static/dag.html` ni `ui/`.

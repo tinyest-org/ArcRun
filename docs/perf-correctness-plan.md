@@ -148,9 +148,44 @@ livraison = intervalle de la boucle (configurable ; option : wake-up immédiat v
 
 ---
 
-## Lot 3 — EN COURS (2026-06-11 — décision utilisateur, sans mesure préalable)
+## Lot 3 — ✅ FAIT (2026-06-11)
 
 > Initialement « sur preuve de besoin » ; lancé sur décision utilisateur le 2026-06-11.
+>
+> **Implémenté** : 3a (insertion groupée multi-row, dedupe-aware) + 3b (webhook
+> `on_batch_complete` via l'outbox). 174 tests d'intégration verts (162 + 12 nouveaux
+> dans `test_batch_complete.rs`), 30 unitaires. Décisions prises à l'implémentation :
+> - UUID tâches générés app-side (`Uuid::new_v4()`) ; `NewTask` porte désormais un champ `id`.
+> - Détection batch-complete centralisée dans `maybe_enqueue_batch_complete[_for_task]`
+>   (`src/db/webhook_execution.rs`), appelée depuis update_running_task, fail_task_and_propagate,
+>   stop_batch, timeout_task_and_propagate, cancel_task, et add_task (batch vide).
+> - `webhook_execution.task_id` nullable + `batch_id` nullable + `CHECK (task_id OR batch_id)`.
+> - Gate start-avant-end : les lignes `batch_complete` (task_id NULL) ne sont jamais retenues
+>   par ce gate (la corrélation `s.task_id = we.task_id` est NULL ⇒ jamais vraie) ; inoffensif
+>   car l'état (toutes tâches terminales) est déjà la vérité au moment de l'enqueue.
+> - Payload `arcrun` = `{batch_id, counts:{success,failure,canceled}, completed_at}`,
+>   counts/`completed_at = max(ended_at)` calculés à la livraison ; pas de `?handle=`.
+> - Rétention : cleanup des lignes `batch` orphelines + leurs lignes `webhook_execution` batch-level.
+
+**Relecture indépendante — 2 bugs corrigés** (régressions dans `test_batch_complete.rs`,
+validation finale : 176 tests d'intégration + 30 unitaires verts) :
+1. **Write-skew sur la détection batch-complete** : deux transactions terminant chacune
+   l'une des deux dernières tâches du batch pouvaient, sous READ COMMITTED, chacune voir
+   l'autre tâche encore non-terminale ⇒ aucune n'enqueueait, signal perdu. Fix :
+   `maybe_enqueue_batch_complete` verrouille la ligne `batch` (`FOR UPDATE`, statement
+   séparé) AVANT le check de terminalité — la seconde transaction attend le commit de la
+   première et re-vérifie sur un snapshot frais. Le verrou batch est toujours le DERNIER
+   pris dans la transaction ⇒ pas de cycle de deadlock.
+   Test : `test_batch_complete_concurrent_last_two_tasks_no_lost_signal`.
+2. **Orphan-sweep de la rétention vs batch vide** : un batch vide (tout dédupe-skipped)
+   n'a aucune tâche ⇒ « orphelin » dès sa création ; le cleanup pouvait supprimer sa
+   ligne outbox `pending` avant livraison. Fix : l'orphan-sweep exclut les batches ayant
+   une ligne `webhook_execution` encore `pending`.
+   Test : `test_cleanup_spares_batch_with_pending_signal`.
+
+Également durci en relecture : le `down.sql` de la migration purge les lignes outbox
+batch-level avant de restaurer `task_id NOT NULL` (rollback toujours réalisable), et
+`cleanup_old_terminal_tasks` est exposé `pub` pour pilotage déterministe par les tests.
 
 ### 3a — Insertion de batch groupée dans `add_task`
 

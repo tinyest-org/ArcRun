@@ -13,6 +13,7 @@
 - **Concurrency Control**: Limit concurrent task execution per task kind using rules
 - **Webhook Actions**: Execute webhooks on task start, success, failure, or cancellation
 - **At-least-once Webhook Delivery**: End/cancel webhooks use a transactional outbox — committed in the status-change transaction (so the API response reflects durable state), delivered asynchronously with retries and exponential backoff, surviving crashes. `on_start` stays synchronous (control-flow). Inspect deliveries via `GET /webhook-deliveries?status=exhausted`
+- **Batch-Complete Webhook**: Register `on_batch_complete` on `POST /task` to fire a batch-level webhook exactly once (at-least-once via the same outbox) when the *last* task of a batch reaches a terminal state. The payload carries an `arcrun` object with `batch_id`, per-status `counts`, and `completed_at`. Works across success/failure/cancel/timeout/`stop_batch`; a fully dedupe-skipped batch fires immediately.
 - **Task States**: Waiting, Pending, Claimed, Running, Success, Failure, Canceled, Paused
 - **DAG Visualization**: Built-in web UI for visualizing task DAGs with auto-layout
 - **Batch Operations**: Batch stats, stop, and live rule updates

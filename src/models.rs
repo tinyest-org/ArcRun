@@ -52,6 +52,10 @@ pub struct Action {
 #[derive(Debug, Deserialize, Insertable)]
 #[diesel(table_name = crate::schema::task)]
 pub struct NewTask {
+    /// Application-generated UUID. Lot 3a generates task UUIDs app-side (instead of
+    /// relying on the DB `DEFAULT gen_random_uuid()`) so the full `id_mapping` is
+    /// known before any insert, enabling grouped multi-row inserts.
+    pub id: uuid::Uuid,
     pub name: String,
     pub kind: String,
     pub status: StatusKind,
@@ -76,6 +80,27 @@ pub struct Link {
     pub parent_id: uuid::Uuid,
     pub child_id: uuid::Uuid,
     pub requires_success: bool,
+}
+
+/// A batch with a registered `on_batch_complete` webhook payload. A row exists only
+/// when the `POST /task` body provided `on_batch_complete`; batches without the
+/// webhook never get a row here.
+#[derive(Identifiable, Queryable, Selectable, Debug, Clone)]
+#[diesel(table_name = crate::schema::batch)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct Batch {
+    pub id: uuid::Uuid,
+    /// The `on_batch_complete` actions, stored as a JSON array of `NewActionDto`.
+    pub on_complete: serde_json::Value,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+/// Insertable struct for registering a batch-complete webhook payload.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = crate::schema::batch)]
+pub struct NewBatch {
+    pub id: uuid::Uuid,
+    pub on_complete: serde_json::Value,
 }
 
 #[derive(Associations, PartialEq, Debug, Serialize, Insertable)]
@@ -114,6 +139,10 @@ pub enum TriggerKind {
     End,
     /// Fired when the task is explicitly canceled via DELETE.
     Cancel,
+    /// Fired once when the LAST task of a batch reaches a terminal state.
+    /// Batch-level (not tied to a single task); see the `batch` table and the
+    /// `on_batch_complete` field of `POST /task`.
+    BatchComplete,
 }
 
 /// Condition that determines which End-trigger action fires.
@@ -159,7 +188,9 @@ pub enum WebhookExecutionStatus {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct WebhookExecution {
     pub id: uuid::Uuid,
-    pub task_id: uuid::Uuid,
+    /// Owning task, for task-level rows (end/cancel/start). NULL for batch-level
+    /// (`batch_complete`) rows, which are keyed by `batch_id` instead.
+    pub task_id: Option<uuid::Uuid>,
     pub trigger: TriggerKind,
     pub condition: TriggerCondition,
     pub idempotency_key: String,
@@ -172,6 +203,8 @@ pub struct WebhookExecution {
     pub next_attempt_at: chrono::DateTime<Utc>,
     /// Last delivery error message (for diagnostics via GET /webhook-deliveries).
     pub last_error: Option<String>,
+    /// Owning batch, for batch-level (`batch_complete`) rows. NULL for task-level rows.
+    pub batch_id: Option<uuid::Uuid>,
 }
 
 /// Insertable struct for creating a new webhook execution record.

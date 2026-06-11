@@ -40,6 +40,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    batch (id) {
+        id -> Uuid,
+        on_complete -> Jsonb,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     link (parent_id, child_id) {
         parent_id -> Uuid,
         child_id -> Uuid,
@@ -83,7 +91,7 @@ diesel::table! {
 
     webhook_execution (id) {
         id -> Uuid,
-        task_id -> Uuid,
+        task_id -> Nullable<Uuid>,
         trigger -> TriggerKind,
         condition -> TriggerCondition,
         idempotency_key -> Text,
@@ -93,10 +101,12 @@ diesel::table! {
         updated_at -> Timestamptz,
         next_attempt_at -> Timestamptz,
         last_error -> Nullable<Text>,
+        batch_id -> Nullable<Uuid>,
     }
 }
 
 diesel::joinable!(action -> task (task_id));
 diesel::joinable!(webhook_execution -> task (task_id));
+diesel::joinable!(webhook_execution -> batch (batch_id));
 
-diesel::allow_tables_to_appear_in_same_query!(action, link, task, webhook_execution,);
+diesel::allow_tables_to_appear_in_same_query!(action, batch, link, task, webhook_execution,);

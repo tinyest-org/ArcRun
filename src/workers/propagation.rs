@@ -343,6 +343,11 @@ pub async fn cancel_task<'a>(
             }
             enqueue_outbox_for_canceled_ancestors(&canceled_ancestors, conn).await?;
 
+            // Batch-complete detection (Lot 3b): a manual cancel can be the batch's
+            // last terminal transition.
+            db_operation::maybe_enqueue_batch_complete_for_task(&mut *conn, task_id, "cancel_task")
+                .await?;
+
             Ok(())
         })
     })

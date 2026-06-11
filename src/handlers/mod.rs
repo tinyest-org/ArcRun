@@ -154,6 +154,8 @@ pub async fn get_conn_with_retry<'a>(
     components(schemas(
         HealthResponse,
         dtos::NewTaskDto,
+        dtos::CreateTaskBody,
+        dtos::CreateTaskBatchDto,
         dtos::TaskDto,
         dtos::BasicTaskDto,
         dtos::UpdateTaskDto,

@@ -106,6 +106,14 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
             crate::workers::enqueue_outbox_for_canceled_ancestors(&canceled_ancestors, conn)
                 .await?;
 
+            // Batch-complete detection (Lot 3b): a timeout can be the last task of a batch.
+            crate::db_operation::maybe_enqueue_batch_complete_for_task(
+                conn,
+                task_id,
+                "timeout_task_and_propagate",
+            )
+            .await?;
+
             Ok(Some((t, cascade_failed, canceled_ancestors)))
         })
     })

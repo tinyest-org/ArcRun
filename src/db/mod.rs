@@ -17,7 +17,7 @@ pub use crate::rule::concurrency_lock_key;
 pub use task_crud::{
     ClaimResult, batch_claim_tasks, claim_task, claim_task_with_rules, mark_task_running,
 };
-pub(crate) use task_crud::{find_detailed_task_by_id, insert_new_task};
+pub(crate) use task_crud::{find_detailed_task_by_id, insert_task_batch};
 
 // Re-exports from task_lifecycle
 pub use task_lifecycle::{UpdateTaskResult, update_running_task};
@@ -35,12 +35,16 @@ pub(crate) use task_query::{
 pub(crate) use batch_listing::{get_batch_stats, list_batches, update_batch_rules};
 
 // Re-exports from cleanup
-pub(crate) use cleanup::cleanup_old_terminal_tasks;
+// `pub` (not pub(crate)) so integration tests can drive one cleanup pass
+// deterministically, like `run_delivery_once` / `run_claim_loop`.
+pub use cleanup::cleanup_old_terminal_tasks;
 
 // Re-exports from webhook_execution
 pub use webhook_execution::{
-    claim_due_outbox, enqueue_outbox, list_webhook_deliveries, mark_outbox_exhausted,
-    mark_outbox_retry, mark_outbox_success,
+    BatchCompletionStats, batch_completion_stats, claim_due_outbox, enqueue_batch_complete_outbox,
+    enqueue_outbox, insert_batch, list_webhook_deliveries, load_batch_on_complete,
+    mark_outbox_exhausted, mark_outbox_retry, mark_outbox_success, maybe_enqueue_batch_complete,
+    maybe_enqueue_batch_complete_for_task,
 };
 pub use webhook_execution::{complete_webhook_execution, try_claim_webhook_execution};
 

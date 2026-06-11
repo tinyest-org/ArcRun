@@ -91,6 +91,43 @@ pub struct NewTaskDto {
     pub priority: Option<i32>,
 }
 
+/// Object form of the `POST /task` body. Carries the task array plus an optional
+/// batch-level `on_batch_complete` webhook fired once when the LAST task of the
+/// batch reaches a terminal state.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateTaskBatchDto {
+    /// The tasks to create (same semantics as the bare-array form).
+    pub tasks: Vec<NewTaskDto>,
+    /// Webhook actions fired exactly once (at-least-once delivery) when the last
+    /// task of this batch becomes terminal. Executed without a `?handle=` param;
+    /// the request body carries an `arcrun` object with `batch_id`, per-status
+    /// `counts`, and `completed_at`.
+    pub on_batch_complete: Option<Vec<NewActionDto>>,
+}
+
+/// The accepted shapes of the `POST /task` request body.
+///
+/// Untagged + backwards compatible: the existing bare array `[NewTaskDto, …]` still
+/// works exactly as before, OR an object `{ "tasks": [...], "on_batch_complete": [...] }`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum CreateTaskBody {
+    /// Object form: tasks + optional batch-complete webhook.
+    WithBatch(CreateTaskBatchDto),
+    /// Legacy bare-array form.
+    Bare(Vec<NewTaskDto>),
+}
+
+impl CreateTaskBody {
+    /// Split the body into `(tasks, on_batch_complete)`.
+    pub fn into_parts(self) -> (Vec<NewTaskDto>, Option<Vec<NewActionDto>>) {
+        match self {
+            CreateTaskBody::Bare(tasks) => (tasks, None),
+            CreateTaskBody::WithBatch(b) => (b.tasks, b.on_batch_complete),
+        }
+    }
+}
+
 /// A dependency on another task within the same batch.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct Dependency {
@@ -249,9 +286,11 @@ pub struct TaskDto {
 pub struct WebhookDeliveryDto {
     /// Outbox row UUID.
     pub id: uuid::Uuid,
-    /// The task this notification is for.
-    pub task_id: uuid::Uuid,
-    /// Lifecycle trigger (End or Cancel; Start rows are delivered synchronously).
+    /// The task this notification is for. Null for batch-level (`BatchComplete`) rows.
+    pub task_id: Option<uuid::Uuid>,
+    /// The batch this notification is for. Set only for batch-level (`BatchComplete`) rows.
+    pub batch_id: Option<uuid::Uuid>,
+    /// Lifecycle trigger (End, Cancel, or BatchComplete; Start rows are delivered synchronously).
     pub trigger: TriggerKind,
     /// For End triggers, whether this is the success or failure notification.
     pub condition: TriggerCondition,
@@ -276,6 +315,7 @@ impl From<WebhookExecution> for WebhookDeliveryDto {
         Self {
             id: w.id,
             task_id: w.task_id,
+            batch_id: w.batch_id,
             trigger: w.trigger,
             condition: w.condition,
             idempotency_key: w.idempotency_key,

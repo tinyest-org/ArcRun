@@ -106,10 +106,25 @@ async fn deliver_row<'a>(
     let trigger_label = trigger_label(row.trigger, row.condition);
     let key = &row.idempotency_key;
 
+    // Batch-level (batch_complete) rows take a dedicated path (no task, no handle).
+    if row.trigger == TriggerKind::BatchComplete {
+        return deliver_batch_complete_row(evaluator, conn, row, cfg).await;
+    }
+
+    // Task-level rows must have a task_id (DB CHECK guarantees one of task/batch).
+    let Some(row_task_id) = row.task_id else {
+        log::error!(
+            "Delivery worker: task-level outbox key {} has NULL task_id; marking success",
+            key
+        );
+        db_operation::mark_outbox_success(conn, key).await?;
+        return Ok(());
+    };
+
     // Load the task (it must still exist; if it was deleted by retention we treat
     // the delivery as vacuously done).
     let task: Option<Task> = task_tbl
-        .filter(task_id_col.eq(row.task_id))
+        .filter(task_id_col.eq(row_task_id))
         .first::<Task>(conn)
         .await
         .optional()?;
@@ -117,7 +132,7 @@ async fn deliver_row<'a>(
     let Some(task) = task else {
         log::warn!(
             "Delivery worker: task {} for outbox key {} no longer exists; marking success",
-            row.task_id,
+            row_task_id,
             key
         );
         db_operation::mark_outbox_success(conn, key).await?;
@@ -189,6 +204,116 @@ async fn deliver_row<'a>(
     Ok(())
 }
 
+/// Deliver a batch-complete outbox row: load the batch's `on_complete` payload,
+/// execute each action WITHOUT a `?handle=` (no task to drive), with an `arcrun`
+/// enrichment of `{batch_id, counts, completed_at}` merged into the body.
+async fn deliver_batch_complete_row<'a>(
+    evaluator: &ActionExecutor,
+    conn: &mut Conn<'a>,
+    row: &WebhookExecution,
+    cfg: DeliveryConfig,
+) -> Result<(), db_operation::DbError> {
+    let key = &row.idempotency_key;
+    let trigger_label = "batch_complete";
+
+    let Some(batch_id) = row.batch_id else {
+        log::error!(
+            "Delivery worker: batch_complete outbox key {} has NULL batch_id; marking success",
+            key
+        );
+        db_operation::mark_outbox_success(conn, key).await?;
+        return Ok(());
+    };
+
+    // Load the batch payload. If the batch row is gone (e.g. retention removed it),
+    // treat delivery as vacuously done.
+    let on_complete = db_operation::load_batch_on_complete(conn, batch_id).await?;
+    let Some(on_complete) = on_complete else {
+        log::warn!(
+            "Delivery worker: batch {} for outbox key {} no longer exists; marking success",
+            batch_id,
+            key
+        );
+        db_operation::mark_outbox_success(conn, key).await?;
+        return Ok(());
+    };
+
+    let actions: Vec<crate::dtos::NewActionDto> = match serde_json::from_value(on_complete) {
+        Ok(a) => a,
+        Err(e) => {
+            // Malformed payload: this can never succeed, so exhaust immediately.
+            log::error!(
+                "Delivery worker: batch {} on_complete payload is malformed: {}",
+                batch_id,
+                e
+            );
+            db_operation::mark_outbox_exhausted(conn, key, &format!("malformed payload: {}", e))
+                .await?;
+            metrics::record_webhook_delivery_exhausted(trigger_label);
+            return Ok(());
+        }
+    };
+
+    if actions.is_empty() {
+        record_lag(row);
+        db_operation::mark_outbox_success(conn, key).await?;
+        return Ok(());
+    }
+
+    // Compute counts + completed_at at delivery time.
+    let stats = db_operation::batch_completion_stats(conn, batch_id).await?;
+    let completed_at = stats.completed_at.unwrap_or(row.updated_at);
+    let enrichment = serde_json::json!({
+        "batch_id": batch_id,
+        "counts": {
+            "success": stats.success,
+            "failure": stats.failure,
+            "canceled": stats.canceled,
+        },
+        "completed_at": completed_at,
+        "trigger": "batch_complete",
+    });
+
+    let mut errors: Vec<String> = Vec::new();
+    for act in &actions {
+        match evaluator
+            .execute_batch_action(act, Some(key), enrichment.clone())
+            .await
+        {
+            Ok(_) => log::debug!("Delivery worker: batch_complete action delivered"),
+            Err(e) => {
+                log::warn!("Delivery worker: batch_complete action failed: {}", e);
+                errors.push(e);
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        record_lag(row);
+        db_operation::mark_outbox_success(conn, key).await?;
+        return Ok(());
+    }
+
+    let error_msg = errors.join("; ");
+    let attempts_after = row.attempts + 1;
+    if attempts_after >= cfg.max_attempts {
+        log::error!(
+            "Delivery worker: batch_complete outbox key {} exhausted after {} attempts: {}",
+            key,
+            attempts_after,
+            error_msg
+        );
+        db_operation::mark_outbox_exhausted(conn, key, &error_msg).await?;
+        metrics::record_webhook_delivery_exhausted(trigger_label);
+    } else {
+        let backoff = compute_backoff(row.attempts, cfg);
+        db_operation::mark_outbox_retry(conn, key, &error_msg, backoff).await?;
+        metrics::record_webhook_delivery_retry(trigger_label);
+    }
+
+    Ok(())
+}
+
 /// Exponential backoff: `base^(prior_attempts + 1)` seconds, capped.
 /// First failure (prior_attempts = 0) => base^1; second => base^2; etc.
 fn compute_backoff(prior_attempts: i32, cfg: DeliveryConfig) -> i64 {
@@ -217,6 +342,7 @@ fn trigger_label(trigger: TriggerKind, condition: TriggerCondition) -> &'static 
         (TriggerKind::End, TriggerCondition::Failure) => "end_failure",
         (TriggerKind::Cancel, _) => "cancel",
         (TriggerKind::Start, _) => "start",
+        (TriggerKind::BatchComplete, _) => "batch_complete",
     }
 }
 
