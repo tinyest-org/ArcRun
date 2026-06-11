@@ -7,12 +7,14 @@ interface Props {
 }
 
 const SHORTCUTS: { key: string; description: string }[] = [
+  { key: '⌘K', description: 'Command palette' },
   { key: '1', description: '2D DAG view' },
   { key: '2', description: '3D isometric view' },
   { key: '3', description: 'Table view' },
   { key: '4', description: 'Timeline view' },
   { key: 'F', description: 'Fit / reset camera' },
   { key: 'C', description: 'Toggle critical path' },
+  { key: 'R', description: 'Refresh now' },
   { key: 'Esc', description: 'Close panels / modals' },
   { key: '?', description: 'Show this help' },
 ];

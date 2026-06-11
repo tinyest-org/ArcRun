@@ -7,6 +7,25 @@ import { STATUS_BG_CLASSES, STATUS_ORDER } from '../constants';
 import { Input, Button } from 'glass-ui-solid';
 import { useTheme } from '../App';
 import { timeAgo } from '../lib/format';
+import { setPaletteOpen } from '../lib/commands';
+import BatchMiniProgress from '../components/BatchMiniProgress';
+import { IconSearch } from '../components/icons';
+
+function SkeletonCard() {
+  return (
+    <div class="animate-pulse rounded-lg border border-white/10 bg-white/5 px-4 py-3">
+      <div class="flex items-center justify-between">
+        <div class="h-3 w-28 rounded bg-white/10" />
+        <div class="h-2.5 w-12 rounded bg-white/10" />
+      </div>
+      <div class="mt-3 flex gap-2">
+        <div class="h-3 w-14 rounded bg-white/10" />
+        <div class="h-3 w-10 rounded bg-white/10" />
+      </div>
+      <div class="mt-3 h-1 w-full rounded-full bg-white/10" />
+    </div>
+  );
+}
 
 export default function BatchesPage() {
   const navigate = useNavigate();
@@ -20,6 +39,7 @@ export default function BatchesPage() {
   const [directId, setDirectId] = createSignal('');
 
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  let searchInputWrapper: HTMLDivElement | undefined;
   const PAGE_SIZE = 20;
 
   const recents = () => getRecentBatches();
@@ -45,8 +65,22 @@ export default function BatchesPage() {
     }
   };
 
-  onMount(() => load(0));
-  onCleanup(() => clearTimeout(debounceTimer));
+  function handleKeyDown(e: KeyboardEvent) {
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    if (e.key === '/') {
+      e.preventDefault();
+      searchInputWrapper?.querySelector('input')?.focus();
+    }
+  }
+
+  onMount(() => {
+    load(0);
+    window.addEventListener('keydown', handleKeyDown);
+  });
+  onCleanup(() => {
+    clearTimeout(debounceTimer);
+    window.removeEventListener('keydown', handleKeyDown);
+  });
 
   // Debounced search
   createEffect(
@@ -72,11 +106,20 @@ export default function BatchesPage() {
   return (
     <div class="flex flex-1 flex-col overflow-hidden">
       <header class="glass-navbar relative z-10 flex items-center gap-3 px-5 py-3">
-        <h1 class="text-lg font-medium" style={{ color: 'var(--accent)' }}>ArcRun</h1>
-        <div class="ml-auto">
+        <h1 class="text-base font-medium text-white/90">Batches</h1>
+        <div class="ml-auto flex items-center gap-2">
+          <button
+            title="Command palette (Cmd+K)"
+            aria-label="Open command palette"
+            class="icon-btn"
+            onClick={() => setPaletteOpen(true)}
+          >
+            <IconSearch size={14} />
+          </button>
+          {/* Theme toggle shown only on mobile, where the sidebar is hidden */}
           <button
             title={`Switch to ${theme() === 'dark' ? 'light' : 'dark'} mode`}
-            class="theme-btn rounded-md border px-2 py-1 text-xs transition-colors hover:opacity-80"
+            class="theme-btn rounded-md border px-2 py-1 text-xs transition-colors hover:opacity-80 sm:hidden"
             onClick={toggleTheme}
           >
             {theme() === 'dark' ? 'Light' : 'Dark'}
@@ -118,6 +161,7 @@ export default function BatchesPage() {
                 {(bid) => (
                   <button
                     class="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 font-mono text-xs text-white/70 transition hover:bg-white/10"
+                    title={bid}
                     onClick={() => goToBatch(bid)}
                   >
                     {bid.substring(0, 8)}...
@@ -130,24 +174,46 @@ export default function BatchesPage() {
 
         {/* Search */}
         <div class="mb-4">
-          <h2 class="mb-2 text-xs font-medium uppercase tracking-wider text-white/40">
-            All Batches
-          </h2>
-          <Input
-            value={search()}
-            onInput={setSearch}
-            placeholder="Search by name..."
-            size="sm"
-            class="w-full sm:w-96"
-          />
+          <div class="mb-2 flex items-center gap-2">
+            <h2 class="text-xs font-medium uppercase tracking-wider text-white/40">
+              All Batches
+            </h2>
+            <button
+              title="Refresh batch list"
+              aria-label="Refresh batch list"
+              class="theme-btn rounded-md border px-1.5 py-0.5 text-[10px] transition-colors"
+              classList={{ 'opacity-50': loading() }}
+              disabled={loading()}
+              onClick={() => load(0)}
+            >
+              &#x21bb; Refresh
+            </button>
+          </div>
+          <div ref={searchInputWrapper}>
+            <Input
+              value={search()}
+              onInput={setSearch}
+              placeholder="Search by name...  ( / )"
+              size="sm"
+              class="w-full sm:w-96"
+            />
+          </div>
         </div>
 
         <Show when={error()}>
-          <div class="mb-2 text-xs text-red-400">{error()}</div>
+          <div class="mb-3 flex items-center gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+            <span>{error()}</span>
+            <button class="ml-auto underline hover:text-red-300" onClick={() => load(0)}>
+              Retry
+            </button>
+          </div>
         </Show>
 
+        {/* Skeleton loading */}
         <Show when={loading() && batches().length === 0}>
-          <div class="text-sm text-white/50">Loading...</div>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            <For each={Array.from({ length: 8 })}>{() => <SkeletonCard />}</For>
+          </div>
         </Show>
 
         {/* Batch grid */}
@@ -159,7 +225,7 @@ export default function BatchesPage() {
                 onClick={() => goToBatch(batch.batch_id)}
               >
                 <div class="flex items-center justify-between">
-                  <span class="font-mono text-xs text-white/80">
+                  <span class="font-mono text-xs text-white/80" title={batch.batch_id}>
                     {batch.batch_id.substring(0, 12)}...
                   </span>
                   <span class="text-[10px] text-white/40">
@@ -198,13 +264,26 @@ export default function BatchesPage() {
                     }}
                   </For>
                 </div>
+                <div class="mt-2.5">
+                  <BatchMiniProgress counts={batch.status_counts} total={batch.total_tasks} />
+                </div>
               </button>
             )}
           </For>
         </div>
 
         <Show when={batches().length === 0 && !loading()}>
-          <div class="mt-4 text-sm text-white/40">No batches found</div>
+          <div class="mt-8 flex flex-col items-center gap-2 text-center">
+            <span class="text-2xl text-white/20" aria-hidden="true">&#x25C7;</span>
+            <p class="text-sm text-white/50">
+              {search().trim() ? `No batches match "${search().trim()}"` : 'No batches yet'}
+            </p>
+            <p class="text-xs text-white/30">
+              {search().trim()
+                ? 'Try a different search, or paste a batch ID above.'
+                : 'Batches appear here once tasks are created via POST /task.'}
+            </p>
+          </div>
         </Show>
 
         <Show when={hasMore() && !loading()}>

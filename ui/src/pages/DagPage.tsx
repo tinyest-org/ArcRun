@@ -18,7 +18,7 @@ import ConfirmModal from '../components/ConfirmModal';
 import { notifyStatusChanges } from '../components/ToastContainer';
 import { computeCriticalPath, type CriticalPath } from '../lib/criticalPath';
 import { exportTasksCsv } from '../lib/exportCsv';
-import { useTheme } from '../App';
+import { setPaletteOpen, setPageCommands, setTaskSource } from '../lib/commands';
 import ErrorBoundary from '../components/ErrorBoundary';
 
 export default function DagPage() {
@@ -39,8 +39,7 @@ export default function DagPage() {
   const [showRulesEditor, setShowRulesEditor] = createSignal(false);
   const [showCriticalPath, setShowCriticalPath] = createSignal(false);
   const [showKeyboardHelp, setShowKeyboardHelp] = createSignal(false);
-
-  const { theme, toggle: toggleTheme } = useTheme();
+  const [lastRefreshed, setLastRefreshed] = createSignal<number | null>(null);
 
   const windowManager = useWindowManager();
   const windowHandles = new Map<string, ReturnType<typeof windowManager.register>>();
@@ -168,6 +167,7 @@ export default function DagPage() {
         }
         setDagData(data);
       }
+      setLastRefreshed(Date.now());
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Failed to load DAG';
       setError(msg);
@@ -238,6 +238,16 @@ export default function DagPage() {
 
   let resetIsoCamera: (() => void) | undefined;
 
+  function fitView() {
+    if (viewMode() === 'dag') canvasApi?.fit();
+    else resetIsoCamera?.();
+  }
+
+  function exportCsv() {
+    const data = filteredData();
+    if (data) exportTasksCsv(data.tasks);
+  }
+
   async function handleBulkCancel(taskIds: string[]) {
     if (taskIds.length === 0) return;
     const results = await Promise.allSettled(taskIds.map((id) => cancelTask(id)));
@@ -288,6 +298,10 @@ export default function DagPage() {
       case 'C':
         if (dagData()) setShowCriticalPath((v) => !v);
         break;
+      case 'r':
+      case 'R':
+        loadDag();
+        break;
       case '?':
         setShowKeyboardHelp((v) => !v);
         break;
@@ -306,11 +320,30 @@ export default function DagPage() {
 
   onMount(() => {
     window.addEventListener('keydown', handleKeyDown);
+
+    // Register contextual commands + task search for the command palette
+    setPageCommands([
+      { id: 'view-2d', label: 'Switch to 2D DAG view', group: 'View', hint: '1', action: () => setViewMode('dag') },
+      { id: 'view-3d', label: 'Switch to 3D isometric view', group: 'View', hint: '2', action: () => setViewMode('iso') },
+      { id: 'view-table', label: 'Switch to table view', group: 'View', hint: '3', action: () => setViewMode('table') },
+      { id: 'view-timeline', label: 'Switch to timeline view', group: 'View', hint: '4', action: () => setViewMode('timeline') },
+      { id: 'fit-view', label: 'Fit view / reset camera', group: 'View', hint: 'F', action: fitView },
+      { id: 'critical-path', label: 'Toggle critical path', group: 'View', hint: 'C', action: () => setShowCriticalPath((v) => !v) },
+      { id: 'refresh', label: 'Refresh DAG', group: 'Actions', hint: 'R', action: () => loadDag() },
+      { id: 'export-csv', label: 'Export tasks as CSV', group: 'Actions', keywords: 'download', action: exportCsv },
+      { id: 'edit-rules', label: 'Edit batch rules', group: 'Actions', keywords: 'concurrency capacity', action: () => setShowRulesEditor(true) },
+      { id: 'close-windows', label: 'Close all task windows', group: 'Actions', action: clearAllWindows },
+      { id: 'cancel-batch', label: 'Cancel batch...', group: 'Actions', keywords: 'stop abort', action: () => setShowCancelConfirm(true) },
+      { id: 'shortcuts', label: 'Show keyboard shortcuts', group: 'Actions', hint: '?', action: () => setShowKeyboardHelp(true) },
+    ]);
+    setTaskSource({ tasks: () => dagData()?.tasks ?? [], open: openTask });
   });
 
   onCleanup(() => {
     if (refreshTimer) clearTimeout(refreshTimer);
     window.removeEventListener('keydown', handleKeyDown);
+    setPageCommands([]);
+    setTaskSource(null);
   });
 
   const batchIdShort = () => {
@@ -329,9 +362,15 @@ export default function DagPage() {
         showCriticalPath={showCriticalPath()}
         openTaskCount={openTaskIds().length}
         hasActiveTasks={hasActiveTasks()}
-        theme={theme()}
         activeFilters={activeFilters()}
         activeKinds={activeKinds()}
+        loading={loading()}
+        lastRefreshed={lastRefreshed()}
+        onRefresh={() => loadDag()}
+        onClearFilters={() => {
+          setActiveFilters(new Set<TaskStatus>());
+          setActiveKinds(new Set<string>());
+        }}
         onNavigateHome={() => navigate('/')}
         onSetViewMode={setViewMode}
         onSetIsoGroupBy={setIsoGroupBy}
@@ -339,16 +378,10 @@ export default function DagPage() {
         onCloseAllWindows={clearAllWindows}
         onEditRules={() => setShowRulesEditor(true)}
         onCancelBatch={() => setShowCancelConfirm(true)}
-        onExportCsv={() => {
-          const data = filteredData();
-          if (data) exportTasksCsv(data.tasks);
-        }}
-        onToggleTheme={toggleTheme}
+        onExportCsv={exportCsv}
         onShowHelp={() => setShowKeyboardHelp(true)}
-        onFitView={() => {
-          if (viewMode() === 'dag') canvasApi?.fit();
-          else resetIsoCamera?.();
-        }}
+        onFitView={fitView}
+        onOpenPalette={() => setPaletteOpen(true)}
         onToggleStatusFilter={toggleStatusFilter}
         onToggleKindFilter={toggleKindFilter}
       />

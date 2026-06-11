@@ -4,6 +4,8 @@ import { createSignal, createContext, useContext, onMount } from 'solid-js';
 import type { JSX } from 'solid-js';
 import ToastContainer from './components/ToastContainer';
 import ErrorBoundary from './components/ErrorBoundary';
+import Sidebar from './components/Sidebar';
+import CommandPalette from './components/CommandPalette';
 import { getTheme, setTheme as persistTheme, type Theme } from './storage';
 
 interface ThemeCtx {
@@ -39,12 +41,16 @@ export default function App(props: { children?: JSX.Element }) {
   return (
     <ThemeContext.Provider value={{ theme, toggle }}>
       <div
-        class="flex h-screen flex-col transition-colors duration-300"
+        class="flex h-screen transition-colors duration-300"
         style={{ background: 'var(--bg-app)' }}
       >
         <ErrorBoundary>
-          {props.children}
+          <Sidebar />
+          <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
+            {props.children}
+          </div>
         </ErrorBoundary>
+        <CommandPalette />
         <ToastContainer />
       </div>
     </ThemeContext.Provider>

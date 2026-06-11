@@ -1,7 +1,7 @@
 import { createSignal, createMemo, createEffect, For, Show } from 'solid-js';
 import type { DagResponse, BasicTask } from '../types';
 import { STATUS_BG_CLASSES } from '../constants';
-import { formatTime } from '../lib/format';
+import { formatTime, formatDurationFromDates } from '../lib/format';
 
 interface Props {
   data: DagResponse | null;
@@ -16,6 +16,7 @@ type SortKey =
   | 'created_at'
   | 'started_at'
   | 'ended_at'
+  | 'duration'
   | 'success'
   | 'failures'
   | 'progress';
@@ -27,6 +28,7 @@ const COLUMNS: { key: SortKey; label: string; filterable?: boolean }[] = [
   { key: 'created_at', label: 'Created' },
   { key: 'started_at', label: 'Started' },
   { key: 'ended_at', label: 'Ended' },
+  { key: 'duration', label: 'Duration' },
   { key: 'success', label: 'Success' },
   { key: 'failures', label: 'Failures' },
   { key: 'progress', label: 'Progress' },
@@ -37,6 +39,12 @@ function progressPct(t: BasicTask): number | null {
   return Math.min(100, Math.round(((t.success + t.failures) / t.expected_count) * 100));
 }
 
+function durationMs(t: BasicTask): number | null {
+  if (!t.started_at) return null;
+  const end = t.ended_at ? new Date(t.ended_at).getTime() : Date.now();
+  return end - new Date(t.started_at).getTime();
+}
+
 function compare(a: BasicTask, b: BasicTask, key: SortKey): number {
   if (key === 'progress') {
     const ap = progressPct(a);
@@ -45,6 +53,14 @@ function compare(a: BasicTask, b: BasicTask, key: SortKey): number {
     if (ap == null) return 1;
     if (bp == null) return -1;
     return ap - bp;
+  }
+  if (key === 'duration') {
+    const ad = durationMs(a);
+    const bd = durationMs(b);
+    if (ad == null && bd == null) return 0;
+    if (ad == null) return 1;
+    if (bd == null) return -1;
+    return ad - bd;
   }
   const av = a[key];
   const bv = b[key];
@@ -120,7 +136,7 @@ export default function TaskTable(props: Props) {
     const sel = selectedIds();
     const allSelected = tasks.length > 0 && tasks.every((t) => sel.has(t.id));
     if (allSelected) {
-      setSelectedIds(new Set());
+      setSelectedIds(new Set<string>());
     } else {
       setSelectedIds(new Set(tasks.map((t) => t.id)));
     }
@@ -143,7 +159,7 @@ export default function TaskTable(props: Props) {
         }
       >
         <table class="w-full border-collapse text-sm text-white/90">
-          <thead>
+          <thead class="sticky top-0 z-10 bg-[#0a0a1a]">
             <tr class="border-b border-white/10">
               <th class="w-8 px-2 py-2">
                 <input
@@ -188,7 +204,7 @@ export default function TaskTable(props: Props) {
                   class="w-full rounded border border-white/10 bg-white/5 px-2 py-0.5 text-xs text-white/80 placeholder-white/30 outline-none focus:border-white/30"
                 />
               </td>
-              <td colspan={7} class="px-3 py-1">
+              <td colspan={8} class="px-3 py-1">
                 <Show when={hasFilters()}>
                   <button
                     class="text-xs text-white/40 hover:text-white/70"
@@ -231,6 +247,15 @@ export default function TaskTable(props: Props) {
                   <td class="px-3 py-2 text-white/50">{formatTime(task.created_at)}</td>
                   <td class="px-3 py-2 text-white/50">{formatTime(task.started_at)}</td>
                   <td class="px-3 py-2 text-white/50">{formatTime(task.ended_at)}</td>
+                  <td
+                    class="px-3 py-2 font-mono text-xs"
+                    classList={{
+                      'text-blue-400': task.status === 'Running',
+                      'text-white/50': task.status !== 'Running',
+                    }}
+                  >
+                    {formatDurationFromDates(task.started_at, task.ended_at)}
+                  </td>
                   <td class="px-3 py-2 text-center">{task.success}</td>
                   <td class="px-3 py-2 text-center">{task.failures}</td>
                   <td class="px-3 py-2 text-center">
@@ -252,13 +277,22 @@ export default function TaskTable(props: Props) {
             </For>
             <Show when={filteredAndSortedTasks().length === 0 && hasFilters()}>
               <tr>
-                <td colspan={10} class="px-3 py-4 text-center text-xs text-white/40">
+                <td colspan={11} class="px-3 py-4 text-center text-xs text-white/40">
                   No tasks match the current filters
                 </td>
               </tr>
             </Show>
           </tbody>
         </table>
+        <div class="mt-2 px-3 text-xs text-white/40">
+          {(() => {
+            const shown = filteredAndSortedTasks().length;
+            const total = props.data?.tasks.length ?? 0;
+            return hasFilters() && shown !== total
+              ? `${shown} of ${total} tasks`
+              : `${total} task${total !== 1 ? 's' : ''}`;
+          })()}
+        </div>
       </Show>
 
       {/* Floating bulk action bar */}
@@ -273,7 +307,7 @@ export default function TaskTable(props: Props) {
               onClick={() => {
                 const ids = cancelableSelected().map((t) => t.id);
                 props.onBulkCancel?.(ids);
-                setSelectedIds(new Set());
+                setSelectedIds(new Set<string>());
               }}
             >
               Cancel {cancelableSelected().length} task{cancelableSelected().length !== 1 ? 's' : ''}
@@ -281,7 +315,7 @@ export default function TaskTable(props: Props) {
           </Show>
           <button
             class="text-xs text-white/40 hover:text-white/70"
-            onClick={() => setSelectedIds(new Set())}
+            onClick={() => setSelectedIds(new Set<string>())}
           >
             Clear
           </button>

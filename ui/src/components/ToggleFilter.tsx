@@ -25,6 +25,8 @@ export default function ToggleFilter(props: Props) {
           return (
             <button
               class="flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors"
+              aria-pressed={isActive()}
+              title={`${isActive() ? 'Remove' : 'Add'} filter: ${item.label}`}
               classList={{
                 'border-white/20 bg-white/5 text-white/60 hover:bg-white/10': !isActive(),
                 [activeStyle]: isActive(),

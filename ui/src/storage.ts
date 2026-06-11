@@ -19,6 +19,17 @@ export function addRecentBatch(id: string): void {
   localStorage.setItem(RECENT_BATCHES_KEY, JSON.stringify(recents));
 }
 
+// Sidebar
+const SIDEBAR_KEY = 'arcrun-sidebar-collapsed';
+
+export function getSidebarCollapsed(): boolean {
+  return localStorage.getItem(SIDEBAR_KEY) === '1';
+}
+
+export function setSidebarCollapsed(collapsed: boolean): void {
+  localStorage.setItem(SIDEBAR_KEY, collapsed ? '1' : '0');
+}
+
 // Theme
 const THEME_KEY = 'arcrun-theme';
 export type Theme = 'dark' | 'light';

@@ -109,7 +109,7 @@ export default function TaskInfoPanel(props: Props) {
       zIndex={props.zIndex()}
       onFocus={props.onFocus}
     >
-      <InfoRow label="ID" value={task().id} mono />
+      <InfoRow label="ID" value={task().id} mono copyable />
       <InfoRow label="Name" value={task().name} />
       <InfoRow label="Kind" value={task().kind} />
       <Show when={task().dead_end_barrier}>
@@ -326,15 +326,38 @@ export default function TaskInfoPanel(props: Props) {
   );
 }
 
-function InfoRow(props: { label: string; value: string; mono?: boolean }) {
+function InfoRow(props: { label: string; value: string; mono?: boolean; copyable?: boolean }) {
+  const [copied, setCopied] = createSignal(false);
+
+  function copy() {
+    navigator.clipboard?.writeText(props.value).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
   return (
     <div class="flex items-center justify-between border-b border-white/10 py-1.5 last:border-b-0">
       <span class="text-white/50">{props.label}</span>
-      <span
-        class={`max-w-[60%] text-right text-xs text-white/90 ${props.mono ? 'break-all font-mono' : ''}`}
+      <Show
+        when={props.copyable}
+        fallback={
+          <span
+            class={`max-w-[60%] text-right text-xs text-white/90 ${props.mono ? 'break-all font-mono' : ''}`}
+          >
+            {props.value}
+          </span>
+        }
       >
-        {props.value}
-      </span>
+        <button
+          class={`max-w-[60%] cursor-pointer text-right text-xs text-white/90 transition-colors hover:text-white ${props.mono ? 'break-all font-mono' : ''}`}
+          title={copied() ? 'Copied!' : 'Click to copy'}
+          aria-label={`Copy ${props.label} to clipboard`}
+          onClick={copy}
+        >
+          {copied() ? 'Copied!' : props.value}
+        </button>
+      </Show>
     </div>
   );
 }

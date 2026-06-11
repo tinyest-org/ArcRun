@@ -50,12 +50,21 @@ export function notifyStatusChanges(
   }, 4000);
 }
 
+function dismissToast(id: number) {
+  setToasts((prev) => prev.filter((t) => t.id !== id));
+}
+
 export default function ToastContainer() {
   return (
     <div class="pointer-events-none fixed right-5 top-16 z-50 flex flex-col gap-2">
       <For each={toasts()}>
         {(toast) => (
-          <div class="toast-slide-in pointer-events-auto rounded-lg border border-white/10 bg-black/85 px-3 py-2 text-xs text-white/90 backdrop-blur-sm">
+          <div
+            class="toast-slide-in pointer-events-auto cursor-pointer rounded-lg border border-white/10 bg-black/85 px-3 py-2 text-xs text-white/90 backdrop-blur-sm transition-opacity hover:opacity-80"
+            role="status"
+            title="Click to dismiss"
+            onClick={() => dismissToast(toast.id)}
+          >
             <Show when={toast.summary}>
               <span>{toast.summary}</span>
             </Show>
