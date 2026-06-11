@@ -12,6 +12,7 @@ mod test_batch_update;
 mod test_bug_audit1;
 mod test_bug_audit2;
 mod test_cancel_webhook;
+mod test_claim_loop;
 mod test_concurrency;
 mod test_crud;
 mod test_dag;

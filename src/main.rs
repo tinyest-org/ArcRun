@@ -62,12 +62,16 @@ async fn main() -> std::io::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let circuit_breaker = create_circuit_breaker(&config);
-    let action_context = Arc::new(new_action_executor(&config));
+    // Instantiate a single ActionExecutor and share it between the workers and
+    // AppState. ActionExecutor is Clone and wraps a reqwest::Client (internally an
+    // Arc), so clones share the same HTTP connection pool.
+    let action_executor = new_action_executor(&config);
+    let action_context = Arc::new(action_executor.clone());
 
     let app_data = AppState {
         pool: pool.clone(),
         sender,
-        action_executor: new_action_executor(&config),
+        action_executor,
         config: config.clone(),
         circuit_breaker,
     };

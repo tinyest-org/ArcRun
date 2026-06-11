@@ -14,7 +14,9 @@ pub(crate) type DbError = crate::error::ArcRunError;
 
 // Re-exports from task_crud
 pub use crate::rule::concurrency_lock_key;
-pub use task_crud::{ClaimResult, claim_task, claim_task_with_rules, mark_task_running};
+pub use task_crud::{
+    ClaimResult, batch_claim_tasks, claim_task, claim_task_with_rules, mark_task_running,
+};
 pub(crate) use task_crud::{find_detailed_task_by_id, insert_new_task};
 
 // Re-exports from task_lifecycle
@@ -25,8 +27,8 @@ pub(crate) use task_lifecycle::{
 
 // Re-exports from task_query
 pub(crate) use task_query::{
-    find_timed_out_tasks, get_dag_for_batch, list_all_pending, list_task_filtered_paged,
-    requeue_stale_claimed_tasks, timeout_task_and_propagate,
+    PendingCursor, find_timed_out_tasks, get_dag_for_batch, list_pending_page,
+    list_task_filtered_paged, requeue_stale_claimed_tasks, timeout_task_and_propagate,
 };
 
 // Re-exports from batch_listing

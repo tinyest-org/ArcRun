@@ -1,0 +1,11 @@
+-- Drop the redundant single-column index on task(status).
+--
+-- idx_task_status ON task(status) is redundant because two composite indexes
+-- already have `status` as their leading column and can satisfy status-only
+-- lookups via a leftmost-prefix scan:
+--   * idx_task_priority    ON task(status, priority DESC, created_at ASC)
+--   * idx_task_status_kind ON task(status, kind)
+--
+-- Removing it reduces write amplification on the task table (one fewer index
+-- to maintain on every insert/update) without losing query coverage.
+DROP INDEX IF EXISTS idx_task_status;

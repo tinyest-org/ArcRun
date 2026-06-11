@@ -70,77 +70,202 @@ pub async fn start_loop(
     }
 }
 
-/// Phase 1: Fetch pending tasks (with LIMIT) and claim them sequentially.
-/// Returns the list of successfully claimed tasks.
-async fn claim_phase(pool: &DbPool, _batch_size: i64) -> Vec<Task> {
+/// Internal page size for the paginated claim scan. Bounds the memory used per
+/// iteration (a page of full Task rows, including JSONB) while keeping the entire
+/// Pending backlog *visible* across pages — visibility is never limited by the cap,
+/// only memory is. See `docs/perf-correctness-plan.md`, "Lot 1".
+const CLAIM_PAGE_SIZE: i64 = 500;
+
+/// Phase 1: Scan Pending tasks page-by-page (keyset pagination) and claim them.
+/// `claim_cap` (= `WORKER_START_BATCH_SIZE`) bounds the number of claims per
+/// iteration. Returns the list of successfully claimed tasks.
+async fn claim_phase(pool: &DbPool, claim_cap: i64) -> Vec<Task> {
     let conn = pool.get();
     let Ok(mut conn) = conn.await else {
         log::error!("Start worker: failed to acquire DB connection for claim phase");
         return vec![];
     };
 
-    let res = db_operation::list_all_pending(&mut conn).await;
-    let tasks = match res {
-        Ok(tasks) => tasks,
-        Err(e) => {
-            log::error!("Start worker: error fetching pending tasks: {:?}", e);
-            return vec![];
-        }
-    };
+    run_claim_loop(&mut conn, claim_cap, CLAIM_PAGE_SIZE).await
+}
 
+/// Paginated claim loop, factored out of `claim_phase` so tests can drive it with a
+/// small `page_size`. Scans Pending tasks ordered by `priority DESC, created_at ASC,
+/// id ASC` via keyset pagination, claiming up to `claim_cap` tasks.
+///
+/// Within each page, tasks are processed strictly in order:
+/// - Rule-free tasks (empty `start_condition`) are accumulated into a contiguous
+///   batch and claimed with a single `batch_claim_tasks` UPDATE. The batch is
+///   flushed (claimed) as soon as we hit a rule-bearing task, the end of the page,
+///   or the claim cap — never *across* a rule-bearing task (which could otherwise
+///   invert priority: a low-priority rule-free run gets counted by a higher-priority
+///   rule-bearing task's concurrency rule).
+/// - Rule-bearing tasks are claimed one at a time via `claim_task_with_rules`, with
+///   the `ko` cache of blocked concurrency lock keys carried across pages.
+///
+/// Early stop is gated on `claimed >= claim_cap` (we stop because we have work, not
+/// blindly). A short (incomplete) page means the backlog is exhausted -> stop.
+pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: i64) -> Vec<Task> {
     let mut ctx = EvaluationContext { ko: HashSet::new() };
-    let mut claimed = Vec::new();
+    let mut claimed: Vec<Task> = Vec::new();
+    let mut cursor: Option<db_operation::PendingCursor> = None;
 
-    log::debug!("Start worker: found {} pending tasks", tasks.len());
+    'pages: loop {
+        let page = match db_operation::list_pending_page(conn, cursor.as_ref(), page_size).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Start worker: error fetching pending page: {:?}", e);
+                break 'pages;
+            }
+        };
 
-    for t in tasks {
-        // Pre-filter: if we already know a rule is blocked in this
-        // iteration, skip the DB call entirely.
-        if is_prefilter_blocked(&t, &ctx) {
-            metrics::record_task_blocked_by_concurrency();
-            log::warn!("Start worker: task {} blocked by cached rule", t.id);
-            continue;
+        let page_len = page.len();
+        log::debug!("Start worker: fetched page of {} pending tasks", page_len);
+
+        // Advance the cursor to the last row of this page before consuming it.
+        if let Some(last) = page.last() {
+            cursor = Some(db_operation::PendingCursor::from(last));
         }
 
-        // Atomically check concurrency rules + claim in a single transaction
-        match db_operation::claim_task_with_rules(&mut conn, &t).await {
-            Ok(db_operation::ClaimResult::Claimed) => {
-                metrics::record_status_transition("Pending", "Claimed");
-                claimed.push(t);
-            }
-            Ok(db_operation::ClaimResult::RuleBlocked) => {
-                // Cache the blocked lock keys for this iteration so subsequent
-                // tasks with the same rule+metadata combo are skipped without a DB call.
-                // Only cache Concurency keys; Capacity sums change with task progress
-                // and cannot be reliably cached within a loop iteration.
-                for strategy in &t.start_condition.0 {
-                    match strategy {
-                        Strategy::Concurency(rule) => {
-                            let key = db_operation::concurrency_lock_key(rule, &t.metadata);
-                            ctx.ko.insert(key);
-                        }
-                        Strategy::Capacity(_) => {
-                            // Skip: capacity sum depends on live progress, can't cache
-                        }
+        // Buffer of contiguous rule-free tasks awaiting a batch claim.
+        let mut batch: Vec<Task> = Vec::new();
+
+        for t in page {
+            if t.start_condition.0.is_empty() {
+                // Rule-free: accumulate for batch claim.
+                batch.push(t);
+                // Flush eagerly if the buffered batch alone could reach the cap,
+                // so the cap is enforced precisely.
+                if claim_cap > 0 && (claimed.len() + batch.len()) as i64 >= claim_cap {
+                    flush_batch(conn, &mut batch, &mut claimed, claim_cap).await;
+                    if claim_cap > 0 && claimed.len() as i64 >= claim_cap {
+                        break 'pages;
                     }
                 }
+                continue;
+            }
+
+            // Rule-bearing task: flush any pending rule-free batch FIRST so ordering
+            // (and priority) is respected — never batch across a rule-bearing task.
+            flush_batch(conn, &mut batch, &mut claimed, claim_cap).await;
+            if claim_cap > 0 && claimed.len() as i64 >= claim_cap {
+                break 'pages;
+            }
+
+            // Pre-filter: if we already know a rule is blocked in this iteration,
+            // skip the DB call entirely.
+            if is_prefilter_blocked(&t, &ctx) {
                 metrics::record_task_blocked_by_concurrency();
-                log::warn!("Start worker: task {} blocked by concurrency rule", t.id);
+                log::debug!("Start worker: task {} blocked by cached rule", t.id);
+                continue;
             }
-            Ok(db_operation::ClaimResult::AlreadyClaimed) => {
-                log::debug!(
-                    "Start worker: task {} already claimed by another worker",
-                    t.id
-                );
+
+            match db_operation::claim_task_with_rules(conn, &t).await {
+                Ok(db_operation::ClaimResult::Claimed) => {
+                    metrics::record_status_transition("Pending", "Claimed");
+                    claimed.push(t);
+                    if claim_cap > 0 && claimed.len() as i64 >= claim_cap {
+                        break 'pages;
+                    }
+                }
+                Ok(db_operation::ClaimResult::RuleBlocked) => {
+                    // Cache the blocked lock keys for this iteration so subsequent
+                    // tasks with the same rule+metadata combo are skipped without a DB call.
+                    // Only cache Concurency keys; Capacity sums change with task progress
+                    // and cannot be reliably cached within a loop iteration.
+                    for strategy in &t.start_condition.0 {
+                        match strategy {
+                            Strategy::Concurency(rule) => {
+                                let key = db_operation::concurrency_lock_key(rule, &t.metadata);
+                                ctx.ko.insert(key);
+                            }
+                            Strategy::Capacity(_) => {
+                                // Skip: capacity sum depends on live progress, can't cache
+                            }
+                        }
+                    }
+                    metrics::record_task_blocked_by_concurrency();
+                    log::debug!("Start worker: task {} blocked by concurrency rule", t.id);
+                }
+                Ok(db_operation::ClaimResult::AlreadyClaimed) => {
+                    log::debug!(
+                        "Start worker: task {} already claimed by another worker",
+                        t.id
+                    );
+                }
+                Err(e) => {
+                    log::error!("Start worker: failed to claim task {}: {:?}", t.id, e);
+                }
             }
-            Err(e) => {
-                log::error!("Start worker: failed to claim task {}: {:?}", t.id, e);
-            }
+        }
+
+        // Flush any trailing rule-free batch at end of page.
+        flush_batch(conn, &mut batch, &mut claimed, claim_cap).await;
+        if claim_cap > 0 && claimed.len() as i64 >= claim_cap {
+            break 'pages;
+        }
+
+        // Incomplete page => backlog fully scanned => done. We never stop early
+        // on a full page unless the claim cap was reached above (no head-of-line
+        // blocking from blind truncation).
+        if (page_len as i64) < page_size {
+            break 'pages;
         }
     }
 
-    // Connection is dropped here (returned to pool)
+    // Connection is dropped by the caller (returned to pool)
     claimed
+}
+
+/// Flush a buffered run of contiguous rule-free tasks via a single batch-claim UPDATE.
+/// Respects `claim_cap`: at most `claim_cap - claimed.len()` tasks from the buffer are
+/// claimed (the rest are left Pending for a later iteration). Emits one
+/// `record_status_transition("Pending","Claimed")` per task actually claimed.
+async fn flush_batch<'a>(
+    conn: &mut Conn<'a>,
+    batch: &mut Vec<Task>,
+    claimed: &mut Vec<Task>,
+    claim_cap: i64,
+) {
+    if batch.is_empty() {
+        return;
+    }
+
+    // Bound the batch by the remaining claim budget.
+    let mut to_claim = std::mem::take(batch);
+    if claim_cap > 0 {
+        let remaining = (claim_cap - claimed.len() as i64).max(0) as usize;
+        if to_claim.len() > remaining {
+            to_claim.truncate(remaining);
+        }
+    }
+    if to_claim.is_empty() {
+        return;
+    }
+
+    let ids: Vec<uuid::Uuid> = to_claim.iter().map(|t| t.id).collect();
+    match db_operation::batch_claim_tasks(conn, &ids).await {
+        Ok(claimed_ids) => {
+            let claimed_set: HashSet<uuid::Uuid> = claimed_ids.into_iter().collect();
+            for t in to_claim {
+                if claimed_set.contains(&t.id) {
+                    metrics::record_status_transition("Pending", "Claimed");
+                    claimed.push(t);
+                } else {
+                    log::debug!(
+                        "Start worker: task {} already claimed by another worker (batch)",
+                        t.id
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "Start worker: failed to batch-claim rule-free tasks: {:?}",
+                e
+            );
+        }
+    }
 }
 
 /// Phase 2: Execute on_start webhooks for all claimed tasks in parallel,

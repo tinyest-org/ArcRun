@@ -284,6 +284,34 @@ pub async fn claim_task<'a>(conn: &mut Conn<'a>, task_id: &uuid::Uuid) -> Result
     Ok(updated_count == 1)
 }
 
+/// Atomically claim a contiguous run of rule-free Pending tasks in a single
+/// `UPDATE ... WHERE id = ANY($ids) AND status='pending' RETURNING id`.
+///
+/// Only valid for tasks with an empty `start_condition` (no concurrency/capacity
+/// rules), because a single UPDATE cannot evaluate per-task rules. Returns the set
+/// of IDs that were actually transitioned Pending -> Claimed (some may already have
+/// been claimed by another worker, in which case they are absent from the result).
+pub async fn batch_claim_tasks<'a>(
+    conn: &mut Conn<'a>,
+    ids: &[uuid::Uuid],
+) -> Result<Vec<uuid::Uuid>, DbError> {
+    use crate::schema::task::dsl::*;
+    use diesel::dsl::now;
+
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let claimed_ids =
+        diesel::update(task.filter(id.eq_any(ids).and(status.eq(StatusKind::Pending))))
+            .set((status.eq(StatusKind::Claimed), last_updated.eq(now)))
+            .returning(id)
+            .get_results::<uuid::Uuid>(conn)
+            .await?;
+
+    Ok(claimed_ids)
+}
+
 /// Transition a Claimed task to Running and set started_at.
 /// Returns true if the task was updated, false if it was no longer Claimed.
 pub async fn mark_task_running<'a>(

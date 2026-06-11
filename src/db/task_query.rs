@@ -130,17 +130,67 @@ pub(crate) async fn requeue_stale_claimed_tasks<'a>(
     Ok(updated)
 }
 
-pub(crate) async fn list_all_pending<'a>(
+/// Keyset cursor for paginating Pending tasks in the start_loop claim phase.
+/// Captures the ordering tuple `(priority, created_at, id)` of the last row of
+/// the previous page. The ordering is `priority DESC, created_at ASC, id ASC`.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingCursor {
+    pub priority: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub id: uuid::Uuid,
+}
+
+impl From<&Task> for PendingCursor {
+    fn from(t: &Task) -> Self {
+        PendingCursor {
+            priority: t.priority,
+            created_at: t.created_at,
+            id: t.id,
+        }
+    }
+}
+
+/// Fetch one page of Pending tasks, ordered by `priority DESC, created_at ASC, id ASC`,
+/// optionally starting strictly after `cursor` (keyset pagination).
+///
+/// The keyset predicate is the *expanded* form of the mixed-order tuple comparison
+/// (no direct tuple `<`/`>` comparison, which would be wrong for mixed ASC/DESC orders):
+///
+/// ```text
+/// (priority < p)
+///   OR (priority = p AND created_at > c)
+///   OR (priority = p AND created_at = c AND id > i)
+/// ```
+///
+/// This serves the `idx_task_priority(status, priority DESC, created_at ASC)` index.
+/// The `id` tiebreaker keeps the cursor stable even if rows are claimed between pages.
+pub(crate) async fn list_pending_page<'a>(
     conn: &mut Conn<'a>,
-    // limit: Option<i64>,
+    cursor: Option<&PendingCursor>,
+    page_size: i64,
 ) -> Result<Vec<Task>, DbError> {
     use crate::schema::task::dsl::*;
-    let tasks = task
+
+    let mut query = task
         .filter(status.eq(models::StatusKind::Pending))
-        .order((priority.desc(), created_at.asc()))
-        // .limit(limit)
-        .get_results(conn)
-        .await?;
+        .order((priority.desc(), created_at.asc(), id.asc()))
+        .limit(page_size)
+        .into_boxed();
+
+    if let Some(c) = cursor {
+        // Expanded keyset predicate for mixed-order tuple (priority DESC, created_at ASC, id ASC).
+        query = query.filter(
+            priority.lt(c.priority).or(priority
+                .eq(c.priority)
+                .and(created_at.gt(c.created_at))
+                .or(priority
+                    .eq(c.priority)
+                    .and(created_at.eq(c.created_at))
+                    .and(id.gt(c.id)))),
+        );
+    }
+
+    let tasks = query.get_results(conn).await?;
     Ok(tasks)
 }
 
@@ -156,9 +206,18 @@ pub(crate) async fn list_task_filtered_paged<'a>(
         .into_boxed()
         .offset(pagination.offset)
         .limit(pagination.limit)
-        .order(created_at.desc())
-        .filter(name.like(format!("%{}%", filter.name)))
-        .filter(kind.like(format!("%{}%", filter.kind)));
+        .order(created_at.desc());
+
+    // Only apply the LIKE filters when a pattern is provided. `name`/`kind` are
+    // NOT NULL, so skipping the filter on an empty string is equivalent to
+    // `LIKE '%%'` while avoiding a useless predicate on every row.
+    if !filter.name.is_empty() {
+        query = query.filter(name.like(format!("%{}%", filter.name)));
+    }
+
+    if !filter.kind.is_empty() {
+        query = query.filter(kind.like(format!("%{}%", filter.kind)));
+    }
 
     if let Some(val) = filter.metadata {
         query = query.filter(metadata.contains(val));
