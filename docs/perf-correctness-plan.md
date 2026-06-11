@@ -148,17 +148,65 @@ livraison = intervalle de la boucle (configurable ; option : wake-up immédiat v
 
 ---
 
-## Lot 3 — Sur preuve de besoin uniquement
+## Lot 3 — EN COURS (2026-06-11 — décision utilisateur, sans mesure préalable)
 
-- **Insertion de batch groupée** dans `add_task` (actuellement N+1 : ~4 round-trips par
-  tâche). Contraintes actées : UUID générés côté application ; batching limité aux tâches
-  **sans `dedupe_strategy`** — la dédup est évaluée séquentiellement dans la transaction et
-  peut matcher une tâche insérée plus tôt **dans le même batch** ; un INSERT multi-valeurs
-  casserait cette sémantique.
-- **Webhook `on_batch_complete`** : déclenché dans la transaction de propagation quand la
-  dernière tâche du batch devient terminale (même mécanique que la détection dead-end).
-  C'est la bonne réponse au besoin « signal de fin ordonné » — pas l'ordonnancement des
-  livraisons.
+> Initialement « sur preuve de besoin » ; lancé sur décision utilisateur le 2026-06-11.
+
+### 3a — Insertion de batch groupée dans `add_task`
+
+Problème : N+1 — `insert_new_task` fait ~4 round-trips par tâche (dedupe check, INSERT
+task, INSERT links, 1-3 INSERT actions), en boucle dans la transaction de `add_task`.
+
+Contraintes actées :
+- **UUID générés côté application** (`Uuid::new_v4()` dans le handler) : permet de
+  construire l'`id_mapping` complet AVANT toute insertion, et donc les links sans
+  RETURNING intermédiaire.
+- **Batching limité aux runs contigus de tâches sans `dedupe_strategy`** — la dédup est
+  évaluée séquentiellement dans la transaction et peut matcher une tâche insérée plus tôt
+  **dans le même batch** ; un INSERT multi-valeurs au travers d'une tâche à dédup
+  casserait cette sémantique. Même pattern que le garde-fou du batch-claim (Lot 1) :
+  on insère le run [tâches sans dédup], on évalue la tâche à dédup, on reprend.
+- Dans un run : 1 INSERT multi-valeurs `task`, 1 INSERT multi-valeurs `link`,
+  1 INSERT multi-valeurs `action` (start/failure/success de toutes les tâches du run).
+- Sémantique préservée à l'identique : parent dédupe-skipped ⇒ dépendance ignorée avec
+  warn (comportement existant), compteurs `wait_*`, statut initial Waiting/Pending,
+  métriques par tâche.
+
+### 3b — Webhook `on_batch_complete`
+
+Le « signal de fin ordonné » : un webhook batch-level déclenché quand la **dernière**
+tâche du batch devient terminale. Notification at-least-once via l'outbox du Lot 2.
+
+Décisions actées :
+- **API** : `POST /task` accepte DEUX formes de body (serde untagged, rétro-compatible) :
+  le tableau nu existant `[NewTaskDto…]`, ou un objet
+  `{"tasks": [NewTaskDto…], "on_batch_complete": [NewActionDto…]}`.
+  Validation SSRF des params comme pour les autres actions.
+- **Stockage** : nouvelle table `batch (id UUID PK, on_complete JSONB NOT NULL,
+  created_at)`. Une ligne créée **uniquement** si `on_batch_complete` est fourni
+  (les batches sans webhook ne coûtent rien).
+- **Détection** : dans CHAQUE transaction où des tâches deviennent terminales
+  (update_running_task, fail_task_and_propagate, timeout, cancel_task, stop_batch,
+  y compris cascade + ancêtres dead-end), après propagation : si la tâche a un
+  `batch_id` avec ligne `batch`, vérifier
+  `NOT EXISTS (task WHERE batch_id = $1 AND status NOT IN (terminaux))`
+  ⇒ enqueue outbox in-tx. L'unicité de la clé d'idempotence rend la détection
+  concurrente inoffensive (ON CONFLICT DO NOTHING).
+- **Outbox** : `webhook_execution.task_id` devient NULLABLE + colonne `batch_id UUID`
+  NULLABLE + CHECK (l'un des deux non NULL) ; valeur `batch_complete` ajoutée à
+  `trigger_kind` ; condition = sentinel `Success` ; clé = `batch:<batch_id>:complete`.
+  La delivery loop traite ces lignes par une branche dédiée : charge `batch.on_complete`,
+  exécute les actions SANS `?handle=` (pas de tâche à piloter), payload `arcrun` =
+  `{batch_id, counts par statut terminal, completed_at}`.
+- **Batch vide** (toutes les tâches dédupe-skipped alors qu'`on_batch_complete` est
+  fourni) : le signal est enqueué immédiatement dans la même transaction — un batch de
+  zéro tâche est vacuement complet ; le consommateur ne doit pas attendre indéfiniment.
+- **Rétention** : le cleanup supprime aussi les lignes `batch` dont plus aucune tâche
+  n'existe (et leurs lignes `webhook_execution` batch-level), pour ne pas croître sans
+  borne.
+
+### Écarté
+
 - ~~CTE récursive pour `propagate_to_children`~~ — écarté : la logique par niveau
   (échecs `requires_success` + décréments + transition Pending) est délicate en SQL pur et
   la version actuelle est déjà batchée par niveau. Rapport risque/gain défavorable.
