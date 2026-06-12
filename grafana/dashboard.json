@@ -532,19 +532,14 @@
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(worker_loop_duration_seconds_bucket[5m]))",
-          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.95, sum by (loop, le) (rate(worker_loop_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{loop}} p95",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(worker_loop_duration_seconds_bucket[5m]))",
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.50, sum by (loop, le) (rate(worker_loop_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{loop}} p50",
           "refId": "B"
-        },
-        {
-          "expr": "histogram_quantile(0.99, rate(worker_loop_duration_seconds_bucket[5m]))",
-          "legendFormat": "p99",
-          "refId": "C"
         }
       ]
     },
@@ -769,6 +764,241 @@
               "expr": "sum by (outcome) (increase(retention_cleanup_runs_total[5m]))",
               "legendFormat": "{{outcome}}",
               "refId": "A"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "New Metrics (M0–M4)",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 63 },
+      "collapsed": true,
+      "panels": [
+        {
+          "title": "Worker Loop Liveness (age since last iteration)",
+          "type": "stat",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 0, "y": 64 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 30 },
+                  { "color": "red", "value": 60 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" },
+          "targets": [
+            {
+              "expr": "time() - max by (loop) (worker_loop_last_iteration_timestamp_seconds)",
+              "legendFormat": "{{loop}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "DB Pool Connections",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 8, "y": 64 },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "stacking": { "mode": "normal" } }
+            },
+            "overrides": []
+          },
+          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "expr": "db_pool_connections",
+              "legendFormat": "{{state}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "DB Acquire Wait (HTTP path)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 16, "y": 64 },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(db_pool_acquire_wait_seconds_bucket[5m])))",
+              "legendFormat": "p95",
+              "refId": "A"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(db_pool_acquire_wait_seconds_bucket[5m])))",
+              "legendFormat": "p99",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "title": "Outbox Backlog Depth",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 0, "y": 71 },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }
+            },
+            "overrides": []
+          },
+          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "expr": "webhook_outbox_pending",
+              "legendFormat": "{{state}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Outbox Oldest Pending Age",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 8, "y": 71 },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 },
+              "unit": "s",
+              "color": { "mode": "fixed", "fixedColor": "orange" }
+            },
+            "overrides": []
+          },
+          "options": { "tooltip": { "mode": "single" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "expr": "webhook_outbox_oldest_pending_age_seconds",
+              "legendFormat": "oldest mature row",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Batch Channel Send Wait (PUT backpressure)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 16, "y": 71 },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(batch_channel_send_wait_seconds_bucket[5m])))",
+              "legendFormat": "p99",
+              "refId": "A"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(batch_channel_send_wait_seconds_bucket[5m])))",
+              "legendFormat": "p95",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "title": "Batch Updater Pending Tasks (crash-loss window)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 0, "y": 78 },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }
+            },
+            "overrides": []
+          },
+          "options": { "tooltip": { "mode": "single" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "expr": "batch_updater_pending_tasks",
+              "legendFormat": "pending tasks",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Webhook Delivery Outcomes/s",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 8, "y": 78 },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+            },
+            "overrides": []
+          },
+          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "expr": "sum(rate(webhook_delivery_success_total[5m]))",
+              "legendFormat": "success",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(rate(webhook_delivery_retries_total[5m]))",
+              "legendFormat": "retry",
+              "refId": "B"
+            },
+            {
+              "expr": "sum(rate(webhook_delivery_exhausted_total[5m]))",
+              "legendFormat": "exhausted",
+              "refId": "C"
+            },
+            {
+              "expr": "sum(rate(webhook_mark_failures_total[5m]))",
+              "legendFormat": "mark failures",
+              "refId": "D"
+            }
+          ]
+        },
+        {
+          "title": "Dedupe / Batch Completions / Pool Failures",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "gridPos": { "h": 7, "w": 8, "x": 16, "y": 78 },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "bars", "fillOpacity": 70, "lineWidth": 0 }
+            },
+            "overrides": []
+          },
+          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "expr": "sum(increase(tasks_deduped_total[5m]))",
+              "legendFormat": "deduped",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(increase(batches_completed_total[5m]))",
+              "legendFormat": "batches completed",
+              "refId": "B"
+            },
+            {
+              "expr": "sum(increase(db_pool_acquire_failures_total[5m]))",
+              "legendFormat": "pool acquire failures",
+              "refId": "C"
             }
           ]
         }

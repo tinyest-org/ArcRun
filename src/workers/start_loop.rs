@@ -58,7 +58,8 @@ pub async fn start_loop(
 
         // Record worker loop metrics
         let loop_duration = loop_start.elapsed().as_secs_f64();
-        metrics::record_worker_loop_iteration(loop_duration, tasks_processed);
+        metrics::record_worker_loop_iteration("start", loop_duration);
+        metrics::record_tasks_processed_per_loop(tasks_processed);
 
         tokio::select! {
             _ = shutdown.changed() => {
@@ -109,6 +110,7 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
     let mut ctx = EvaluationContext { ko: HashSet::new() };
     let mut claimed: Vec<Task> = Vec::new();
     let mut cursor: Option<db_operation::PendingCursor> = None;
+    let mut pages_scanned: usize = 0;
 
     'pages: loop {
         let page = match db_operation::list_pending_page(conn, cursor.as_ref(), page_size).await {
@@ -118,6 +120,7 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
                 break 'pages;
             }
         };
+        pages_scanned += 1;
 
         let page_len = page.len();
         log::debug!("Start worker: fetched page of {} pending tasks", page_len);
@@ -155,6 +158,7 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
             // Pre-filter: if we already know a rule is blocked in this iteration,
             // skip the DB call entirely.
             if is_prefilter_blocked(&t, &ctx) {
+                metrics::record_concurrency_ko_cache_hit();
                 metrics::record_task_blocked_by_concurrency();
                 log::debug!("Start worker: task {} blocked by cached rule", t.id);
                 continue;
@@ -213,6 +217,7 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
         }
     }
 
+    metrics::record_claim_pages_scanned(pages_scanned);
     // Connection is dropped by the caller (returned to pool)
     claimed
 }
@@ -348,6 +353,12 @@ async fn execute_webhook_for_task(
             match db_operation::mark_task_running(&mut conn, &task.id).await {
                 Ok(true) => {
                     metrics::record_status_transition("Claimed", "Running");
+                    // Scheduler latency: time from task creation to actually running.
+                    let wait_secs = (chrono::Utc::now() - task.created_at)
+                        .num_milliseconds()
+                        .max(0) as f64
+                        / 1000.0;
+                    metrics::record_task_wait(&task.kind, wait_secs);
                     log::debug!("Start worker: task {} started", task.id);
 
                     // Save cancel actions returned by the webhook

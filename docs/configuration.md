@@ -55,6 +55,7 @@ All configuration is via environment variables.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SLOW_QUERY_THRESHOLD_MS` | `100` | Slow query warning threshold in ms |
+| `METRICS_SAMPLER_INTERVAL_SECS` | `15` | Interval for the metrics sampler (tasks_by_status, running_tasks_by_kind, db_pool_connections gauges) |
 | `TRACING_ENABLED` | `0` | Enable OpenTelemetry distributed tracing |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | - | OTLP endpoint URL (e.g., `http://localhost:4317`) |
 | `OTEL_SERVICE_NAME` | `arcrun` | Service name for traces |

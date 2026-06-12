@@ -9,6 +9,40 @@ use uuid::Uuid;
 
 use super::DbError;
 
+/// One `(label, count)` row of an aggregation query (status or kind).
+#[derive(diesel::QueryableByName)]
+struct LabelCount {
+    #[diesel(sql_type = sql_types::Text)]
+    label: String,
+    #[diesel(sql_type = sql_types::BigInt)]
+    count: i64,
+}
+
+/// Count tasks grouped by status, for the `tasks_by_status` gauge. One indexed
+/// `GROUP BY` run by the metrics sampler — never in an HTTP path.
+pub(crate) async fn count_tasks_by_status<'a>(
+    conn: &mut Conn<'a>,
+) -> Result<Vec<(String, i64)>, DbError> {
+    let rows: Vec<LabelCount> = diesel::sql_query(
+        "SELECT status::text AS label, COUNT(*) AS count FROM task GROUP BY status",
+    )
+    .get_results(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.label, r.count)).collect())
+}
+
+/// Count Running tasks grouped by kind, for the `running_tasks_by_kind` gauge.
+pub(crate) async fn count_running_tasks_by_kind<'a>(
+    conn: &mut Conn<'a>,
+) -> Result<Vec<(String, i64)>, DbError> {
+    let rows: Vec<LabelCount> = diesel::sql_query(
+        "SELECT kind AS label, COUNT(*) AS count FROM task WHERE status = 'running' GROUP BY kind",
+    )
+    .get_results(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.label, r.count)).collect())
+}
+
 /// Find all Running tasks that have exceeded their timeout (based on `last_updated`).
 /// Returns matching task IDs without modifying them — callers should use
 /// `timeout_task_and_propagate` to atomically mark each as failed and propagate.

@@ -27,8 +27,9 @@ pub(crate) use task_lifecycle::{
 
 // Re-exports from task_query
 pub(crate) use task_query::{
-    PendingCursor, find_timed_out_tasks, get_dag_for_batch, list_pending_page,
-    list_task_filtered_paged, requeue_stale_claimed_tasks, timeout_task_and_propagate,
+    PendingCursor, count_running_tasks_by_kind, count_tasks_by_status, find_timed_out_tasks,
+    get_dag_for_batch, list_pending_page, list_task_filtered_paged, requeue_stale_claimed_tasks,
+    timeout_task_and_propagate,
 };
 
 // Re-exports from batch_listing
@@ -44,7 +45,7 @@ pub use webhook_execution::{
     BatchCompletionStats, batch_completion_stats, claim_due_outbox, claim_due_outbox_leased,
     enqueue_batch_complete_outbox, enqueue_outbox, insert_batch, list_webhook_deliveries,
     load_batch_on_complete, mark_outbox_exhausted, mark_outbox_retry, mark_outbox_success,
-    maybe_enqueue_batch_complete, maybe_enqueue_batch_complete_for_task,
+    maybe_enqueue_batch_complete, maybe_enqueue_batch_complete_for_task, outbox_backlog_stats,
 };
 pub use webhook_execution::{complete_webhook_execution, try_claim_webhook_execution};
 

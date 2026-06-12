@@ -129,6 +129,7 @@ pub(crate) async fn insert_task_batch<'a>(
     dtos_in: Vec<dtos::NewTaskDto>,
     batch_id: Option<Uuid>,
 ) -> Result<Vec<TaskDto>, DbError> {
+    crate::metrics::record_batch_insert_tasks(dtos_in.len());
     let mut id_mapping: HashMap<String, Uuid> = HashMap::new();
     let mut results: Vec<TaskDto> = Vec::with_capacity(dtos_in.len());
 
@@ -147,6 +148,7 @@ pub(crate) async fn insert_task_batch<'a>(
             let dedupe_rules = dto.dedupe_strategy.clone().unwrap();
             let should_write = handle_dedupe(conn, dedupe_rules, &dto.metadata).await?;
             if !should_write {
+                crate::metrics::record_task_deduped();
                 continue;
             }
 

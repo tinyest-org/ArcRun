@@ -1,7 +1,7 @@
 use actix_web::{HttpResponse, web};
 use uuid::Uuid;
 
-use crate::{db_operation, dtos, error::ApiError, validation, workers};
+use crate::{db_operation, dtos, error::ApiError, metrics, validation, workers};
 
 use super::AppState;
 use super::response::validation_error_response;
@@ -154,15 +154,22 @@ pub async fn batch_task_updater(
             .body("At least one of new_success or new_failures must be non-zero");
     }
 
-    match state
+    // Sample channel capacity *before* the send: this captures the backpressure the
+    // request actually faced (a full channel that drains during our await would read
+    // misleadingly high afterwards).
+    let capacity_available = state.sender.capacity();
+    let send_start = std::time::Instant::now();
+    let result = state
         .sender
         .send(workers::UpdateEvent {
             success,
             failures,
             task_id,
         })
-        .await
-    {
+        .await;
+    metrics::record_batch_channel_send(send_start.elapsed().as_secs_f64(), capacity_available);
+
+    match result {
         Ok(_) => HttpResponse::Accepted().body("Queued"),
         Err(_) => HttpResponse::InternalServerError().body("Failed to queue update"),
     }

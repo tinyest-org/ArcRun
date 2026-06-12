@@ -40,6 +40,7 @@ pub fn test_config() -> Arc<Config> {
             webhook_retry_backoff_cap_secs: 300,
             webhook_delivery_lease_secs: 120,
             webhook_delivery_concurrency: 10,
+            metrics_sampler_interval: std::time::Duration::from_secs(15),
         },
         circuit_breaker: arcrun::config::CircuitBreakerConfig {
             enabled: true,

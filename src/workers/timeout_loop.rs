@@ -16,6 +16,7 @@ pub async fn timeout_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
+        let loop_start = std::time::Instant::now();
         // note that obtaining a connection from the pool is also potentially blocking
         let conn = pool.get();
 
@@ -94,6 +95,7 @@ pub async fn timeout_loop(
                 }
             }
         }
+        metrics::record_worker_loop_iteration("timeout", loop_start.elapsed().as_secs_f64());
         tokio::select! {
             _ = shutdown.changed() => {
                 log::info!("Timeout worker: shutdown signal received, exiting");

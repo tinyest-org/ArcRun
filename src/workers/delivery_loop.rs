@@ -72,15 +72,29 @@ pub async fn delivery_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
+        let loop_start = std::time::Instant::now();
         if let Ok(mut conn) = pool.get().await {
             match run_delivery_once(evaluator.as_ref(), &mut conn, cfg).await {
                 Ok(0) => log::debug!("Delivery worker: no mature outbox rows"),
                 Ok(n) => log::debug!("Delivery worker: processed {} outbox rows", n),
                 Err(e) => log::error!("Delivery worker: error draining outbox: {:?}", e),
             }
+
+            // Snapshot the outbox backlog (depth + oldest-mature age). A single
+            // indexed scan per iteration — reveals a growing backlog or a stuck row,
+            // neither of which the per-delivery lag histogram can show.
+            match db_operation::outbox_backlog_stats(&mut conn).await {
+                Ok(stats) => metrics::set_webhook_outbox_backlog(
+                    stats.ready,
+                    stats.leased,
+                    stats.oldest_ready_age_secs,
+                ),
+                Err(e) => log::warn!("Delivery worker: outbox backlog stats failed: {:?}", e),
+            }
         } else {
             log::error!("Delivery worker: failed to acquire DB connection");
         }
+        metrics::record_worker_loop_iteration("delivery", loop_start.elapsed().as_secs_f64());
 
         tokio::select! {
             _ = shutdown.changed() => {
@@ -160,6 +174,7 @@ enum MarkAction {
     Success {
         key: String,
         lag: Option<f64>,
+        label: &'static str,
     },
     Retry {
         key: String,
@@ -229,7 +244,11 @@ async fn prepare_task_row<'a>(
             "Delivery worker: task-level outbox key {} has NULL task_id; marking success",
             key
         );
-        return Ok(Prepared::Mark(MarkAction::Success { key, lag: None }));
+        return Ok(Prepared::Mark(MarkAction::Success {
+            key,
+            lag: None,
+            label,
+        }));
     };
 
     let task: Option<Task> = task_tbl
@@ -244,7 +263,11 @@ async fn prepare_task_row<'a>(
             row_task_id,
             key
         );
-        return Ok(Prepared::Mark(MarkAction::Success { key, lag: None }));
+        return Ok(Prepared::Mark(MarkAction::Success {
+            key,
+            lag: None,
+            label,
+        }));
     };
 
     let actions = Action::belonging_to(&task)
@@ -259,6 +282,7 @@ async fn prepare_task_row<'a>(
         return Ok(Prepared::Mark(MarkAction::Success {
             key,
             lag: Some(lag_secs(row.created_at)),
+            label,
         }));
     }
 
@@ -296,7 +320,11 @@ async fn prepare_batch_complete_row<'a>(
             "Delivery worker: batch_complete outbox key {} has NULL batch_id; marking success",
             key
         );
-        return Ok(Prepared::Mark(MarkAction::Success { key, lag: None }));
+        return Ok(Prepared::Mark(MarkAction::Success {
+            key,
+            lag: None,
+            label,
+        }));
     };
 
     let on_complete = db_operation::load_batch_on_complete(conn, batch_id).await?;
@@ -306,7 +334,11 @@ async fn prepare_batch_complete_row<'a>(
             batch_id,
             key
         );
-        return Ok(Prepared::Mark(MarkAction::Success { key, lag: None }));
+        return Ok(Prepared::Mark(MarkAction::Success {
+            key,
+            lag: None,
+            label,
+        }));
     };
 
     let actions: Vec<crate::dtos::NewActionDto> = match serde_json::from_value(on_complete) {
@@ -331,6 +363,7 @@ async fn prepare_batch_complete_row<'a>(
         return Ok(Prepared::Mark(MarkAction::Success {
             key,
             lag: Some(lag_secs(row.created_at)),
+            label,
         }));
     }
 
@@ -373,6 +406,10 @@ async fn deliver_plan(
         created_at,
         kind,
     } = plan;
+
+    // Track delivery-phase concurrency (separate from the start phase) so we can see
+    // whether we plateau at WEBHOOK_DELIVERY_CONCURRENCY.
+    let _in_flight = metrics::WebhooksInFlightGuard::new("delivery");
 
     let mut errors: Vec<String> = Vec::new();
     match kind {
@@ -418,6 +455,7 @@ async fn deliver_plan(
             mark: MarkAction::Success {
                 key,
                 lag: Some(lag_secs(created_at)),
+                label: trigger_label,
             },
         };
     }
@@ -457,12 +495,16 @@ async fn deliver_plan(
 /// logged and swallowed (the lease will re-deliver; at-least-once). This never rolls
 /// back marks already posted for other rows in the batch.
 async fn apply_mark<'a>(conn: &mut Conn<'a>, mark: MarkAction) {
-    let result = match &mark {
-        MarkAction::Success { key, lag } => {
+    let (result, mark_label) = match &mark {
+        MarkAction::Success { key, lag, label } => {
             if let Some(lag) = lag {
                 metrics::record_webhook_delivery_lag(*lag);
             }
-            db_operation::mark_outbox_success(conn, key).await
+            let r = db_operation::mark_outbox_success(conn, key).await;
+            if r.is_ok() {
+                metrics::record_webhook_delivery_success(label);
+            }
+            (r, "success")
         }
         MarkAction::Retry {
             key,
@@ -474,18 +516,21 @@ async fn apply_mark<'a>(conn: &mut Conn<'a>, mark: MarkAction) {
             if r.is_ok() {
                 metrics::record_webhook_delivery_retry(label);
             }
-            r
+            (r, "retry")
         }
         MarkAction::Exhausted { key, error, label } => {
             let r = db_operation::mark_outbox_exhausted(conn, key, error).await;
             if r.is_ok() {
                 metrics::record_webhook_delivery_exhausted(label);
             }
-            r
+            (r, "exhausted")
         }
     };
 
     if let Err(e) = result {
+        // Previously swallowed silently (M2): count it so a mark that fails in a loop
+        // is visible without grepping logs. The lease re-delivers (at-least-once).
+        metrics::record_webhook_mark_failure(mark_label);
         let key = match &mark {
             MarkAction::Success { key, .. }
             | MarkAction::Retry { key, .. }

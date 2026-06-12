@@ -136,7 +136,7 @@ pub async fn enqueue_batch_complete_outbox<'a>(
     batch_id: uuid::Uuid,
     key: &str,
 ) -> Result<(), DbError> {
-    diesel::sql_query(
+    let rows_inserted = diesel::sql_query(
         "INSERT INTO webhook_execution
             (batch_id, trigger, condition, idempotency_key, status, attempts, next_attempt_at)
          VALUES ($1, 'batch_complete', 'success', $2, 'pending', 0, now())
@@ -146,6 +146,12 @@ pub async fn enqueue_batch_complete_outbox<'a>(
     .bind::<diesel::sql_types::Text, _>(key)
     .execute(conn)
     .await?;
+
+    // Count only a real insert (ON CONFLICT DO NOTHING ⇒ 0 rows on a concurrent
+    // double-detection), so the counter tracks distinct batch completions.
+    if rows_inserted > 0 {
+        crate::metrics::record_batch_completed();
+    }
 
     Ok(())
 }
@@ -303,6 +309,39 @@ pub async fn batch_completion_stats<'a>(
          FROM task WHERE batch_id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(batch_id)
+    .get_result(conn)
+    .await?;
+    Ok(stats)
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+pub struct OutboxBacklogStats {
+    /// `pending` rows whose `next_attempt_at <= now()` (mature, awaiting delivery).
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub ready: i64,
+    /// `pending` rows whose `next_attempt_at > now()` (leased in-flight or backing off).
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub leased: i64,
+    /// Age in seconds of the oldest mature `pending` row (0.0 if none).
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    pub oldest_ready_age_secs: f64,
+}
+
+/// Snapshot the outbox backlog for observability: how many pending rows are mature
+/// (`ready`) vs not-yet-due (`leased`), and the age of the oldest mature row. A
+/// single indexed scan over `pending` rows (served by `idx_webhook_execution_pending_due`),
+/// run once per delivery-loop iteration — never in an HTTP path.
+pub async fn outbox_backlog_stats<'a>(conn: &mut Conn<'a>) -> Result<OutboxBacklogStats, DbError> {
+    let stats: OutboxBacklogStats = diesel::sql_query(
+        "SELECT
+            COUNT(*) FILTER (WHERE next_attempt_at <= now()) AS ready,
+            COUNT(*) FILTER (WHERE next_attempt_at >  now()) AS leased,
+            COALESCE(
+                EXTRACT(EPOCH FROM (now() - MIN(created_at) FILTER (WHERE next_attempt_at <= now()))),
+                0
+            )::double precision AS oldest_ready_age_secs
+         FROM webhook_execution WHERE status = 'pending'",
+    )
     .get_result(conn)
     .await?;
     Ok(stats)

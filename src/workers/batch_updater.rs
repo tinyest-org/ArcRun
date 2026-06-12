@@ -44,6 +44,7 @@ pub async fn batch_updater(
 
     // Updater loop - persists batched counts to database
     loop {
+        let loop_start = std::time::Instant::now();
         if let Ok(mut conn) = pool.get().await {
             // Collect updates - DashMap iter() doesn't block other operations on different shards
             let updates: Vec<(uuid::Uuid, i32, i32)> = data
@@ -59,12 +60,14 @@ pub async fn batch_updater(
 
             // Process updates in a single batched SQL query
             if !updates.is_empty() {
-                log::debug!("Batch update: {} tasks to persist", updates.len());
+                let row_count = updates.len();
+                log::debug!("Batch update: {} tasks to persist", row_count);
 
+                let flush_start = std::time::Instant::now();
                 if let Err(e) = handle_batch_with_counts(&updates, &mut conn).await {
                     log::error!(
                         "Failed to apply batched update for {} tasks: {:?}, re-queuing all counts",
-                        updates.len(),
+                        row_count,
                         e
                     );
                     // Re-add all counts back for retry
@@ -75,6 +78,7 @@ pub async fn batch_updater(
                     }
                     metrics::record_batch_update_failure();
                 }
+                metrics::record_batch_updater_flush(row_count, flush_start.elapsed().as_secs_f64());
             }
 
             // Cleanup zero entries periodically
@@ -82,7 +86,9 @@ pub async fn batch_updater(
                 AtomicI32::load(&entry.success, Ordering::Relaxed) != 0
                     || AtomicI32::load(&entry.failures, Ordering::Relaxed) != 0
             });
+            metrics::set_batch_updater_pending_tasks(data.len());
         }
+        metrics::record_worker_loop_iteration("batch_updater", loop_start.elapsed().as_secs_f64());
         tokio::select! {
             _ = shutdown.changed() => {
                 log::info!("Batch updater: shutdown signal received, flushing remaining data");

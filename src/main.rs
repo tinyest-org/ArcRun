@@ -186,6 +186,7 @@ struct WorkerHandles {
     batch: tokio::task::JoinHandle<()>,
     retention: tokio::task::JoinHandle<()>,
     delivery: tokio::task::JoinHandle<()>,
+    metrics_sampler: tokio::task::JoinHandle<()>,
 }
 
 impl WorkerHandles {
@@ -196,6 +197,7 @@ impl WorkerHandles {
             let _ = self.batch.await;
             let _ = self.retention.await;
             let _ = self.delivery.await;
+            let _ = self.metrics_sampler.await;
         })
         .await;
     }
@@ -284,11 +286,21 @@ fn spawn_workers(
         })
     };
 
+    let metrics_sampler = {
+        let pool = pool.clone();
+        let interval = config.worker.metrics_sampler_interval;
+        let shutdown = shutdown_rx.clone();
+        actix_web::rt::spawn(async move {
+            arcrun::workers::metrics_sampler_loop(pool, interval, shutdown).await;
+        })
+    };
+
     WorkerHandles {
         start,
         timeout,
         batch,
         retention,
         delivery,
+        metrics_sampler,
     }
 }

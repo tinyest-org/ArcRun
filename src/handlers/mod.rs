@@ -87,12 +87,14 @@ pub async fn get_conn_with_retry<'a>(
     let mut last_error = None;
 
     let effective_retries = max_retries.max(1);
+    let acquire_start = std::time::Instant::now();
 
     for attempt in 0..effective_retries {
         match pool.get().await {
             Ok(conn) => {
                 // Record success for circuit breaker
                 circuit_breaker.record_success();
+                metrics::record_db_pool_acquire_wait(acquire_start.elapsed().as_secs_f64());
                 return Ok(conn);
             }
             Err(e) => {
@@ -119,9 +121,7 @@ pub async fn get_conn_with_retry<'a>(
         effective_retries,
         err
     );
-    metrics::TASKS_BY_STATUS
-        .with_label_values(&["pool_exhausted"])
-        .inc();
+    metrics::record_db_pool_acquire_failure();
     Err(error::ErrorServiceUnavailable(
         "Database connection unavailable",
     ))

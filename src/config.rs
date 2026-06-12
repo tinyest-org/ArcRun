@@ -122,6 +122,10 @@ pub struct WorkerConfig {
 
     /// Max concurrent HTTP deliveries within one delivery-loop batch.
     pub webhook_delivery_concurrency: usize,
+
+    /// Interval between metrics-sampler iterations (gauges: tasks_by_status,
+    /// running_tasks_by_kind, db_pool_connections).
+    pub metrics_sampler_interval: Duration,
 }
 
 /// Circuit breaker configuration for connection pool resilience.
@@ -233,6 +237,7 @@ impl Default for WorkerConfig {
             webhook_retry_backoff_cap_secs: 300,
             webhook_delivery_lease_secs: 120,
             webhook_delivery_concurrency: 10,
+            metrics_sampler_interval: Duration::from_secs(15),
         }
     }
 }
@@ -389,6 +394,10 @@ impl Config {
             webhook_retry_backoff_cap_secs: parse_env_or("WEBHOOK_RETRY_BACKOFF_CAP_SECS", 300)?,
             webhook_delivery_lease_secs: parse_env_or("WEBHOOK_DELIVERY_LEASE_SECS", 120)?,
             webhook_delivery_concurrency: parse_env_or("WEBHOOK_DELIVERY_CONCURRENCY", 10)?,
+            metrics_sampler_interval: Duration::from_secs(parse_env_or(
+                "METRICS_SAMPLER_INTERVAL_SECS",
+                15,
+            )?),
             ..Default::default()
         };
 

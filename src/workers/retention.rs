@@ -71,5 +71,6 @@ pub async fn retention_cleanup_loop(
                 metrics::record_retention_cleanup("error", 0, duration);
             }
         }
+        metrics::record_worker_loop_iteration("retention", start.elapsed().as_secs_f64());
     }
 }
