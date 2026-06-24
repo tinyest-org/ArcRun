@@ -208,17 +208,28 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          # Get JWT from Docker Hub using PAT
-          TOKEN=$(curl -sf -H "Content-Type: application/json" \
+          # --- DIAGNOSTIC (temporaire) : afficher les codes HTTP, ne pas faire planter l'etape ---
+          # 1) Login : recupere le JWT et logue le code HTTP
+          login_body=$(curl -s -o /tmp/login.json -w "%{http_code}" \
+            -H "Content-Type: application/json" \
             -X POST -d "{\"username\": \"${DOCKERHUB_USERNAME}\", \"password\": \"${DOCKERHUB_TOKEN}\"}" \
-            https://hub.docker.com/v2/users/login/ | jq -r .token)
+            https://hub.docker.com/v2/users/login/)
+          echo "LOGIN HTTP status: ${login_body}"
+          TOKEN=$(jq -r '.token // empty' /tmp/login.json)
+          if [ -z "$TOKEN" ]; then
+            echo "LOGIN a echoue (pas de token). Reponse:"; cat /tmp/login.json; echo
+          else
+            echo "LOGIN OK (token recupere)"
+          fi
 
-          # Update full_description with readme content
-          jq -n --arg desc "$(cat ./readme.md)" '{"full_description": $desc}' | \
-            curl -sf -X PATCH \
+          # 2) PATCH description : logue le code HTTP + le corps de la reponse
+          patch_status=$(jq -n --arg desc "$(cat ./readme.md)" '{"full_description": $desc}' | \
+            curl -s -o /tmp/patch.json -w "%{http_code}" -X PATCH \
               -H "Authorization: JWT ${TOKEN}" \
               -H "Content-Type: application/json" \
               -d @- \
-              "https://hub.docker.com/v2/repositories/plawn/arcrun/"
+              "https://hub.docker.com/v2/repositories/plawn/arcrun/")
+          echo "PATCH HTTP status: ${patch_status}"
+          echo "PATCH response body:"; cat /tmp/patch.json; echo
 
-          echo "Docker Hub description updated successfully"
+          echo "Diagnostic termine (etape volontairement non bloquante)."
