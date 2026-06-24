@@ -82,25 +82,32 @@ pub struct Link {
     pub requires_success: bool,
 }
 
-/// A batch with a registered `on_batch_complete` webhook payload. A row exists only
-/// when the `POST /task` body provided `on_batch_complete`; batches without the
-/// webhook never get a row here.
+/// A batch row. Created when the `POST /task` body provided any of
+/// `on_batch_complete`, `scope`, or `metadata`. Batches with none of these never
+/// get a row here (they are tracked only via `task.batch_id`).
 #[derive(Identifiable, Queryable, Selectable, Debug, Clone)]
 #[diesel(table_name = crate::schema::batch)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Batch {
     pub id: uuid::Uuid,
-    /// The `on_batch_complete` actions, stored as a JSON array of `NewActionDto`.
+    /// The `on_batch_complete` actions, stored as a JSON array of `NewActionDto`
+    /// (empty array `[]` when the batch carries only scope/metadata).
     pub on_complete: serde_json::Value,
     pub created_at: chrono::DateTime<Utc>,
+    /// Optional business-level label for filtering/search.
+    pub scope: Option<String>,
+    /// Arbitrary structured metadata for filtering/search (defaults to `{}`).
+    pub metadata: serde_json::Value,
 }
 
-/// Insertable struct for registering a batch-complete webhook payload.
+/// Insertable struct for a batch row (webhook payload and/or scope/metadata).
 #[derive(Debug, Insertable)]
 #[diesel(table_name = crate::schema::batch)]
 pub struct NewBatch {
     pub id: uuid::Uuid,
     pub on_complete: serde_json::Value,
+    pub scope: Option<String>,
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Associations, PartialEq, Debug, Serialize, Insertable)]

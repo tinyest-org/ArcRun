@@ -111,6 +111,9 @@ impl Client {
 
     /// Create a batch of tasks, optionally forming a DAG (POST /task).
     ///
+    /// Sends the legacy bare-array body. To attach batch-level `scope`/`metadata`
+    /// or an `on_batch_complete` webhook, use [`Client::create_batch`].
+    ///
     /// Returns the batch ID and created tasks. If all tasks were deduplicated,
     /// `tasks` will be empty.
     pub async fn create_tasks(&self, tasks: Vec<NewTaskDto>) -> Result<CreateBatchResult> {
@@ -120,7 +123,34 @@ impl Client {
             .json(&tasks)
             .send()
             .await?;
+        Self::handle_create_response(resp).await
+    }
 
+    /// Create a batch using the object-form body (POST /task), carrying optional
+    /// batch-level `scope`, `metadata`, and `on_batch_complete` webhook.
+    ///
+    /// ```no_run
+    /// # use arcrun_sdk::{Client, NewTaskDto, CreateTaskBatchDto};
+    /// # async fn f(client: Client, tasks: Vec<NewTaskDto>) -> arcrun_sdk::Result<()> {
+    /// let req = CreateTaskBatchDto::new(tasks)
+    ///     .scope("team-payments")
+    ///     .metadata(serde_json::json!({ "env": "prod" }));
+    /// let result = client.create_batch(req).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn create_batch(&self, body: CreateTaskBatchDto) -> Result<CreateBatchResult> {
+        let resp = self
+            .http
+            .post(format!("{}/task", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+        Self::handle_create_response(resp).await
+    }
+
+    /// Parse a `POST /task` response into a [`CreateBatchResult`] (shared by
+    /// `create_tasks` and `create_batch`).
+    async fn handle_create_response(resp: reqwest::Response) -> Result<CreateBatchResult> {
         let status = resp.status();
         let batch_id = resp
             .headers()

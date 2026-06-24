@@ -8,6 +8,7 @@ mod common;
 mod test_actions;
 mod test_batch_complete;
 mod test_batch_rules;
+mod test_batch_scope;
 mod test_batch_stats;
 mod test_batch_update;
 mod test_bug_audit1;

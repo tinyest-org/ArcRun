@@ -26,13 +26,20 @@ struct BatchStatusRow {
     latest_updated_at: chrono::DateTime<Utc>,
     #[diesel(sql_type = sql_types::Array<sql_types::Text>)]
     kinds: Vec<String>,
+    /// Batch scope (NULL when the batch has no `batch` row).
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    scope: Option<String>,
+    /// Batch metadata (NULL when the batch has no `batch` row).
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Jsonb>)]
+    metadata: Option<serde_json::Value>,
 }
 
 /// List batches with aggregated statistics, supporting optional filters and pagination.
 ///
 /// Uses `GROUP BY (batch_id, status)` instead of repeated `COUNT(*) FILTER`
-/// clauses — the pivot into per-status counts happens in Rust.
-/// All filter parameters are always bound as `Nullable` ($1–$7), so no dynamic
+/// clauses — the pivot into per-status counts happens in Rust. A `LEFT JOIN batch`
+/// surfaces the batch scope/metadata (NULL for batches that have no `batch` row).
+/// All filter parameters are always bound as `Nullable` ($1–$8), so no dynamic
 /// SQL assembly or bind-count branching is needed.
 pub(crate) async fn list_batches<'a>(
     conn: &mut Conn<'a>,
@@ -41,24 +48,36 @@ pub(crate) async fn list_batches<'a>(
 ) -> Result<Vec<dtos::BatchSummaryDto>, DbError> {
     let kind_filter = filter.kind.map(|k| escape_like_pattern(&k));
     let name_filter = filter.name.map(|n| escape_like_pattern(&n));
+    let search_filter = filter.search.map(|s| escape_like_pattern(&s));
+    // Invalid JSON in the metadata filter is treated as "no filter" (mirrors task filtering).
+    let metadata_filter: Option<serde_json::Value> =
+        filter.metadata.and_then(|m| serde_json::from_str(&m).ok());
 
     let rows = diesel::sql_query(
         r#"
         WITH paginated_batches AS (
             SELECT
-                batch_id,
-                ARRAY_AGG(DISTINCT kind) AS kinds,
-                MIN(created_at) AS first_created
-            FROM task
-            WHERE batch_id IS NOT NULL
-              AND ($1::text        IS NULL OR kind       LIKE '%' || $1 || '%')
-              AND ($2::status_kind IS NULL OR status     = $2)
-              AND ($3::text        IS NULL OR name       LIKE '%' || $3 || '%')
-              AND ($4::timestamptz IS NULL OR created_at >= $4)
-              AND ($5::timestamptz IS NULL OR created_at <= $5)
-            GROUP BY batch_id
+                t.batch_id,
+                ARRAY_AGG(DISTINCT t.kind) AS kinds,
+                MIN(t.created_at) AS first_created,
+                b.scope AS scope,
+                b.metadata AS metadata
+            FROM task t
+            LEFT JOIN batch b ON b.id = t.batch_id
+            WHERE t.batch_id IS NOT NULL
+              AND ($1::text        IS NULL OR t.kind       LIKE '%' || $1 || '%')
+              AND ($2::status_kind IS NULL OR t.status     = $2)
+              AND ($3::text        IS NULL OR t.name       LIKE '%' || $3 || '%')
+              AND ($4::timestamptz IS NULL OR t.created_at >= $4)
+              AND ($5::timestamptz IS NULL OR t.created_at <= $5)
+              AND ($6::text        IS NULL OR b.scope = $6)
+              AND ($7::jsonb       IS NULL OR b.metadata @> $7)
+              AND ($8::text        IS NULL
+                   OR b.scope ILIKE '%' || $8 || '%'
+                   OR b.metadata::text ILIKE '%' || $8 || '%')
+            GROUP BY t.batch_id, b.scope, b.metadata
             ORDER BY first_created DESC
-            LIMIT $6 OFFSET $7
+            LIMIT $9 OFFSET $10
         )
         SELECT
             t.batch_id,
@@ -66,10 +85,12 @@ pub(crate) async fn list_batches<'a>(
             COUNT(*)::bigint AS cnt,
             MIN(t.created_at) AS first_created_at,
             MAX(t.last_updated) AS latest_updated_at,
-            pb.kinds
+            pb.kinds,
+            pb.scope,
+            pb.metadata
         FROM task t
         INNER JOIN paginated_batches pb ON t.batch_id = pb.batch_id
-        GROUP BY t.batch_id, t.status, pb.kinds, pb.first_created
+        GROUP BY t.batch_id, t.status, pb.kinds, pb.first_created, pb.scope, pb.metadata
         ORDER BY pb.first_created DESC, t.batch_id
         "#,
     )
@@ -78,6 +99,9 @@ pub(crate) async fn list_batches<'a>(
     .bind::<sql_types::Nullable<sql_types::Text>, _>(name_filter)
     .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(filter.created_after)
     .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(filter.created_before)
+    .bind::<sql_types::Nullable<sql_types::Text>, _>(filter.scope)
+    .bind::<sql_types::Nullable<sql_types::Jsonb>, _>(metadata_filter)
+    .bind::<sql_types::Nullable<sql_types::Text>, _>(search_filter)
     .bind::<sql_types::BigInt, _>(pagination.limit)
     .bind::<sql_types::BigInt, _>(pagination.offset)
     .get_results::<BatchStatusRow>(conn)
@@ -95,6 +119,10 @@ pub(crate) async fn list_batches<'a>(
                 latest_updated_at: row.latest_updated_at,
                 status_counts: dtos::BatchStatusCounts::default(),
                 kinds: row.kinds,
+                scope: row.scope,
+                metadata: row
+                    .metadata
+                    .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
             });
         }
         let entry = batches.last_mut().unwrap();
@@ -153,28 +181,35 @@ pub(crate) async fn get_batch_stats<'a>(
         paused: i64,
         #[diesel(sql_type = sql_types::BigInt)]
         canceled: i64,
+        #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+        scope: Option<String>,
+        #[diesel(sql_type = sql_types::Nullable<sql_types::Jsonb>)]
+        metadata: Option<serde_json::Value>,
     }
 
     let row = diesel::sql_query(
         r#"
         SELECT
             COUNT(*)::bigint AS total_tasks,
-            COALESCE(SUM(success), 0)::bigint AS total_success,
-            COALESCE(SUM(failures), 0)::bigint AS total_failures,
-            CASE WHEN COUNT(*) FILTER (WHERE expected_count IS NULL) = 0
-                 THEN SUM(expected_count)::bigint
+            COALESCE(SUM(t.success), 0)::bigint AS total_success,
+            COALESCE(SUM(t.failures), 0)::bigint AS total_failures,
+            CASE WHEN COUNT(*) FILTER (WHERE t.expected_count IS NULL) = 0
+                 THEN SUM(t.expected_count)::bigint
             END AS total_expected,
-            COUNT(*) FILTER (WHERE status = 'waiting')::bigint AS waiting,
-            COUNT(*) FILTER (WHERE status = 'pending')::bigint AS pending,
-            COUNT(*) FILTER (WHERE status = 'claimed')::bigint AS claimed,
-            COUNT(*) FILTER (WHERE status = 'running')::bigint AS running,
-            COUNT(*) FILTER (WHERE status = 'success')::bigint AS cnt_success,
-            COUNT(*) FILTER (WHERE status = 'failure')::bigint AS cnt_failure,
-            COUNT(*) FILTER (WHERE status = 'paused')::bigint AS paused,
-            COUNT(*) FILTER (WHERE status = 'canceled')::bigint AS canceled
-        FROM task
-        WHERE batch_id = $1
-        GROUP BY batch_id
+            COUNT(*) FILTER (WHERE t.status = 'waiting')::bigint AS waiting,
+            COUNT(*) FILTER (WHERE t.status = 'pending')::bigint AS pending,
+            COUNT(*) FILTER (WHERE t.status = 'claimed')::bigint AS claimed,
+            COUNT(*) FILTER (WHERE t.status = 'running')::bigint AS running,
+            COUNT(*) FILTER (WHERE t.status = 'success')::bigint AS cnt_success,
+            COUNT(*) FILTER (WHERE t.status = 'failure')::bigint AS cnt_failure,
+            COUNT(*) FILTER (WHERE t.status = 'paused')::bigint AS paused,
+            COUNT(*) FILTER (WHERE t.status = 'canceled')::bigint AS canceled,
+            b.scope AS scope,
+            b.metadata AS metadata
+        FROM task t
+        LEFT JOIN batch b ON b.id = t.batch_id
+        WHERE t.batch_id = $1
+        GROUP BY t.batch_id, b.scope, b.metadata
         "#,
     )
     .bind::<sql_types::Uuid, _>(bid)
@@ -198,6 +233,10 @@ pub(crate) async fn get_batch_stats<'a>(
             paused: r.paused,
             canceled: r.canceled,
         },
+        scope: r.scope,
+        metadata: r
+            .metadata
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
     }))
 }
 

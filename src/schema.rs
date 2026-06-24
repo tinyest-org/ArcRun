@@ -44,6 +44,8 @@ diesel::table! {
         id -> Uuid,
         on_complete -> Jsonb,
         created_at -> Timestamptz,
+        scope -> Nullable<Text>,
+        metadata -> Jsonb,
     }
 }
 

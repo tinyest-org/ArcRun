@@ -344,6 +344,49 @@ pub fn validate_rules(rules: &Rules) -> ValidationResult {
 
 /// Validates a batch of new tasks, checking for duplicate IDs, unknown/forward
 /// dependency references, and circular dependencies.
+/// Validate the batch-level `scope` and `metadata` carried by a `POST /task` object body.
+/// `scope` must be non-empty (after trim) and within the length cap; `metadata` is size-capped
+/// like task metadata. Both are optional — `None` is always valid.
+pub fn validate_batch_meta(
+    scope: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+) -> ValidationResult {
+    let mut errors = Vec::new();
+
+    if let Some(scope) = scope {
+        if scope.trim().is_empty() {
+            errors.push(ValidationError {
+                field: "scope".to_string(),
+                message: "Batch scope cannot be empty".to_string(),
+            });
+        } else if scope.len() > MAX_BATCH_SCOPE_LEN {
+            errors.push(ValidationError {
+                field: "scope".to_string(),
+                message: format!(
+                    "Batch scope cannot exceed {} characters",
+                    MAX_BATCH_SCOPE_LEN
+                ),
+            });
+        }
+    }
+
+    if let Some(metadata) = metadata {
+        let metadata_str = serde_json::to_string(metadata).unwrap_or_default();
+        if metadata_str.len() > MAX_METADATA_BYTES {
+            errors.push(ValidationError {
+                field: "metadata".to_string(),
+                message: "Batch metadata cannot exceed 64KB".to_string(),
+            });
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 pub fn validate_task_batch(tasks: &[NewTaskDto]) -> ValidationResult {
     use std::collections::HashMap;
 

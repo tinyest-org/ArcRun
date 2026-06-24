@@ -103,6 +103,20 @@ pub struct CreateTaskBatchDto {
     /// the request body carries an `arcrun` object with `batch_id`, per-status
     /// `counts`, and `completed_at`.
     pub on_batch_complete: Option<Vec<NewActionDto>>,
+    /// Optional business-level label attached to the batch. Filterable via
+    /// `GET /batches?scope=...` (exact match) and searchable via `?search=...`.
+    pub scope: Option<String>,
+    /// Optional arbitrary structured metadata attached to the batch. Filterable via
+    /// `GET /batches?metadata={...}` (JSONB containment) and searchable via `?search=...`.
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// The batch-level parts extracted from a `POST /task` body.
+pub struct BatchParts {
+    pub tasks: Vec<NewTaskDto>,
+    pub on_batch_complete: Option<Vec<NewActionDto>>,
+    pub scope: Option<String>,
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// The accepted shapes of the `POST /task` request body.
@@ -119,11 +133,22 @@ pub enum CreateTaskBody {
 }
 
 impl CreateTaskBody {
-    /// Split the body into `(tasks, on_batch_complete)`.
-    pub fn into_parts(self) -> (Vec<NewTaskDto>, Option<Vec<NewActionDto>>) {
+    /// Split the body into its task list and batch-level parts. The legacy bare-array
+    /// form carries no batch-level fields.
+    pub fn into_parts(self) -> BatchParts {
         match self {
-            CreateTaskBody::Bare(tasks) => (tasks, None),
-            CreateTaskBody::WithBatch(b) => (b.tasks, b.on_batch_complete),
+            CreateTaskBody::Bare(tasks) => BatchParts {
+                tasks,
+                on_batch_complete: None,
+                scope: None,
+                metadata: None,
+            },
+            CreateTaskBody::WithBatch(b) => BatchParts {
+                tasks: b.tasks,
+                on_batch_complete: b.on_batch_complete,
+                scope: b.scope,
+                metadata: b.metadata,
+            },
         }
     }
 }

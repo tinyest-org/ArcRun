@@ -20,6 +20,10 @@ pub struct BatchSummaryDto {
     pub status_counts: BatchStatusCounts,
     /// Distinct task kinds in this batch.
     pub kinds: Vec<String>,
+    /// Optional business-level label for the batch (null when none was set).
+    pub scope: Option<String>,
+    /// Structured metadata attached to the batch (`{}` when none was set).
+    pub metadata: serde_json::Value,
 }
 
 /// Per-status task counts within a batch.
@@ -51,6 +55,10 @@ pub struct BatchStatsDto {
     pub total_expected: Option<i64>,
     /// Breakdown of task counts by status.
     pub status_counts: BatchStatusCounts,
+    /// Optional business-level label for the batch (null when none was set or no batch row exists).
+    pub scope: Option<String>,
+    /// Structured metadata attached to the batch (`{}` when none was set or no batch row exists).
+    pub metadata: serde_json::Value,
 }
 
 /// Filter parameters for batch listing. All filters are optional and combined with AND logic.
@@ -68,6 +76,13 @@ pub struct BatchFilterDto {
     pub created_after: Option<chrono::DateTime<Utc>>,
     /// Only include batches with tasks created on or before this timestamp.
     pub created_before: Option<chrono::DateTime<Utc>>,
+    /// Filter by batch scope (exact match).
+    pub scope: Option<String>,
+    /// Filter by batch metadata using JSONB containment (`@>`). Pass a JSON object,
+    /// e.g. `?metadata={"env":"prod"}`; matches batches whose metadata contains it.
+    pub metadata: Option<String>,
+    /// Free-text substring search across the batch scope and its metadata (as text).
+    pub search: Option<String>,
 }
 
 /// Payload for updating concurrency/capacity rules on non-terminal tasks in a batch,

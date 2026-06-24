@@ -299,6 +299,12 @@ pub struct BatchSummaryDto {
     pub latest_updated_at: chrono::DateTime<chrono::Utc>,
     pub status_counts: BatchStatusCounts,
     pub kinds: Vec<String>,
+    /// Optional business-level label for the batch (`None` when none was set).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Structured metadata attached to the batch (`{}` when none was set).
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 /// Filter parameters for batch listing.
@@ -314,6 +320,16 @@ pub struct BatchFilter {
     pub created_after: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Filter by batch scope (exact match).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Filter by batch metadata using JSONB containment (`@>`). A JSON object
+    /// serialized to a string, e.g. `{"env":"prod"}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    /// Free-text substring search across the batch scope and its metadata (as text).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
 }
 
 // =============================================================================
@@ -335,6 +351,57 @@ pub struct ReadyResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+// =============================================================================
+// Batch creation request (object form)
+// =============================================================================
+
+/// Object-form `POST /task` body: a task list plus optional batch-level fields
+/// (`on_batch_complete` webhook, `scope`, `metadata`). Use [`Client::create_batch`]
+/// to send it; for the legacy bare-array form use [`Client::create_tasks`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTaskBatchDto {
+    pub tasks: Vec<NewTaskDto>,
+    /// Webhook actions fired exactly once when the last task of the batch becomes terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_batch_complete: Option<Vec<NewActionDto>>,
+    /// Optional business-level label attached to the batch (filterable/searchable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Optional structured metadata attached to the batch (filterable/searchable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl CreateTaskBatchDto {
+    /// Start an object-form batch request from a task list.
+    pub fn new(tasks: Vec<NewTaskDto>) -> Self {
+        Self {
+            tasks,
+            on_batch_complete: None,
+            scope: None,
+            metadata: None,
+        }
+    }
+
+    /// Attach a business-level scope label to the batch.
+    pub fn scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = Some(scope.into());
+        self
+    }
+
+    /// Attach structured metadata to the batch.
+    pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Register batch-complete webhook actions.
+    pub fn on_batch_complete(mut self, actions: Vec<NewActionDto>) -> Self {
+        self.on_batch_complete = Some(actions);
+        self
+    }
 }
 
 // =============================================================================

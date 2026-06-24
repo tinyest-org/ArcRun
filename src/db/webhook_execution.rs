@@ -182,16 +182,20 @@ pub async fn maybe_enqueue_batch_complete<'a>(
     // check into one statement would NOT work: the subquery would be evaluated on
     // the pre-wait snapshot.)
     //
-    // Batches without an on_batch_complete payload have no `batch` row: cheap no-op.
-    let locked: Option<uuid::Uuid> = dsl::batch
+    // Batches without a `batch` row are a cheap no-op. A batch row may exist with an
+    // EMPTY `on_complete` (scope/metadata-only batch, no webhook) — those carry no
+    // completion signal, so skip them too. We lock + read `on_complete` in one
+    // statement; the lock still serialises concurrent detection for webhook batches.
+    let locked: Option<(uuid::Uuid, serde_json::Value)> = dsl::batch
         .filter(dsl::id.eq(batch_id))
-        .select(dsl::id)
+        .select((dsl::id, dsl::on_complete))
         .for_update()
-        .first::<uuid::Uuid>(conn)
+        .first::<(uuid::Uuid, serde_json::Value)>(conn)
         .await
         .optional()?;
 
-    if locked.is_none() {
+    let has_webhook = matches!(locked, Some((_, ref on_complete)) if on_complete.as_array().is_some_and(|a| !a.is_empty()));
+    if !has_webhook {
         return Ok(());
     }
 
@@ -247,19 +251,24 @@ pub async fn maybe_enqueue_batch_complete_for_task<'a>(
     Ok(())
 }
 
-/// Insert the `batch` row holding an `on_batch_complete` payload, inside the
-/// caller's transaction (the same tx as `add_task`). `on_complete` is the JSON
-/// array of `NewActionDto`.
+/// Insert the `batch` row, inside the caller's transaction (the same tx as
+/// `add_task`). `on_complete` is the JSON array of `NewActionDto` (empty `[]` for a
+/// scope/metadata-only batch); `scope`/`metadata` are the batch's business-level
+/// identity used for filtering and search.
 pub async fn insert_batch<'a>(
     conn: &mut Conn<'a>,
     batch_id: uuid::Uuid,
     on_complete: serde_json::Value,
+    scope: Option<String>,
+    metadata: serde_json::Value,
 ) -> Result<(), DbError> {
     use crate::schema::batch::dsl;
     diesel::insert_into(dsl::batch)
         .values(crate::models::NewBatch {
             id: batch_id,
             on_complete,
+            scope,
+            metadata,
         })
         .execute(conn)
         .await?;

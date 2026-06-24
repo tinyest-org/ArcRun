@@ -205,8 +205,13 @@ pub async fn add_task(
     let batch_id = Uuid::new_v4();
 
     // Accept both the legacy bare array and the object form
-    // `{ "tasks": [...], "on_batch_complete": [...] }`.
-    let (f, on_batch_complete) = form.0.into_parts();
+    // `{ "tasks": [...], "on_batch_complete": [...], "scope": ..., "metadata": ... }`.
+    let dtos::BatchParts {
+        tasks: f,
+        on_batch_complete,
+        scope: batch_scope,
+        metadata: batch_metadata,
+    } = form.0.into_parts();
 
     log::info!(
         "[batch_id={}] Creating task batch from requester={}, task_count={}, on_batch_complete={}",
@@ -250,16 +255,42 @@ pub async fn add_task(
         }
     }
 
+    // Validate the batch-level scope/metadata (size/format) before the transaction.
+    if let Err(errors) =
+        validation::validate_batch_meta(batch_scope.as_deref(), batch_metadata.as_ref())
+    {
+        let error_messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+        log::warn!(
+            "[batch_id={}] Batch scope/metadata validation failed: {:?}",
+            batch_id,
+            error_messages
+        );
+        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Validation failed",
+            "batch_id": batch_id,
+            "details": error_messages
+        })));
+    }
+
     let mut conn = state.conn().await?;
 
     let result = db_operation::run_in_transaction(&mut conn, |conn| {
         Box::pin(async move {
-            // Register the batch-complete webhook payload first (if provided), so the
-            // empty-batch case still fires the signal in this same transaction.
-            if let Some(actions) = on_batch_complete {
-                let on_complete = serde_json::to_value(&actions)
-                    .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
-                db_operation::insert_batch(conn, batch_id, on_complete).await?;
+            // Create the batch row when ANY batch-level field is provided (webhook,
+            // scope, or metadata). Done first so the empty-batch case still fires the
+            // batch-complete signal in this same transaction. `on_complete` defaults to
+            // an empty array for scope/metadata-only batches (no webhook).
+            if on_batch_complete.is_some() || batch_scope.is_some() || batch_metadata.is_some() {
+                let on_complete = on_batch_complete
+                    .map(|actions| {
+                        serde_json::to_value(&actions)
+                            .unwrap_or_else(|_| serde_json::Value::Array(vec![]))
+                    })
+                    .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+                let metadata =
+                    batch_metadata.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+                db_operation::insert_batch(conn, batch_id, on_complete, batch_scope, metadata)
+                    .await?;
             }
 
             // Grouped insertion (Lot 3a): contiguous dedupe-free runs are inserted in

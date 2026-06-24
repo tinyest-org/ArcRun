@@ -39,12 +39,12 @@ The `on_start` action can return a `NewActionDto` in the response body to regist
 ### POST /task body shapes (Lot 3)
 `POST /task` accepts two JSON shapes (serde `untagged`, fully backwards compatible):
 - The legacy bare array `[NewTaskDto, …]`.
-- An object `{ "tasks": [NewTaskDto, …], "on_batch_complete": [NewActionDto, …] }`.
+- An object `{ "tasks": [NewTaskDto, …], "on_batch_complete": [NewActionDto, …], "scope": "…", "metadata": {…} }`.
 
-`on_batch_complete` registers a batch-level webhook fired exactly once (at-least-once via the outbox) when the **last** task of the batch becomes terminal. A `batch` row is created only when the field is provided (batches without it cost nothing). SSRF/param validation runs on the batch-level actions like any other action. Tasks are inserted in **grouped multi-row INSERTs** (Lot 3a): contiguous runs of tasks *without* a `dedupe_strategy` are flushed in one `task` / `link` / `action` INSERT each; UUIDs are app-generated (`Uuid::new_v4()`) so the full `id_mapping` is known before any insert. A task carrying a `dedupe_strategy` ends the current run (the run is flushed first so the dedupe check can match tasks inserted earlier in the same batch) — same guard philosophy as the Lot 1 batch-claim.
+`on_batch_complete` registers a batch-level webhook fired exactly once (at-least-once via the outbox) when the **last** task of the batch becomes terminal. `scope` (text label) and `metadata` (arbitrary JSON) are optional batch-level identity used for filtering/search via `GET /batches` (Tasker #601). A `batch` row is created when **any** of `on_batch_complete` / `scope` / `metadata` is provided (batches with none of them cost nothing); a scope/metadata-only batch stores `on_complete = '[]'`. Scope/metadata are validated (`validation::validate_batch_meta`: scope non-empty + ≤255 chars, metadata ≤64KB). SSRF/param validation runs on the batch-level actions like any other action. Tasks are inserted in **grouped multi-row INSERTs** (Lot 3a): contiguous runs of tasks *without* a `dedupe_strategy` are flushed in one `task` / `link` / `action` INSERT each; UUIDs are app-generated (`Uuid::new_v4()`) so the full `id_mapping` is known before any insert. A task carrying a `dedupe_strategy` ends the current run (the run is flushed first so the dedupe check can match tasks inserted earlier in the same batch) — same guard philosophy as the Lot 1 batch-claim.
 
 ### Batch-complete detection (`BatchComplete` trigger — Lot 3b)
-When any task of a batch reaches a terminal state, the transition transaction calls `maybe_enqueue_batch_complete[_for_task]` (`src/db/webhook_execution.rs`): if a `batch` row exists AND `NOT EXISTS (task WHERE batch_id = $1 AND status NOT IN (terminal))`, it enqueues one outbox row keyed `batch:<batch_id>:complete`. The unique idempotency key + `ON CONFLICT DO NOTHING` make concurrent detection inoffensive (a single row even if two tasks finish "at once"). The check is centralised in ONE helper, called from every terminal site: `update_running_task`, `fail_task_and_propagate`, `stop_batch` (`task_lifecycle.rs`), `timeout_task_and_propagate` (`task_query.rs`), `cancel_task` (`propagation.rs`), and `add_task` (for the vacuously-complete empty / all-dedupe-skipped batch). The delivery loop (`delivery_loop.rs`: `prepare_batch_complete_row` prefetch + `deliver_plan`) loads `batch.on_complete`, executes each action **without** a `?handle=`, with an `arcrun` body enrichment `{batch_id, counts:{success,failure,canceled}, completed_at}` (counts / `completed_at = max(ended_at)` computed at delivery time). Retry/backoff/exhausted are identical to task-level rows. Retention (`src/db/cleanup.rs`) also deletes orphaned `batch` rows (and their batch-level `webhook_execution` rows) once their tasks are gone.
+When any task of a batch reaches a terminal state, the transition transaction calls `maybe_enqueue_batch_complete[_for_task]` (`src/db/webhook_execution.rs`): if a `batch` row exists **with a non-empty `on_complete`** AND `NOT EXISTS (task WHERE batch_id = $1 AND status NOT IN (terminal))`, it enqueues one outbox row keyed `batch:<batch_id>:complete`. (The `on_complete` non-empty gate matters since #601: scope/metadata-only batches have a `batch` row but an empty `on_complete`, so they never signal completion.) The unique idempotency key + `ON CONFLICT DO NOTHING` make concurrent detection inoffensive (a single row even if two tasks finish "at once"). The check is centralised in ONE helper, called from every terminal site: `update_running_task`, `fail_task_and_propagate`, `stop_batch` (`task_lifecycle.rs`), `timeout_task_and_propagate` (`task_query.rs`), `cancel_task` (`propagation.rs`), and `add_task` (for the vacuously-complete empty / all-dedupe-skipped batch). The delivery loop (`delivery_loop.rs`: `prepare_batch_complete_row` prefetch + `deliver_plan`) loads `batch.on_complete`, executes each action **without** a `?handle=`, with an `arcrun` body enrichment `{batch_id, counts:{success,failure,canceled}, completed_at}` (counts / `completed_at = max(ended_at)` computed at delivery time). Retry/backoff/exhausted are identical to task-level rows. Retention (`src/db/cleanup.rs`) also deletes orphaned `batch` rows (and their batch-level `webhook_execution` rows) once their tasks are gone.
 
 ### Webhook Delivery Contract (transactional outbox — Lot 2)
 
@@ -296,9 +296,12 @@ task (id, name, kind, status, metadata, timeout, batch_id, start_condition,
       created_at, started_at, ended_at, last_updated, priority)
 action (id, task_id, kind, trigger, condition, params, success)
 link (parent_id, child_id, requires_success)
-batch (id, on_complete, created_at)
-  -- one row per batch that registered an on_batch_complete webhook (Lot 3b);
-  -- on_complete = JSONB array of NewActionDto. Batches without the webhook have no row.
+batch (id, on_complete, created_at, scope, metadata)
+  -- one row per batch that registered on_batch_complete (Lot 3b) AND/OR scope/metadata (#601);
+  -- on_complete = JSONB array of NewActionDto ('[]' for a scope/metadata-only batch).
+  -- scope = nullable TEXT label, metadata = JSONB (default '{}') — both filterable/searchable
+  --   via GET /batches (?scope= exact, ?metadata= JSONB containment @>, ?search= substring).
+  -- Batches with none of on_complete/scope/metadata have no row (tracked only via task.batch_id).
 webhook_execution (id, task_id, trigger, condition, idempotency_key,
                    status, attempts, created_at, updated_at,
                    next_attempt_at, last_error, batch_id)
@@ -328,6 +331,8 @@ idx_webhook_execution_status ON webhook_execution(status)
 idx_webhook_execution_pending_due ON webhook_execution(next_attempt_at) WHERE status = 'pending'
 idx_webhook_execution_batch_id ON webhook_execution(batch_id) WHERE batch_id IS NOT NULL
 idx_task_priority ON task(status, priority DESC, created_at ASC)
+idx_batch_scope ON batch(scope) WHERE scope IS NOT NULL
+idx_batch_metadata_gin ON batch USING GIN(metadata)
 ```
 
 ## Metrics
