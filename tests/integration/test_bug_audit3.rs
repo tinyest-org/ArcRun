@@ -1068,3 +1068,203 @@ async fn test_audit2_a4_cancel_during_permit_wait_skips_on_start() {
     let _ = t1_start_shutdown.send(());
     let _ = t2_start_shutdown.send(());
 }
+
+// ---------------------------------------------------------------------------
+// A7 — batch-updater counter pipeline: terminal guard, i32 clamp, anti-poison.
+// ---------------------------------------------------------------------------
+
+// NOTE: `RunQueryDsl` is intentionally not in module scope (see top-of-file
+// comment), so `execute` is invoked in fully-qualified form here.
+
+/// Force a task's status (and, for `running`, a known-old `last_updated`) directly.
+async fn force_status_running_old(pool: &arcrun::DbPool, task_id: uuid::Uuid) {
+    use diesel::sql_types::{Timestamptz, Uuid as SqlUuid};
+    let mut conn = pool.get().await.unwrap();
+    let past = chrono::Utc::now() - chrono::Duration::seconds(3600);
+    let q = diesel::sql_query(
+        "UPDATE task SET status = 'running', started_at = $1, last_updated = $1 WHERE id = $2",
+    )
+    .bind::<Timestamptz, _>(past)
+    .bind::<SqlUuid, _>(task_id);
+    diesel_async::RunQueryDsl::execute(q, &mut conn)
+        .await
+        .unwrap();
+}
+
+/// Force a task to terminal `success`, stamping `last_updated = now()`.
+async fn force_status_terminal_success(pool: &arcrun::DbPool, task_id: uuid::Uuid) {
+    use diesel::sql_types::Uuid as SqlUuid;
+    let mut conn = pool.get().await.unwrap();
+    let q = diesel::sql_query(
+        "UPDATE task SET status = 'success', ended_at = now(), last_updated = now() WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(task_id);
+    diesel_async::RunQueryDsl::execute(q, &mut conn)
+        .await
+        .unwrap();
+}
+
+/// Set a task's raw success counter (used to place it near i32::MAX).
+async fn set_success_counter(pool: &arcrun::DbPool, task_id: uuid::Uuid, value: i32) {
+    use diesel::sql_types::{Integer, Uuid as SqlUuid};
+    let mut conn = pool.get().await.unwrap();
+    let q = diesel::sql_query("UPDATE task SET success = $1 WHERE id = $2")
+        .bind::<Integer, _>(value)
+        .bind::<SqlUuid, _>(task_id);
+    diesel_async::RunQueryDsl::execute(q, &mut conn)
+        .await
+        .unwrap();
+}
+
+async fn put_counts(
+    app: &impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>,
+        Error = actix_web::Error,
+    >,
+    task_id: uuid::Uuid,
+    success: i32,
+    failures: i32,
+) {
+    let req = actix_web::test::TestRequest::put()
+        .uri(&format!("/task/{}", task_id))
+        .set_json(&json!({"new_success": success, "new_failures": failures}))
+        .to_request();
+    let resp = actix_web::test::call_service(app, req).await;
+    assert_eq!(
+        resp.status(),
+        actix_web::http::StatusCode::ACCEPTED,
+        "PUT counter update should be accepted"
+    );
+}
+
+/// # Original bug (A7)
+/// The batch-updater flush UNNEST statement had **no status guard**. A counter
+/// flush (from a buffered `PUT /task/{id}`) that landed *after* the task became
+/// terminal mutated `success`/`failures`/`last_updated` of a terminal task —
+/// violating "terminal states are immutable" and diverging from the counts that
+/// were already delivered with the task's end notification.
+///
+/// # Fix
+/// The flush now carries `AND task.status NOT IN ('success','failure','canceled')`.
+/// A row whose task is terminal no longer matches, so its buffered counts are
+/// **dropped** (a terminal task's counters are frozen — dropping, not re-queuing,
+/// is correct). A non-match is not an error, so nothing is re-queued.
+///
+/// # What this test asserts
+/// * Control: while the task is `running`, a flush DOES apply the counts and bumps
+///   `last_updated` (keepalive preserved).
+/// * After the task is terminal, a later flush leaves `success`, `failures` AND
+///   `last_updated` **unchanged**. Reverting the guard makes the terminal counters
+///   move and this test go red.
+#[tokio::test]
+async fn test_audit2_a7_terminal_guard_drops_late_flush() {
+    let (_g, test_state) = setup_test_app_with_batch_updater().await;
+    let state = test_state.state;
+    let app = test_service!(state);
+
+    let created = create_tasks_ok(&app, &[task_json("a7-guard", "A7 terminal guard", "a7")]).await;
+    let task_id = created[0].id;
+
+    // Control: while running, a flush must apply counts + bump last_updated.
+    force_status_running_old(&state.pool, task_id).await;
+    let running_before = get_task_ok(&app, task_id).await;
+    put_counts(&app, task_id, 2, 0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let running_after = get_task_ok(&app, task_id).await;
+    assert_eq!(
+        running_after.success, 2,
+        "running task must receive counter updates"
+    );
+    assert!(
+        running_after.last_updated > running_before.last_updated,
+        "running task flush must bump last_updated (keepalive)"
+    );
+
+    // Transition to terminal; snapshot the frozen counters + last_updated.
+    force_status_terminal_success(&state.pool, task_id).await;
+    let terminal = get_task_ok(&app, task_id).await;
+
+    // A late flush for the now-terminal task must be dropped entirely.
+    put_counts(&app, task_id, 5, 3).await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let after = get_task_ok(&app, task_id).await;
+    assert_eq!(
+        after.success, terminal.success,
+        "success must be frozen on a terminal task (late flush dropped)"
+    );
+    assert_eq!(
+        after.failures, terminal.failures,
+        "failures must be frozen on a terminal task (late flush dropped)"
+    );
+    assert_eq!(
+        after.last_updated, terminal.last_updated,
+        "last_updated must NOT move on a terminal task (late flush dropped)"
+    );
+}
+
+/// # Original bug (A7 — poison pill)
+/// The flush summed counters as `task.success + batch.s` in `int4`. A task whose
+/// counter approached `i32::MAX` (realistic for a long-lived high-throughput
+/// batch) would overflow on the next delta, raising `integer out of range`. That
+/// error failed the whole multi-row flush, which re-queued **every** count with
+/// no backoff or cap — the same overflowing row erroring on each iteration, so the
+/// entire counter pipeline (all tasks) was wedged until process restart (which
+/// loses the in-memory DashMap).
+///
+/// # Fix
+/// The sum is computed in `bigint` and clamped:
+/// `LEAST(task.success::bigint + batch.s, 2147483647)`. The `::bigint` cast makes
+/// the addition overflow-proof; `LEAST(..)` saturates at `i32::MAX`. No error is
+/// ever raised, so the flush commits and the pipeline keeps flowing.
+///
+/// # What this test asserts
+/// A task set to `i32::MAX - 100` that receives a `+1000` delta saturates to
+/// exactly `2147483647` with no error, and the updater loop remains alive
+/// (a second, independent task's counters are still flushed afterwards). Reverting
+/// the clamp makes the flush raise an overflow error: the delta is never applied
+/// (counter stays at `i32::MAX - 100`) and this test goes red.
+#[tokio::test]
+async fn test_audit2_a7_clamp_prevents_i32_overflow() {
+    let (_g, test_state) = setup_test_app_with_batch_updater().await;
+    let state = test_state.state;
+    let app = test_service!(state);
+
+    let created = create_tasks_ok(&app, &[task_json("a7-clamp", "A7 clamp", "a7")]).await;
+    let task_id = created[0].id;
+
+    // Place the counter just below i32::MAX while the task is active.
+    force_status_running_old(&state.pool, task_id).await;
+    let near_max = i32::MAX - 100; // 2_147_483_547
+    set_success_counter(&state.pool, task_id, near_max).await;
+
+    // A +1000 delta would overflow int4 without the bigint/LEAST clamp.
+    put_counts(&app, task_id, 1000, 0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let after = get_task_ok(&app, task_id).await;
+    assert_eq!(
+        after.success,
+        i32::MAX,
+        "counter must saturate at i32::MAX, not overflow (got {})",
+        after.success
+    );
+
+    // Pipeline liveness: an independent task's counters still flush afterwards,
+    // proving the near-overflow row did not wedge the updater loop.
+    let created2 = create_tasks_ok(
+        &app,
+        &[task_json("a7-clamp-live", "A7 clamp liveness", "a7")],
+    )
+    .await;
+    let live_id = created2[0].id;
+    force_status_running_old(&state.pool, live_id).await;
+    put_counts(&app, live_id, 7, 0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let live = get_task_ok(&app, live_id).await;
+    assert_eq!(
+        live.success, 7,
+        "pipeline must stay alive: a later task's counters are still persisted"
+    );
+}

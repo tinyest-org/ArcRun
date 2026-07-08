@@ -94,18 +94,25 @@ async fn test_batch_update_rejects_zero_counters() {
     );
 }
 
-/// Batch updates must persist counters even on terminal tasks.
-/// Previously, the batch updater SQL filtered out terminal statuses, which caused
-/// a race condition: if PUT (batch counter) was in-flight when PATCH (status=Success)
-/// landed, the buffered counts were silently dropped — resulting in tasks at "Success"
-/// with incomplete counters.
+/// Terminal tasks have FROZEN counters — a late batch flush must NOT mutate them.
+///
+/// Contract change (audit 2, A7): the batch-updater flush is now gated by
+/// `AND task.status NOT IN ('success','failure','canceled')`. A PUT whose counts
+/// land after the task became terminal (Success/Canceled) is silently dropped,
+/// because a terminal task's counters are immutable and were already delivered
+/// with its end notification — re-applying them would diverge from what consumers
+/// observed. This intentionally reverses commit 2e50620 ("ensure we don't skip
+/// the last updates"), which had removed the guard so racing counts still landed;
+/// audit A7 re-decided the trade-off in favor of terminal immutability. The PUT
+/// is still accepted (202) so callers racing the transition are not surprised by
+/// an error; the counts simply have no effect once the task is terminal.
 #[tokio::test]
-async fn test_batch_update_persists_counters_on_terminal_tasks() {
+async fn test_batch_update_dropped_on_terminal_tasks() {
     let (_g, test_state) = setup_test_app_with_batch_updater().await;
     let state = test_state.state;
     let app = test_service!(state);
 
-    // Success case: counters must still be applied
+    // Success case: counters must NOT change after the task is terminal.
     let tasks = vec![task_json(
         "terminal-success",
         "Terminal Success",
@@ -115,6 +122,7 @@ async fn test_batch_update_persists_counters_on_terminal_tasks() {
     let task_id = created[0].id;
 
     succeed_task(&state, task_id).await;
+    let before: TaskDto = get_task_ok(&app, task_id).await;
 
     let update_req = actix_web::test::TestRequest::put()
         .uri(&format!("/task/{}", task_id))
@@ -124,21 +132,21 @@ async fn test_batch_update_persists_counters_on_terminal_tasks() {
     assert_eq!(
         update_resp.status(),
         actix_web::http::StatusCode::ACCEPTED,
-        "Batch update should be accepted even if task is terminal"
+        "Batch update is still accepted even if task is terminal"
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     let updated: TaskDto = get_task_ok(&app, task_id).await;
     assert_eq!(
-        updated.success, 3,
-        "Success counter must be persisted even on terminal task"
+        updated.success, before.success,
+        "Success counter must NOT change on a terminal (Success) task"
     );
     assert_eq!(
-        updated.failures, 1,
-        "Failure counter must be persisted even on terminal task"
+        updated.failures, before.failures,
+        "Failure counter must NOT change on a terminal (Success) task"
     );
 
-    // Canceled case: counters must still be applied
+    // Canceled case: counters must NOT change after cancellation.
     let tasks = vec![task_json(
         "terminal-canceled",
         "Terminal Canceled",
@@ -152,6 +160,7 @@ async fn test_batch_update_persists_counters_on_terminal_tasks() {
         .to_request();
     let cancel_resp = actix_web::test::call_service(&app, cancel_req).await;
     assert!(cancel_resp.status().is_success());
+    let before: TaskDto = get_task_ok(&app, cancel_id).await;
 
     let update_req = actix_web::test::TestRequest::put()
         .uri(&format!("/task/{}", cancel_id))
@@ -161,17 +170,17 @@ async fn test_batch_update_persists_counters_on_terminal_tasks() {
     assert_eq!(
         update_resp.status(),
         actix_web::http::StatusCode::ACCEPTED,
-        "Batch update should be accepted even if task is canceled"
+        "Batch update is still accepted even if task is canceled"
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     let updated: TaskDto = get_task_ok(&app, cancel_id).await;
     assert_eq!(
-        updated.success, 2,
-        "Success counter must be persisted even on canceled task"
+        updated.success, before.success,
+        "Success counter must NOT change on a terminal (Canceled) task"
     );
     assert_eq!(
-        updated.failures, 2,
-        "Failure counter must be persisted even on canceled task"
+        updated.failures, before.failures,
+        "Failure counter must NOT change on a terminal (Canceled) task"
     );
 }

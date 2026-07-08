@@ -195,7 +195,9 @@ The batch updater (`src/workers.rs`) efficiently handles high-throughput success
 Key design decisions:
 - **DashMap**: Lock-free concurrent HashMap with per-shard locking
 - **Atomic counters**: `AtomicI32` for success/failures within each entry
-- **No data loss**: Failed DB updates re-add counts for retry
+- **No data loss (transient only)**: only *transient* DB failures re-add counts for retry. Two classes of failure are **dropped instead of re-queued** (contract change, audit A7): (a) a flush landing on a task that has become **terminal** — the flush SQL is gated by `AND task.status NOT IN ('success','failure','canceled')`, so a terminal task's counters stay frozen (a terminal task's counters were already delivered with its end notification; re-applying would diverge forever, and a re-queue would loop forever); (b) a **poison row** — on a batch-flush error the updater falls back to per-row; if some rows succeed while others keep failing, the connection is demonstrably alive, so the failing rows are deterministically faulty and are dropped + logged (`record_batch_update_failure`) rather than wedging the whole pipeline. Only an *all-rows-fail* per-row pass (DB/connection down) re-queues.
+- **Overflow-safe**: the flush computes `LEAST(task.<c>::bigint + delta, 2147483647)` — the sum is done in `bigint` (no `int4` overflow) and clamped to `i32::MAX`, so a long-lived high-throughput counter can never poison the flush with `integer out of range`.
+- **Shutdown drain**: on shutdown the receiver task drains all still-buffered channel events (`try_recv`) and is joined **before** the final flush snapshots the map, so in-flight events are never lost at shutdown.
 - **Cleanup**: Zero-count entries removed periodically
 
 ## Testing
