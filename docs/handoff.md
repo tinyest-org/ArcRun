@@ -1,43 +1,40 @@
-# Handoff — Plan perf & correctness
+# Handoff — État courant et reprise
 
-Contexte de reprise pour la prochaine session. La référence de design est
-`docs/perf-correctness-plan.md` — **lire ce fichier en premier**, il contient le contrat
-API cible, les décisions actées avec leurs raisons, et l'historique des lots.
+Contexte de reprise pour la prochaine session.
 
-## État au 2026-06-12
+## Campagne en cours : fixes Audit 2 (depuis 2026-07-08)
 
-- **Lots 0, 1, 2 et 3 : faits, testés, committés — le plan perf & correctness est
-  terminé.** Lot 3 (insertion groupée + webhook `on_batch_complete`) : 206 tests verts
-  (30 unitaires + 176 intégration dont 14 dans `test_batch_complete.rs`), validés
-  indépendamment de l'agent d'implémentation. La relecture a trouvé et corrigé 2 bugs
-  réels (write-skew sur la détection batch-complete ⇒ verrou FOR UPDATE sur la ligne
-  `batch` ; orphan-sweep de rétention vs signal `pending` d'un batch vide) — détail et
-  tests de régression dans la section Lot 3 du plan.
-- **Les 4 suivis de relecture sont soldés (2026-06-12)** — il ne reste rien d'ouvert :
-  1. *Delivery loop* : `run_delivery_once` réécrit en 4 phases — claim court avec lease
-     (`claim_due_outbox_leased`, env `WEBHOOK_DELIVERY_LEASE_SECS`), prefetch hors-lock,
-     HTTP parallèle borné (`WEBHOOK_DELIVERY_CONCURRENCY`), marks autocommit indépendants.
-     Détail dans la section Lot 2 du plan ; 4 nouveaux tests dans
-     `tests/integration/test_delivery_lease.rs`. La relecture indépendante a corrigé un
-     double comptage de la métrique `exhausted` (payload batch malformé).
-  2. *Paramètres `_evaluator` morts* : retirés de `update_running_task`,
-     `fail_task_and_propagate`, `cancel_task`, `timeout_loop` (+ tous les call sites).
-  3. *`WORKER_START_BATCH_SIZE`* : la validation rejette désormais `<= 0` (les négatifs
-     signifiaient silencieusement « claims illimités »).
-  4. *Migration drop d'index* : validée par `EXPLAIN ANALYZE` sur Postgres 18 seedé —
-     aucune requête de la `timeout_loop` ne fait de seq scan (résultat consigné dans le
-     plan, section Lot 0). Bon pour la prod.
-- Le contrat webhooks (at-least-once, ordre par tâche, `on_start` = control-flow hors
-  outbox, signal `on_batch_complete`) est documenté dans `CLAUDE.md` et implémenté.
+- **Référence d'analyse** : `docs/audits/AUDIT_2_CLAUDE.md` — audit complet perf,
+  correctness et architecture (post Lots 0-3). Chaque finding : fichier:ligne, scénario
+  d'échec, fix suggéré, sévérité. Findings majeurs contre-vérifiés à la main.
+- **Suivi d'exécution** : `docs/audits/AUDIT_2_FIXES.md` — tableau des items (Lots 4-7),
+  process de la boucle, prompt de reprise, journal. **C'est là qu'on lit l'état et
+  qu'on le met à jour.**
+- **Rôles** : implémentation déléguée à un agent **Opus 4.8** (Agent tool, `model: opus`)
+  avec prompt détaillé ; **relecture indépendante par Fable** (session principale) :
+  diff complet, invariants, re-run `cargo check` + suites ciblées + régressions
+  (`tests/integration/test_bug_audit3.rs`). Ne pas se fier au rapport de l'implémenteur.
+- Ordre : Lot 4 (correctness critique) → Lot 5 (sécurité) → Lot 6 (perf non-breaking).
+  Le Lot 7 (breaking : API v1, batch.remaining, rule_slot, GET /work) ne se lance que
+  sur décision explicite de l'utilisateur.
 
-## Process de travail utilisé (à reconduire)
+## Historique
 
-1. L'implémentation des lots est déléguée à un agent **Claude Opus 4.8** (Agent tool,
-   `model: opus`) avec un prompt détaillé qui pointe vers la section du plan + liste les
-   fichiers, les invariants à préserver et les tests exigés.
-2. La session principale fait ensuite une **relecture indépendante** : lecture du diff
-   complet, vérification des invariants du plan, re-run de `cargo check` et des suites de
-   tests (ne pas se fier au seul rapport de l'agent).
+- **Plan perf & correctness (Lots 0-3) : TERMINÉ** (2026-06-12, committé). Référence de
+  design et décisions actées : `docs/perf-correctness-plan.md` — à lire avant de toucher
+  claim loop / outbox / insertion groupée / batch-complete, pour ne pas régresser une
+  décision déjà tranchée (LIMIT-less visibility, on_start synchrone = control-flow,
+  pas de CTE récursive, enqueue outbox inconditionnel…).
+- Audit 1 (2026-02-14) : `docs/audits/AUDIT_1_*.md`, régressions dans
+  `tests/integration/test_bug_audit{1,2}.rs`.
+
+## Process de travail (à reconduire)
+
+1. L'implémentation est déléguée à un agent Opus (prompt : section du plan/audit copiée,
+   fichiers, invariants CLAUDE.md, tests exigés).
+2. La session principale fait la relecture indépendante (diff complet, invariants,
+   re-run des tests — jamais sur la seule foi du rapport de l'agent).
+3. Mise à jour du tableau de suivi + commit à chaque item (staging explicite).
 
 ## Pièges d'environnement connus
 
@@ -49,23 +46,10 @@ API cible, les décisions actées avec leurs raisons, et l'historique des lots.
 - **Docker Desktop fragile** : un disque plein l'a fait crasher en laissant un
   `com.docker.backend` zombie qui survit au SIGTERM et fait croire à `open -a Docker`
   que tout tourne. Remède : `kill -9 <pid backend>` puis `open -a Docker`.
-- **Espace disque** : les builds cargo remplissent vite le disque — il a saturé à 0
-  pendant le Lot 3 (les outils ne pouvaient même plus écrire dans /tmp). En cas de
+- **Espace disque** : les builds cargo remplissent vite le disque. En cas de
   `No space left on device` : `rm -rf ~/.cargo/target/debug/incremental`, ou
   `cargo clean` si insuffisant (rebuild complet ensuite).
-- **Working tree partagé** : une autre session travaille sur `ui/` (Sidebar,
-  CommandPalette…). Toujours **stager explicitement** les fichiers de son lot, jamais
-  `git add -A`. Ne jamais toucher `static/dag.html` ni `ui/`.
-
-## Suivis mineurs notés en relecture (non bloquants)
-
-- **Débit de la delivery loop** : `run_delivery_once` exécute tout le batch (HTTP compris)
-  dans une seule transaction qui tient les locks — livraison séquentielle. Si le débit
-  devient un goulot : claim court + livraison hors-tx parallèle (noté dans le plan, Lot 2).
-- **Paramètres `_evaluator` morts** : `update_running_task`, `cancel_task`,
-  `fail_task_and_propagate`, `timeout_loop` gardent un paramètre `ActionExecutor` inutilisé
-  depuis le passage à l'outbox. Nettoyage cosmétique à l'occasion.
-- `WORKER_START_BATCH_SIZE <= 0` signifie « claims illimités » (tous les gardes sont
-  `claim_cap > 0`). À documenter ou valider dans `config.rs` à l'occasion.
-- Migration `2026-06-11-000001_drop_redundant_status_index` : avant déploiement prod,
-  valider par `EXPLAIN` que la `timeout_loop` utilise bien `idx_task_priority`.
+- **Working tree partagé** : une autre session peut travailler sur `ui/`. Toujours
+  **stager explicitement** les fichiers de son lot, jamais `git add -A`. Ne jamais
+  toucher `static/dag.html` ni `ui/`.
+- **Commits** : pas de trailer Co-Authored-By.
