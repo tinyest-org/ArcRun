@@ -66,14 +66,14 @@ pub(crate) async fn enqueue_end_outbox_with_cascade<'a>(
 }
 
 /// Enqueue outbox rows for ancestors canceled by dead-end detection:
-/// - a `cancel` row if the ancestor was Running,
+/// - a `cancel` row if the ancestor's on_start may have run (Running OR Claimed — A4),
 /// - plus an on_failure `end` row in all cases.
 pub(crate) async fn enqueue_outbox_for_canceled_ancestors<'a>(
     ancestors: &[CanceledAncestor],
     conn: &mut Conn<'a>,
 ) -> Result<(), DbError> {
     for ancestor in ancestors {
-        if ancestor.was_running {
+        if ancestor.was_active {
             enqueue_cancel_outbox(&ancestor.id, conn).await?;
         }
         enqueue_end_outbox(&ancestor.id, StatusKind::Failure, conn).await?;

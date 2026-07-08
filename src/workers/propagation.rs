@@ -174,8 +174,11 @@ pub(crate) async fn propagate_to_children<'a>(
 #[derive(Debug)]
 pub(crate) struct CanceledAncestor {
     pub id: uuid::Uuid,
-    /// True if the task was Running before cancellation (needs cancel webhook).
-    pub was_running: bool,
+    /// True if the task's on_start webhook may have run before cancellation, i.e. it
+    /// was `Running` OR `Claimed` (needs a cancel webhook). A4 fix: `Claimed` covers
+    /// the whole on_start-in-flight window, so a Claimed dead-end ancestor whose
+    /// consumer started work must also get a cancel notification.
+    pub was_active: bool,
 }
 
 /// Row returned by the writable CTE in `cancel_dead_end_ancestors`.
@@ -268,7 +271,7 @@ pub(crate) async fn cancel_dead_end_ancestors<'a>(
             );
             all_canceled.push(CanceledAncestor {
                 id: row.id,
-                was_running: row.prev_status == "running",
+                was_active: row.prev_status == "running" || row.prev_status == "claimed",
             });
         }
     }
@@ -330,10 +333,21 @@ pub async fn cancel_task<'a>(
             };
 
             // Enqueue outbox rows (inside tx):
-            // - cancel notification for the canceled task if it was Running,
+            // - cancel notification for the canceled task if on_start may have run,
             // - on_failure for each cascade-failed child,
             // - cancel/on_failure for dead-end ancestors.
-            if t.status == StatusKind::Running {
+            //
+            // A4 fix: enqueue the cancel for `Claimed` as well as `Running`. `Claimed`
+            // is NOT "on_start never called" — it covers the whole on_start
+            // webhook-in-flight window (permit queue + up to the webhook timeout). A
+            // consumer that already received on_start and started work must get a cancel.
+            // Safe: the delivery loop's start-before-end gate holds this cancel row while
+            // the task's start row is pending+fresh (the start row is completed in the
+            // same tx as the Claimed->Running transition AND the cancel-action save — see
+            // start_loop A4), so the cancel is delivered only after the actions exist; a
+            // Claimed task that never returned a cancel action prefetches zero actions ⇒
+            // fast-path success (no HTTP).
+            if matches!(t.status, StatusKind::Running | StatusKind::Claimed) {
                 enqueue_cancel_outbox(&task_id, conn).await?;
             }
             for child_id in &cascade_failed {

@@ -1,6 +1,6 @@
 use crate::{
     Conn, dtos, metrics,
-    models::{self, StatusKind, Task},
+    models::{self, StatusKind},
     workers,
 };
 use diesel::prelude::*;
@@ -162,39 +162,53 @@ pub async fn update_running_task<'a>(
     }
 }
 
-/// Save cancel actions for a task that has been claimed.
-/// Validates webhook URLs before saving to prevent SSRF via cancel action responses.
+/// Persist the cancel actions a task's on_start webhook returned, validating each
+/// webhook URL first (SSRF protection via cancel action responses).
+///
+/// **Best-effort validation (A4)**: an individual cancel action that fails SSRF/param
+/// validation is logged and *skipped*, NOT surfaced as an error. This is what lets the
+/// call run INSIDE the Claimed->Running / start-row-completion transaction (see
+/// `start_loop::execute_webhook_for_task`): committing the cancel actions atomically
+/// with the start-row completion closes the race where a concurrently-enqueued cancel
+/// outbox row (from a DELETE/stop_batch fired while on_start was in flight) could be
+/// prefetched by the delivery loop *before* the actions existed — the consumer would
+/// then never receive a cancel and keep running zombie work. A validation failure must
+/// not roll back the transition (4.2 decision), hence the swallow. Only a real DB
+/// error (from `insert_actions`) propagates and rolls back the tx.
 pub(crate) async fn save_cancel_actions<'a>(
     conn: &mut Conn<'a>,
-    t: &Task,
+    task_id: uuid::Uuid,
     cancel_tasks: &[dtos::NewActionDto],
 ) -> Result<(), DbError> {
-    if !cancel_tasks.is_empty() {
-        // Validate each cancel action's webhook URL before persisting
-        for action_dto in cancel_tasks {
-            if let Err(e) =
-                crate::validation::validate_action_params(&action_dto.kind, &action_dto.params)
-            {
-                log::warn!(
-                    "Rejecting cancel action for task {} due to validation failure: {}",
-                    t.id,
-                    e
-                );
-                return Err(crate::error::ArcRunError::Validation(format!(
-                    "Cancel action validation failed: {}",
-                    e
-                )));
-            }
-        }
-        insert_actions(
-            t.id,
-            cancel_tasks,
-            &models::TriggerKind::Cancel,
-            &models::TriggerCondition::Success, // Condition doesn't matter for cancel
-            conn,
-        )
-        .await?;
+    if cancel_tasks.is_empty() {
+        return Ok(());
     }
+
+    // Validate each cancel action; skip (log) the invalid ones instead of failing.
+    let mut valid: Vec<dtos::NewActionDto> = Vec::with_capacity(cancel_tasks.len());
+    for action_dto in cancel_tasks {
+        match crate::validation::validate_action_params(&action_dto.kind, &action_dto.params) {
+            Ok(()) => valid.push(action_dto.clone()),
+            Err(e) => log::warn!(
+                "Skipping cancel action for task {} due to validation failure: {}",
+                task_id,
+                e
+            ),
+        }
+    }
+
+    if valid.is_empty() {
+        return Ok(());
+    }
+
+    insert_actions(
+        task_id,
+        &valid,
+        &models::TriggerKind::Cancel,
+        &models::TriggerCondition::Success, // Condition doesn't matter for cancel
+        conn,
+    )
+    .await?;
     Ok(())
 }
 
@@ -377,8 +391,16 @@ pub(crate) async fn stop_batch<'a>(
             .execute(conn)
             .await? as i64;
 
-            // Cancel Claimed tasks (no cancel webhooks needed — on_start not yet called)
-            let canceled_claimed = diesel::update(
+            // Cancel Claimed tasks (return their IDs for cancel webhook firing).
+            // A4 fix: `Claimed` is NOT "on_start not yet called" — it spans the entire
+            // on_start webhook-in-flight window (permit queue + up to the webhook
+            // timeout per action). A consumer that already received on_start and started
+            // work must still get a cancel, so we enqueue a cancel outbox row for
+            // formerly-Claimed tasks exactly like formerly-Running ones. Safe: the
+            // delivery loop's start-before-end gate holds the cancel row while the
+            // start row is pending+fresh, and a Claimed task that never returned a
+            // cancel action prefetches zero actions ⇒ fast-path success (no HTTP).
+            let canceled_claimed_ids: Vec<uuid::Uuid> = diesel::update(
                 dsl::task.filter(
                     dsl::batch_id
                         .eq(batch_id)
@@ -386,8 +408,10 @@ pub(crate) async fn stop_batch<'a>(
                 ),
             )
             .set(cancel_set!())
-            .execute(conn)
-            .await? as i64;
+            .returning(dsl::id)
+            .get_results(conn)
+            .await?;
+            let canceled_claimed = canceled_claimed_ids.len() as i64;
 
             // Cancel Running tasks (return their IDs for cancel webhook firing)
             let canceled_running_ids: Vec<uuid::Uuid> = diesel::update(
@@ -402,11 +426,14 @@ pub(crate) async fn stop_batch<'a>(
             .get_results(conn)
             .await?;
 
-            // Enqueue cancel outbox rows for formerly-Running tasks INSIDE this
-            // transaction (at-least-once delivery via the delivery loop). No reqwest
-            // in the call path. Safe per invariant #7: intra-batch links only, both
-            // sides of every link are canceled here, so no per-task propagation needed.
-            for rid in &canceled_running_ids {
+            // Enqueue cancel outbox rows for formerly-Running AND formerly-Claimed tasks
+            // INSIDE this transaction (at-least-once delivery via the delivery loop). No
+            // reqwest in the call path. Safe per invariant #7: intra-batch links only,
+            // both sides of every link are canceled here, so no per-task propagation.
+            for rid in canceled_running_ids
+                .iter()
+                .chain(canceled_claimed_ids.iter())
+            {
                 crate::workers::enqueue_cancel_outbox(rid, conn).await?;
             }
 

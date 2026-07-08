@@ -323,8 +323,10 @@ async fn webhook_phase(
 
 /// Execute the full webhook lifecycle for a single claimed task:
 /// 1. start_task (on_start webhooks)
-/// 2. mark_task_running + start-row completion (one transaction — A2 fix)
-/// 3. save_cancel_actions (outside the tx)
+/// 2. mark_task_running + save_cancel_actions + start-row completion (one transaction —
+///    A2 keeps the running transition & start-row completion atomic; A4 folds the
+///    cancel-action save into the same tx so it is committed before the start-before-end
+///    gate can release the task's cancel row)
 /// On failure: fail_task_and_propagate
 ///
 /// Returns true if the task was successfully started.
@@ -360,16 +362,27 @@ async fn execute_webhook_for_task(
             // actually executed (`claimed == true`), even if the running transition
             // itself is a no-op (task no longer Claimed) — so the row never lingers.
             //
-            // `save_cancel_actions` deliberately stays OUTSIDE this tx (below), so a
-            // validation failure on a webhook-supplied cancel action is logged and
-            // swallowed as before, without rolling back the running transition.
+            // A4 fix: `save_cancel_actions` now runs INSIDE this same tx, BEFORE the
+            // start-row completion. The delivery loop's start-before-end gate holds a
+            // task's cancel outbox row while its start row is `pending`; the start row
+            // goes non-pending only when THIS tx commits, and that commit now also
+            // contains the cancel actions. So a cancel row concurrently enqueued by a
+            // DELETE/stop_batch that fired while on_start was in flight (the task left
+            // `Claimed`, giving `Ok(false)` below) can never be prefetched by the
+            // delivery loop before its actions exist — the consumer, which received
+            // on_start and started work, will receive the cancel WITH those actions.
+            // `save_cancel_actions` is best-effort on validation (invalid actions are
+            // logged + skipped, never rolling back the transition — the 4.2 decision),
+            // so the tx rolls back only on a genuine DB error.
             let task_id = task.id;
             let tx_result: Result<bool, _> =
                 db_operation::run_in_transaction(&mut conn, move |conn| {
                     let key = idempotency_key;
+                    let cancel_tasks = cancel_tasks;
                     Box::pin(async move {
                         let ran = db_operation::mark_task_running(conn, &task_id).await?;
                         if claimed {
+                            db_operation::save_cancel_actions(conn, task_id, &cancel_tasks).await?;
                             db_operation::complete_webhook_execution(conn, &key, true).await?;
                         }
                         Ok(ran)
@@ -387,26 +400,24 @@ async fn execute_webhook_for_task(
                         / 1000.0;
                     metrics::record_task_wait(&task.kind, wait_secs);
                     log::debug!("Start worker: task {} started", task.id);
-
-                    // Save cancel actions returned by the webhook (outside the tx — see
-                    // above; its failure must not roll back the running transition).
-                    if let Err(e) =
-                        db_operation::save_cancel_actions(&mut conn, &task, &cancel_tasks).await
-                    {
-                        log::error!(
-                            "Start worker: failed to save cancel actions for task {}: {:?}",
-                            task.id,
-                            e
-                        );
-                    }
                 }
                 Ok(false) => {
+                    // Task left `Claimed` during the on_start webhook (canceled, stopped,
+                    // failed, or paused by a concurrent request). The cancel actions were
+                    // still persisted inside the tx above (A4), atomically with the
+                    // start-row completion, so a cancel notification already enqueued by
+                    // the concurrent transition will be delivered WITH them.
                     log::warn!(
                         "Start worker: task {} no longer claimed; skipping running transition",
                         task.id
                     );
                 }
                 Err(e) => {
+                    // Genuine DB error: the tx rolled back, so the running transition, the
+                    // start-row completion AND the cancel-action save were all undone.
+                    // The task stays `Claimed` with its start row `pending`; the
+                    // requeue-stale path re-picks it, and the start-row freshness bound
+                    // (A2) keeps the gate from blocking end/cancel forever.
                     log::error!(
                         "Start worker: failed to commit running transition / start-row \
                          completion for task {}: {:?}",
@@ -496,6 +507,42 @@ async fn start_task<'a>(
             idempotency_key: key,
             claimed: false,
         });
+    }
+
+    // A4: the task may have left `Claimed` while waiting for a webhook permit — a
+    // cancel enqueued in that window was NOT gated (the start row above did not exist
+    // yet) and may already have been delivered as a zero-action fast-path. Firing
+    // on_start now would hand the consumer zombie work whose cancel is already
+    // consumed. Re-check the status now that the start row exists: if the task is no
+    // longer Claimed, skip on_start entirely and complete the start row (releases the
+    // gate; nothing was executed, so a zero-action cancel is correct). Any transition
+    // landing AFTER this check enqueues a cancel row that the gate holds (start row
+    // pending + fresh) until the completion tx commits the cancel actions.
+    {
+        use crate::models::StatusKind;
+        use crate::schema::task::dsl as task_dsl;
+        let current_status: StatusKind = task_dsl::task
+            .filter(task_dsl::id.eq(task.id))
+            .select(task_dsl::status)
+            .get_result(conn)
+            .await
+            .map_err(|e| format!("Failed to re-check task status: {}", e))?;
+        if current_status != StatusKind::Claimed {
+            log::info!(
+                "Start worker: task {} left Claimed ({:?}) before its on_start fired; \
+                 skipping on_start",
+                task.id,
+                current_status
+            );
+            db_operation::complete_webhook_execution(conn, &key, true)
+                .await
+                .map_err(|e| format!("Failed to complete skipped start row: {}", e))?;
+            return Ok(StartTaskResult {
+                cancel_tasks: vec![],
+                idempotency_key: key,
+                claimed: false,
+            });
+        }
     }
 
     let actions = Action::belonging_to(&task)

@@ -549,3 +549,522 @@ async fn test_audit2_a2_start_row_completed_atomically_with_running() {
     let _ = start_shutdown.send(());
     let _ = end_shutdown.send(());
 }
+
+// =============================================================================
+// Audit 2, A4 — Claimed + on_start in flight: no zombie work at the consumer
+// =============================================================================
+//
+// # Original bug
+// The `Claimed` state spans the ENTIRE on_start webhook-in-flight window (the
+// worker's permit queue plus up to the webhook timeout per action), not just the
+// instant before on_start. Two gaps let a consumer receive on_start, start work,
+// and then never get a cancel:
+//   1. `execute_webhook_for_task` only called `save_cancel_actions` in the
+//      `mark_task_running == true` branch. If the task left `Claimed` while on_start
+//      was in flight (a concurrent DELETE / stop_batch / requeue), the transition
+//      returned false and the cancel action the consumer returned was silently
+//      dropped — so even if a cancel was later delivered, it carried no action.
+//   2. `cancel_task` enqueued a cancel outbox row only for `Running`, and
+//      `stop_batch` treated `Claimed` as "on_start not yet called" (no cancel), and
+//      the dead-end path gated the cancel on `was_running`. So a Claimed task that
+//      had received on_start was never sent a cancel at all.
+//
+// # Fix
+//   * `save_cancel_actions` now runs INSIDE the running-transition/start-row-
+//     completion transaction, unconditionally when on_start actually executed
+//     (`claimed == true`) — regardless of whether `mark_task_running` transitioned
+//     the row. Committing the actions atomically with the start-row completion also
+//     closes the race with the delivery loop's start-before-end gate: the cancel row
+//     (enqueued by the concurrent transition) is held while the start row is pending,
+//     and by the time the gate releases (start row completed in this tx) the cancel
+//     actions are already committed. Validation is best-effort (invalid actions are
+//     skipped, never rolling back the transition — the 4.2 decision).
+//   * `cancel_task`, `stop_batch`, and the dead-end path now enqueue a cancel outbox
+//     row for `Claimed` as well as `Running`. A Claimed task that never returned a
+//     cancel action prefetches zero cancel actions ⇒ fast-path success (no HTTP), so
+//     the broadened enqueue is innocuous.
+
+/// Count `cancel`-trigger action rows registered for a task.
+async fn cancel_action_count(pool: &arcrun::DbPool, task_id: uuid::Uuid) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        c: i64,
+    }
+    let mut conn = pool.get().await.unwrap();
+    let r: Cnt = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query(
+            "SELECT count(*) AS c FROM action WHERE task_id = $1 AND trigger = 'cancel'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    r.c
+}
+
+/// Count `cancel`-trigger outbox rows for a task with the given status.
+async fn cancel_outbox_count(pool: &arcrun::DbPool, task_id: uuid::Uuid, status: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        c: i64,
+    }
+    let mut conn = pool.get().await.unwrap();
+    let r: Cnt = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query(
+            "SELECT count(*) AS c FROM webhook_execution \
+             WHERE task_id = $1 AND trigger = 'cancel' \
+               AND status = $2::webhook_execution_status",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(status),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    r.c
+}
+
+/// Spawn a mock on_start server that responds — after `delay` — with a `NewActionDto`
+/// (a cancel action pointing at `cancel_url`). The delay keeps the task `Claimed`
+/// (on_start in flight) long enough for a concurrent cancel to fire.
+fn spawn_slow_server_returning_cancel_action(
+    cancel_url: &str,
+    delay: Duration,
+) -> (String, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let cancel_url = cancel_url.to_string();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    if let Ok((mut stream, _)) = result {
+                        let cancel_url = cancel_url.clone();
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let _ = stream.read(&mut buf).await;
+                            // Hold the response so the task stays Claimed (in flight).
+                            tokio::time::sleep(delay).await;
+                            let body = serde_json::json!({
+                                "kind": "Webhook",
+                                "params": {"url": cancel_url, "verb": "Post"}
+                            });
+                            let body_str = serde_json::to_string(&body).unwrap();
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                body_str.len(),
+                                body_str
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+                _ = &mut shutdown_rx => break,
+            }
+        }
+    });
+
+    (format!("http://{}/start", addr), shutdown_tx)
+}
+
+/// A4 core test — cancelling a task WHILE its on_start is in flight must NOT drop the
+/// cancel action the consumer returned, and the consumer must still receive the cancel.
+///
+/// The task is claimed and its (slow) on_start webhook begins; while it is in flight a
+/// DELETE cancels the task (it leaves `Claimed`), so when on_start returns
+/// `mark_task_running` == false. The A4 fix persists the returned cancel action inside
+/// the same tx anyway, and the cancel outbox row (enqueued by the DELETE, now allowed
+/// for `Claimed`) is delivered WITH that action after draining. With the fix reverted,
+/// the action is dropped (and/or no cancel row is enqueued) → 0 deliveries.
+#[tokio::test]
+async fn test_audit2_a4_cancel_action_saved_when_task_left_claimed_during_on_start() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // Cancel webhook target — counts deliveries to the consumer.
+    let cancel_hits = Arc::new(AtomicUsize::new(0));
+    let (cancel_url, cancel_shutdown) = spawn_webhook_server(cancel_hits.clone());
+
+    // Slow on_start that returns a cancel action once it finally responds.
+    let (start_url, start_shutdown) =
+        spawn_slow_server_returning_cancel_action(&cancel_url, Duration::from_millis(1500));
+
+    let payload = json!({
+        "id": "a4-inflight",
+        "name": "A4 In-flight Cancel",
+        "kind": "a4-test",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": {"kind": "Webhook", "params": {"url": start_url, "verb": "Post"}}
+    });
+    let created = create_tasks_ok(&app, &[payload]).await;
+    let task_id = created[0].id;
+
+    // Drive the real start_loop.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let evaluator = state.action_executor.clone();
+    let pool = state.pool.clone();
+    let handle = tokio::spawn(async move {
+        arcrun::workers::start_loop(
+            &evaluator,
+            pool,
+            Duration::from_millis(50),
+            true,
+            50,
+            10,
+            shutdown_rx,
+        )
+        .await;
+    });
+
+    // Wait for start_loop to claim the task and begin the slow on_start webhook.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_task_status(
+        &app,
+        task_id,
+        StatusKind::Claimed,
+        "task should be Claimed with on_start in flight",
+    )
+    .await;
+
+    // Cancel it WHILE on_start is in flight — the task leaves Claimed for Canceled and
+    // (A4) a cancel outbox row is enqueued.
+    let cancel_req = actix_web::test::TestRequest::delete()
+        .uri(&format!("/task/{}", task_id))
+        .to_request();
+    let cancel_resp = actix_web::test::call_service(&app, cancel_req).await;
+    assert!(cancel_resp.status().is_success(), "cancel should succeed");
+    assert_task_status(
+        &app,
+        task_id,
+        StatusKind::Canceled,
+        "task should be Canceled",
+    )
+    .await;
+
+    // Let the slow on_start finish; the start_loop tx then runs mark_task_running
+    // (== false) but STILL saves the cancel action + completes the start row (A4).
+    // Shutting down waits for the in-flight webhook + its tx to complete.
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+
+    assert_eq!(
+        cancel_action_count(&state.pool, task_id).await,
+        1,
+        "cancel action returned by on_start must be saved even though mark_task_running == false"
+    );
+
+    // Deliver the outbox: the cancel row was held by the start-before-end gate until
+    // the start row completed (same tx as the save), so it now delivers WITH the action.
+    drain_outbox(&state).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        cancel_hits.load(Ordering::SeqCst),
+        1,
+        "the consumer must receive the cancel webhook exactly once (no zombie work)"
+    );
+
+    let _ = cancel_shutdown.send(());
+    let _ = start_shutdown.send(());
+}
+
+/// A4 — cancelling a `Claimed` task (via DELETE /task) must enqueue a cancel outbox
+/// row. Before the fix, `cancel_task` only enqueued for `Running`.
+#[tokio::test]
+async fn test_audit2_a4_cancel_task_on_claimed_enqueues_cancel_outbox() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let payload = json!({
+        "id": "a4-claimed",
+        "name": "A4 Claimed Cancel",
+        "kind": "a4-test",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": webhook_action()
+    });
+    let created = create_tasks_ok(&app, &[payload]).await;
+    let task_id = created[0].id;
+
+    // Drive the task to Claimed directly — the window the audit flags.
+    {
+        let mut conn = state.pool.get().await.unwrap();
+        let claimed = arcrun::db_operation::claim_task(&mut conn, &task_id)
+            .await
+            .unwrap();
+        assert!(claimed, "task should be claimed");
+    }
+    assert_task_status(&app, task_id, StatusKind::Claimed, "task should be Claimed").await;
+
+    let cancel_req = actix_web::test::TestRequest::delete()
+        .uri(&format!("/task/{}", task_id))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, cancel_req).await;
+    assert!(resp.status().is_success(), "cancel should succeed");
+    assert_task_status(
+        &app,
+        task_id,
+        StatusKind::Canceled,
+        "task should be Canceled",
+    )
+    .await;
+
+    assert_eq!(
+        cancel_outbox_count(&state.pool, task_id, "pending").await,
+        1,
+        "canceling a Claimed task must enqueue a pending cancel outbox row"
+    );
+}
+
+/// A4 — stopping a batch that contains a `Claimed` task must enqueue a cancel outbox
+/// row for that task. Before the fix, `stop_batch` treated Claimed as "on_start not
+/// yet called" and enqueued nothing.
+#[tokio::test]
+async fn test_audit2_a4_stop_batch_on_claimed_enqueues_cancel_outbox() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let payload = json!({
+        "id": "a4-batch-claimed",
+        "name": "A4 Batch Claimed",
+        "kind": "a4-test",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": webhook_action()
+    });
+    let created = create_tasks_ok(&app, &[payload]).await;
+    let task_id = created[0].id;
+    let batch_id = created[0].batch_id.expect("task should have a batch_id");
+
+    {
+        let mut conn = state.pool.get().await.unwrap();
+        assert!(
+            arcrun::db_operation::claim_task(&mut conn, &task_id)
+                .await
+                .unwrap(),
+            "task should be claimed"
+        );
+    }
+    assert_task_status(&app, task_id, StatusKind::Claimed, "task should be Claimed").await;
+
+    let req = actix_web::test::TestRequest::delete()
+        .uri(&format!("/batch/{}", batch_id))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert!(resp.status().is_success(), "stop_batch should succeed");
+    assert_task_status(
+        &app,
+        task_id,
+        StatusKind::Canceled,
+        "task should be Canceled",
+    )
+    .await;
+
+    assert_eq!(
+        cancel_outbox_count(&state.pool, task_id, "pending").await,
+        1,
+        "stopping a batch with a Claimed task must enqueue a pending cancel outbox row"
+    );
+}
+
+/// A4 innocuousness — a `Claimed` task that never started (no cancel action ever
+/// registered) canceled and drained: the cancel row exists but delivers via the
+/// zero-action fast-path (marked success) with ZERO HTTP hits.
+#[tokio::test]
+async fn test_audit2_a4_claimed_cancel_without_action_delivers_no_http() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // A server we assert is never hit.
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (_url, shutdown) = spawn_webhook_server(hits.clone());
+
+    let payload = json!({
+        "id": "a4-noop",
+        "name": "A4 No-op Cancel",
+        "kind": "a4-test",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": webhook_action()
+    });
+    let created = create_tasks_ok(&app, &[payload]).await;
+    let task_id = created[0].id;
+
+    {
+        let mut conn = state.pool.get().await.unwrap();
+        assert!(
+            arcrun::db_operation::claim_task(&mut conn, &task_id)
+                .await
+                .unwrap(),
+            "task should be claimed"
+        );
+    }
+
+    let req = actix_web::test::TestRequest::delete()
+        .uri(&format!("/task/{}", task_id))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert!(resp.status().is_success(), "cancel should succeed");
+    assert_task_status(
+        &app,
+        task_id,
+        StatusKind::Canceled,
+        "task should be Canceled",
+    )
+    .await;
+
+    assert_eq!(
+        cancel_outbox_count(&state.pool, task_id, "pending").await,
+        1,
+        "cancel outbox row enqueued for the Claimed task"
+    );
+
+    drain_outbox(&state).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no cancel action registered -> zero HTTP deliveries (innocuous)"
+    );
+    assert_eq!(
+        cancel_outbox_count(&state.pool, task_id, "success").await,
+        1,
+        "the zero-action cancel row must be marked success via the fast-path"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// A4 permit-wait window — a task canceled while queued for a webhook permit (claimed,
+/// but its `start` outbox row not yet created) must NOT receive on_start at all.
+///
+/// In that window the cancel outbox row is not held by the start-before-end gate
+/// (there is no start row yet), so it can be drained as a zero-action fast-path
+/// BEFORE on_start fires. If on_start then fires anyway, the consumer starts zombie
+/// work whose cancel has already been consumed — unfixable after the fact. The fix
+/// re-checks the task's status in `start_task` right after creating the start row
+/// (post-permit): no longer `Claimed` ⇒ skip on_start and complete the start row
+/// (nothing executed, so the zero-action cancel was correct). Any transition landing
+/// after that check is gated normally (start row pending + fresh) until the
+/// completion tx commits the cancel actions.
+///
+/// Deterministic setup: `webhook_concurrency = 1`; T1's slow on_start (2 s) holds the
+/// only permit while T2 — claimed in the same iteration — waits. T2 is canceled and
+/// the outbox drained during that wait. With the fix, T2's on_start never fires and
+/// its start row ends `success`; with the fix reverted, T2's mock receives on_start.
+#[tokio::test]
+async fn test_audit2_a4_cancel_during_permit_wait_skips_on_start() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // T1's slow on_start: holds the single permit for 2 s.
+    let t1_cancel_hits = Arc::new(AtomicUsize::new(0));
+    let (t1_cancel_url, t1_cancel_shutdown) = spawn_webhook_server(t1_cancel_hits.clone());
+    let (t1_start_url, t1_start_shutdown) =
+        spawn_slow_server_returning_cancel_action(&t1_cancel_url, Duration::from_millis(2000));
+
+    // T2's on_start: must NEVER be hit.
+    let t2_start_hits = Arc::new(AtomicUsize::new(0));
+    let (t2_start_url, t2_start_shutdown) = spawn_webhook_server(t2_start_hits.clone());
+
+    // Higher priority on T1 so it is claimed/processed first and takes the permit.
+    let t1 = json!({
+        "id": "a4-permit-t1",
+        "name": "A4 Permit Holder",
+        "kind": "a4-test",
+        "timeout": 60,
+        "priority": 10,
+        "metadata": {"test": true},
+        "on_start": {"kind": "Webhook", "params": {"url": t1_start_url, "verb": "Post"}}
+    });
+    let t2 = json!({
+        "id": "a4-permit-t2",
+        "name": "A4 Permit Waiter",
+        "kind": "a4-test",
+        "timeout": 60,
+        "priority": 0,
+        "metadata": {"test": true},
+        "on_start": {"kind": "Webhook", "params": {"url": t2_start_url, "verb": "Post"}}
+    });
+    let created = create_tasks_ok(&app, &[t1, t2]).await;
+    let t2_id = created[1].id;
+
+    // Drive the real start_loop with webhook_concurrency = 1.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let evaluator = state.action_executor.clone();
+    let pool = state.pool.clone();
+    let handle = tokio::spawn(async move {
+        arcrun::workers::start_loop(
+            &evaluator,
+            pool,
+            Duration::from_millis(50),
+            true,
+            50,
+            1,
+            shutdown_rx,
+        )
+        .await;
+    });
+
+    // Both tasks are claimed in the first iteration; T1's webhook is in flight, T2 is
+    // Claimed, queued for the permit, with NO start row yet.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_task_status(
+        &app,
+        t2_id,
+        StatusKind::Claimed,
+        "T2 should be Claimed, waiting for the permit",
+    )
+    .await;
+    assert_eq!(
+        start_row_status(&state.pool, t2_id).await,
+        None,
+        "T2's start row must not exist yet (permit-wait window)"
+    );
+
+    // Cancel T2 during the permit wait and drain: the cancel row is not gated (no
+    // start row) and is consumed as a zero-action fast-path — as in production.
+    let req = actix_web::test::TestRequest::delete()
+        .uri(&format!("/task/{}", t2_id))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert!(resp.status().is_success(), "cancel should succeed");
+    drain_outbox(&state).await;
+    assert_eq!(
+        cancel_outbox_count(&state.pool, t2_id, "success").await,
+        1,
+        "T2's cancel row was drained (zero-action) during the permit wait"
+    );
+
+    // Let T1's slow webhook finish; the loop then processes T2 with the permit.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+
+    assert_eq!(
+        t2_start_hits.load(Ordering::SeqCst),
+        0,
+        "T2's on_start must NOT fire for a task that left Claimed during the permit wait"
+    );
+    assert_eq!(
+        start_row_status(&state.pool, t2_id).await.as_deref(),
+        Some("success"),
+        "T2's start row must be completed by the skip path (gate released)"
+    );
+    assert_task_status(&app, t2_id, StatusKind::Canceled, "T2 stays Canceled").await;
+
+    let _ = t1_cancel_shutdown.send(());
+    let _ = t1_start_shutdown.send(());
+    let _ = t2_start_shutdown.send(());
+}
