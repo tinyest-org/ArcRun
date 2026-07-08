@@ -6,7 +6,7 @@ mod task_query;
 mod webhook_execution;
 
 use crate::Conn;
-use diesel_async::RunQueryDsl;
+use diesel_async::AsyncConnection;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -52,23 +52,34 @@ pub use webhook_execution::{complete_webhook_execution, try_claim_webhook_execut
 /// Execute a closure within a database transaction.
 /// Automatically rolls back on error. Commits on success.
 /// Callers must wrap their async block with `Box::pin(async move { ... })`.
+///
+/// # Cancel-safety (Audit 2, A1)
+///
+/// This delegates to diesel-async's [`AsyncConnection::transaction`], which
+/// drives the connection's `AnsiTransactionManager`, instead of emitting raw
+/// `BEGIN` / `COMMIT` / `ROLLBACK` via `sql_query`. That distinction is what
+/// makes the transaction safe against cancellation: if the surrounding future
+/// is dropped mid-transaction (client disconnect, actix request timeout, a
+/// `tokio::time::timeout`), the transaction manager records that the connection
+/// is left inside an open transaction. bb8 inspects that manager state in
+/// `is_broken` and discards the connection on return to the pool, instead of
+/// handing it to the next borrower with a live transaction still holding row
+/// locks (e.g. the batch `FOR UPDATE`). With the previous raw-SQL version the
+/// manager was never updated, so a leaked open transaction could silently wrap
+/// the next borrower's "autocommit" statements and a later `COMMIT` could make
+/// a half-propagated transition durable.
+///
+/// Observable behavior for callers is unchanged: commit on `Ok`, rollback on
+/// `Err`, and the same error is propagated. `DbError` implements
+/// `From<diesel::result::Error>`, which `transaction` requires to surface
+/// manager-level failures.
 pub async fn run_in_transaction<'a, T: Send>(
     conn: &mut Conn<'a>,
     f: impl for<'c> FnOnce(
         &'c mut Conn<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<T, DbError>> + Send + 'c>>,
+    ) -> Pin<Box<dyn Future<Output = Result<T, DbError>> + Send + 'c>>
+    + Send,
 ) -> Result<T, DbError> {
-    diesel::sql_query("BEGIN").execute(&mut *conn).await?;
-    match f(conn).await {
-        Ok(val) => {
-            diesel::sql_query("COMMIT").execute(&mut *conn).await?;
-            Ok(val)
-        }
-        Err(e) => {
-            if let Err(rb_err) = diesel::sql_query("ROLLBACK").execute(&mut *conn).await {
-                log::error!("Failed to rollback transaction: {}", rb_err);
-            }
-            Err(e)
-        }
-    }
+    conn.transaction(async move |c: &mut Conn<'a>| f(c).await)
+        .await
 }

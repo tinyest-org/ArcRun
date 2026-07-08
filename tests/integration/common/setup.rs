@@ -86,6 +86,10 @@ unsafe impl Sync for SharedPg {}
 /// No longer owns the container — the shared LazyLock keeps it alive.
 pub struct TestApp {
     pub pool: DbPool,
+    /// Connection URL of this test's isolated database. Useful for opening an
+    /// independent observer connection/pool (e.g. `test_bug_audit3` needs to
+    /// confirm a write is durably committed from *outside* the pool under test).
+    pub url: String,
 }
 
 /// Setup a test database and return the pool.
@@ -93,6 +97,16 @@ pub struct TestApp {
 /// Each test gets its own database created instantly via
 /// `CREATE DATABASE ... TEMPLATE test_template`, skipping per-test migrations.
 pub async fn setup_test_db() -> TestApp {
+    setup_test_db_with_pool_size(5).await
+}
+
+/// Like [`setup_test_db`] but with a caller-chosen pool `max_size`.
+///
+/// A pool of size 1 is useful for cancel-safety / connection-reuse tests
+/// (e.g. `test_bug_audit3`): the single physical connection is guaranteed to be
+/// handed back to the next borrower, so a leaked open transaction (if any)
+/// would deterministically corrupt the following statements.
+pub async fn setup_test_db_with_pool_size(max_size: u32) -> TestApp {
     let shared = &*SHARED_PG;
 
     // Generate a unique database name
@@ -116,12 +130,15 @@ pub async fn setup_test_db() -> TestApp {
     // Create async pool for this test's isolated database
     let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&test_url);
     let pool = Pool::builder()
-        .max_size(5)
+        .max_size(max_size)
         .build(config)
         .await
         .expect("Failed to create pool");
 
-    TestApp { pool }
+    TestApp {
+        pool,
+        url: test_url,
+    }
 }
 
 /// Convert ALTER TYPE ... ADD VALUE to use IF NOT EXISTS for idempotency

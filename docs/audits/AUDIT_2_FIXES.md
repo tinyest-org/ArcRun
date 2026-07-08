@@ -70,7 +70,7 @@ Statuts : `À faire` / `En cours` / `Fait (commit)` / `Écarté (raison)`.
 
 | Item | Audit | Description | Fichiers principaux | Statut | Notes relecture |
 |---|---|---|---|---|---|
-| 4.1 | A1 | `run_in_transaction` → `conn.transaction()` diesel-async (cancellation-safe) | `src/db/mod.rs` | À faire | |
+| 4.1 | A1 | `run_in_transaction` → `conn.transaction()` diesel-async (cancellation-safe) | `src/db/mod.rs` | Fait | Relu : délégation à `AsyncConnection::transaction` (manager → `is_broken` bb8), signature quasi inchangée (`+ Send`), zéro changement aux 8 call-sites, pas d'imbrication. 3 régressions `test_audit2_a1_*` vertes ; test d'annulation **rouge avec fix reverti** (observer voit `[]`). Helpers ajoutés : `setup_test_db_with_pool_size`, `TestApp.url`. |
 | 4.2 | A2 | Ligne outbox `start` complétée dans la même tx que `mark_task_running` + gate start-before-end borné par fraîcheur | `src/workers/start_loop.rs`, `src/db/webhook_execution.rs`, `src/db/task_crud.rs` | À faire | |
 | 4.3 | A4 | Fenêtre Claimed : sauver les cancel actions même si `mark_task_running` = false ; enqueuer le cancel outbox pour les Claimed (cancel_task + stop_batch) | `src/workers/start_loop.rs`, `src/workers/propagation.rs`, `src/db/task_lifecycle.rs` | À faire | |
 | 4.4 | A7 | Flush compteurs : garde `status IN ('running','claimed')` + clamp `LEAST(...)` + anti-poison (bisect/per-row + drop loggé) + drain du canal avant flush final (C6 workers) | `src/workers/batch_updater.rs` | À faire | |
@@ -111,3 +111,4 @@ Statuts : `À faire` / `En cours` / `Fait (commit)` / `Écarté (raison)`.
 ## Journal
 
 - 2026-07-08 : audit livré (`AUDIT_2_CLAUDE.md`), campagne initialisée, aucun item démarré.
+- 2026-07-08 : 4.1 (A1) fait — implémentation Opus, relecture Fable (diff, régressions vertes, contre-épreuve rouge sur revert, suite intégration complète). Incident environnement : Docker zombie (backend pid survivant), remède kill -9 + relaunch confirmé.
