@@ -61,6 +61,14 @@ pub struct DeliveryConfig {
     pub lease_secs: i64,
     /// Max concurrent HTTP deliveries within one `run_delivery_once` batch.
     pub concurrency: usize,
+    /// Freshness bound (seconds) for the start-before-end gate (Audit 2, A2). An
+    /// `end`/`cancel` row is held back only while the task's `start` row is pending
+    /// AND that start row was updated within the last `start_stale_secs`. A start row
+    /// that never completes (crash between `mark_task_running` and the start-row
+    /// completion, or a Claimed task canceled mid-webhook) eventually goes stale and
+    /// stops blocking delivery. Mirror of the `webhook_idempotency_timeout` /
+    /// `WORKER_CLAIM_TIMEOUT_SECS` staleness used by `try_claim_webhook_execution`.
+    pub start_stale_secs: i64,
 }
 
 /// Background loop: drains the webhook outbox at a fixed interval until shutdown.
@@ -123,9 +131,10 @@ pub async fn run_delivery_once<'a>(
     let claimed = db_operation::run_in_transaction(conn, |conn| {
         let batch_size = cfg.batch_size;
         let lease = cfg.lease_secs;
-        Box::pin(
-            async move { db_operation::claim_due_outbox_leased(conn, batch_size, lease).await },
-        )
+        let start_stale = cfg.start_stale_secs;
+        Box::pin(async move {
+            db_operation::claim_due_outbox_leased(conn, batch_size, lease, start_stale).await
+        })
     })
     .await?;
 

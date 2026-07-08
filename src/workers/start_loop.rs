@@ -323,8 +323,8 @@ async fn webhook_phase(
 
 /// Execute the full webhook lifecycle for a single claimed task:
 /// 1. start_task (on_start webhooks)
-/// 2. mark_task_running
-/// 3. save_cancel_actions
+/// 2. mark_task_running + start-row completion (one transaction — A2 fix)
+/// 3. save_cancel_actions (outside the tx)
 /// On failure: fail_task_and_propagate
 ///
 /// Returns true if the task was successfully started.
@@ -350,7 +350,34 @@ async fn execute_webhook_for_task(
                 claimed,
             } = start_result;
 
-            match db_operation::mark_task_running(&mut conn, &task.id).await {
+            // A2 fix: transition Claimed -> Running AND complete the `start` outbox row
+            // in ONE transaction. Previously these were two separate autocommit
+            // statements; a crash (or a swallowed UPDATE error) between them left the
+            // task Running with its `start` row stuck `pending` forever, which the
+            // delivery loop's start-before-end gate then read as "hold end/cancel
+            // forever". Committing them together closes that window on the nominal
+            // path. The start row is completed whenever the on_start webhook was
+            // actually executed (`claimed == true`), even if the running transition
+            // itself is a no-op (task no longer Claimed) — so the row never lingers.
+            //
+            // `save_cancel_actions` deliberately stays OUTSIDE this tx (below), so a
+            // validation failure on a webhook-supplied cancel action is logged and
+            // swallowed as before, without rolling back the running transition.
+            let task_id = task.id;
+            let tx_result: Result<bool, _> =
+                db_operation::run_in_transaction(&mut conn, move |conn| {
+                    let key = idempotency_key;
+                    Box::pin(async move {
+                        let ran = db_operation::mark_task_running(conn, &task_id).await?;
+                        if claimed {
+                            db_operation::complete_webhook_execution(conn, &key, true).await?;
+                        }
+                        Ok(ran)
+                    })
+                })
+                .await;
+
+            match tx_result {
                 Ok(true) => {
                     metrics::record_status_transition("Claimed", "Running");
                     // Scheduler latency: time from task creation to actually running.
@@ -361,7 +388,8 @@ async fn execute_webhook_for_task(
                     metrics::record_task_wait(&task.kind, wait_secs);
                     log::debug!("Start worker: task {} started", task.id);
 
-                    // Save cancel actions returned by the webhook
+                    // Save cancel actions returned by the webhook (outside the tx — see
+                    // above; its failure must not roll back the running transition).
                     if let Err(e) =
                         db_operation::save_cancel_actions(&mut conn, &task, &cancel_tasks).await
                     {
@@ -380,21 +408,9 @@ async fn execute_webhook_for_task(
                 }
                 Err(e) => {
                     log::error!(
-                        "Start worker: failed to mark task {} as running: {:?}",
+                        "Start worker: failed to commit running transition / start-row \
+                         completion for task {}: {:?}",
                         task.id,
-                        e
-                    );
-                }
-            }
-
-            if claimed {
-                if let Err(e) =
-                    db_operation::complete_webhook_execution(&mut conn, &idempotency_key, true)
-                        .await
-                {
-                    log::error!(
-                        "Failed to complete webhook execution record for key {}: {}",
-                        idempotency_key,
                         e
                     );
                 }

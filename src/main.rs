@@ -279,6 +279,9 @@ fn spawn_workers(
             backoff_cap_secs: config.worker.webhook_retry_backoff_cap_secs,
             lease_secs: config.worker.webhook_delivery_lease_secs,
             concurrency: config.worker.webhook_delivery_concurrency,
+            // A2: the start-before-end gate relaxes once a pending `start` row is
+            // older than the claim timeout (mirror of webhook_idempotency_timeout).
+            start_stale_secs: config.worker.claim_timeout.as_secs() as i64,
         };
         let shutdown = shutdown_rx.clone();
         actix_web::rt::spawn(async move {

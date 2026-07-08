@@ -24,6 +24,7 @@ fn lease_cfg() -> DeliveryConfig {
         backoff_cap_secs: 1,
         lease_secs: 120,
         concurrency: 10,
+        start_stale_secs: 30,
     }
 }
 
@@ -110,7 +111,7 @@ async fn test_lease_prevents_double_claim() {
 
     // First claim leases the row.
     let mut conn1 = state.pool.get().await.unwrap();
-    let claimed1 = arcrun::db_operation::claim_due_outbox_leased(&mut conn1, 100, 120)
+    let claimed1 = arcrun::db_operation::claim_due_outbox_leased(&mut conn1, 100, 120, 30)
         .await
         .unwrap();
     assert_eq!(
@@ -122,7 +123,7 @@ async fn test_lease_prevents_double_claim() {
 
     // Second claim on a fresh connection sees nothing (lease pushed maturity out).
     let mut conn2 = state.pool.get().await.unwrap();
-    let claimed2 = arcrun::db_operation::claim_due_outbox_leased(&mut conn2, 100, 120)
+    let claimed2 = arcrun::db_operation::claim_due_outbox_leased(&mut conn2, 100, 120, 30)
         .await
         .unwrap();
     assert_eq!(
@@ -152,7 +153,7 @@ async fn test_lease_expires_and_redelivers() {
     // Claim (lease) the row but do NOT deliver or mark it — this simulates a crash
     // mid-delivery: the row stays pending, leased into the future.
     let mut conn = state.pool.get().await.unwrap();
-    let claimed = arcrun::db_operation::claim_due_outbox_leased(&mut conn, 100, 120)
+    let claimed = arcrun::db_operation::claim_due_outbox_leased(&mut conn, 100, 120, 30)
         .await
         .unwrap();
     assert_eq!(claimed.len(), 1);

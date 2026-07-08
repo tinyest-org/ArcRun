@@ -362,15 +362,28 @@ pub async fn outbox_backlog_stats<'a>(conn: &mut Conn<'a>) -> Result<OutboxBackl
 /// Maturity: `next_attempt_at <= now()`.
 ///
 /// Per-task ordering guarantee (start-before-end): an `end`/`cancel` row is only
-/// returned if there is NO `start` row for the same task still in `pending` state.
-/// `start` rows are delivered synchronously by the start_loop, but a start row can
-/// linger as `pending` while the on_start webhook is in flight or has failed — in
+/// returned if there is NO **fresh** `start` row for the same task still in `pending`
+/// state. `start` rows are delivered synchronously by the start_loop, but a start row
+/// can linger as `pending` while the on_start webhook is in flight or has failed — in
 /// that window we must not deliver the task's end/cancel notification.
+///
+/// Freshness bound (Audit 2, A2): the gate only holds while the start row's
+/// `updated_at > now() - start_stale_secs`. A start row that is never completed
+/// (crash between `mark_task_running` and its completion, or a Claimed task canceled
+/// mid-webhook) would otherwise block the task's end/cancel delivery **forever**. The
+/// bound is a deliberate relaxation: once the start row goes stale, end/cancel are
+/// delivered anyway (better than an eternal block; start-before-end still holds for
+/// healthy starts). Mirror of the `try_claim_webhook_execution` staleness.
+///
+/// NOTE: this non-leased variant is currently unused (the delivery loop uses
+/// [`claim_due_outbox_leased`]); the freshness bound is mirrored here to keep the two
+/// gates from diverging.
 ///
 /// Rows are returned oldest-first (`created_at ASC`) for fair, FIFO-ish delivery.
 pub async fn claim_due_outbox<'a>(
     conn: &mut Conn<'a>,
     limit: i64,
+    start_stale_secs: i64,
 ) -> Result<Vec<WebhookExecution>, DbError> {
     // Includes batch_complete rows (Lot 3b). The start-before-end gate below only
     // affects task-level rows: a batch_complete row has NULL task_id, so the
@@ -387,12 +400,14 @@ pub async fn claim_due_outbox<'a>(
                  WHERE s.task_id = we.task_id
                    AND s.trigger = 'start'
                    AND s.status = 'pending'
+                   AND s.updated_at > now() - ($2::bigint * interval '1 second')
            )
          ORDER BY we.created_at ASC
          LIMIT $1
          FOR UPDATE OF we SKIP LOCKED",
     )
     .bind::<diesel::sql_types::BigInt, _>(limit)
+    .bind::<diesel::sql_types::BigInt, _>(start_stale_secs)
     .load::<WebhookExecution>(conn)
     .await?;
 
@@ -412,14 +427,25 @@ pub async fn claim_due_outbox<'a>(
 ///
 /// Same selection predicates as [`claim_due_outbox`]: `status = 'pending'`, triggers
 /// in `('end','cancel','batch_complete')`, `next_attempt_at <= now()`, the per-task
-/// start-before-end gate, `ORDER BY created_at ASC`, `LIMIT`, `FOR UPDATE SKIP LOCKED`.
+/// start-before-end gate (bounded by `start_stale_secs` freshness — see below),
+/// `ORDER BY created_at ASC`, `LIMIT`, `FOR UPDATE SKIP LOCKED`.
 ///
 /// `lease_secs` must be >= 1 and should exceed the worst-case delivery time of a single
 /// row (otherwise a slow delivery could be double-claimed while still in flight).
+///
+/// `start_stale_secs` (Audit 2, A2) bounds the start-before-end gate by freshness: an
+/// `end`/`cancel` row is held back only while the task's `start` row is pending AND
+/// that start row's `updated_at > now() - start_stale_secs`. A start row that never
+/// completes (crash between `mark_task_running` and the start-row completion, or a
+/// Claimed task canceled/stopped mid-webhook) would otherwise block the task's
+/// end/cancel delivery forever; once it goes stale the end/cancel delivers anyway.
+/// This is a deliberate relaxation — start-before-end is still guaranteed for healthy
+/// (fresh) starts. Mirror of the `try_claim_webhook_execution` staleness.
 pub async fn claim_due_outbox_leased<'a>(
     conn: &mut Conn<'a>,
     limit: i64,
     lease_secs: i64,
+    start_stale_secs: i64,
 ) -> Result<Vec<WebhookExecution>, DbError> {
     let rows = diesel::sql_query(
         "UPDATE webhook_execution we
@@ -434,6 +460,7 @@ pub async fn claim_due_outbox_leased<'a>(
                      WHERE s.task_id = c.task_id
                        AND s.trigger = 'start'
                        AND s.status = 'pending'
+                       AND s.updated_at > now() - ($3::bigint * interval '1 second')
                )
              ORDER BY c.created_at ASC
              LIMIT $1
@@ -444,6 +471,7 @@ pub async fn claim_due_outbox_leased<'a>(
     )
     .bind::<diesel::sql_types::BigInt, _>(limit)
     .bind::<diesel::sql_types::BigInt, _>(lease_secs)
+    .bind::<diesel::sql_types::BigInt, _>(start_stale_secs)
     .load::<WebhookExecution>(conn)
     .await?;
 

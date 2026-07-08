@@ -156,6 +156,7 @@ pub fn default_delivery_cfg() -> arcrun::workers::DeliveryConfig {
         backoff_cap_secs: 300,
         lease_secs: 120,
         concurrency: 10,
+        start_stale_secs: 30,
     }
 }
 

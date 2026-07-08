@@ -602,6 +602,7 @@ async fn test_batch_complete_retry_and_exhausted() {
         backoff_cap_secs: 1,
         lease_secs: 120,
         concurrency: 10,
+        start_stale_secs: 30,
     };
     drain_outbox_with(&state, cfg, 1).await; // attempt 1 -> fail, retry scheduled
     assert_eq!(
