@@ -367,11 +367,16 @@ pub async fn cancel_task(
     patch,
     path = "/task/pause/{task_id}",
     summary = "Pause a task",
-    description = "Set a task's status to `Paused`. The worker loop will skip paused tasks. This does NOT propagate to children. To resume a paused task, update its status back to `Pending` via PATCH.",
+    description = "Set a task's status to `Paused`. Only tasks that have NOT started executing can be paused: a task in `Pending` or `Waiting` status. Pausing is atomic.
+
+A `Paused` task is NOT scheduled by the worker loop, but it is NOT shielded from its dependencies: when a required parent fails (or is canceled) the paused task is still cascade-failed, and its dependency counters are still decremented as parents complete. A paused task whose counters reach 0 stays `Paused` — it does NOT auto-transition to `Pending`.
+
+To resume, call `PATCH /task/resume/{task_id}` (it returns the task to `Waiting` if dependencies are still outstanding, otherwise to `Pending`). A `Running`/`Claimed` task cannot be paused (cancel it via `DELETE /task/{id}` instead); terminal tasks cannot be paused. A `Paused` task can still be canceled.",
     params(("task_id" = Uuid, Path, description = "The UUID of the task to pause")),
     responses(
         (status = 200, description = "Task paused"),
-        (status = 400, description = "Task could not be paused (already finished or invalid state)"),
+        (status = 400, description = "Task could not be paused (not in Pending/Waiting state)"),
+        (status = 404, description = "Task not found"),
     ),
     tag = "tasks"
 )]
@@ -382,8 +387,36 @@ pub async fn pause_task(
 ) -> actix_web::Result<HttpResponse> {
     let mut conn = state.conn().await?;
 
-    match db_operation::pause_task(&task_id, &mut conn).await {
-        Ok(_) => Ok(HttpResponse::Ok().finish()),
-        Err(_) => Ok(HttpResponse::BadRequest().finish()),
-    }
+    db_operation::pause_task(&task_id, &mut conn)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(HttpResponse::Ok().finish())
+}
+
+#[utoipa::path(
+    patch,
+    path = "/task/resume/{task_id}",
+    summary = "Resume a paused task",
+    description = "Resume a `Paused` task, returning it to the schedulable flow. The target state is derived atomically from the task's outstanding dependency counters: if any dependency is still unmet the task returns to `Waiting`, otherwise straight to `Pending` (where the worker loop can pick it up).
+
+Only a `Paused` task can be resumed; any other state returns 400 (and a missing task returns 404). This is the counterpart of `PATCH /task/pause/{task_id}`.",
+    params(("task_id" = Uuid, Path, description = "The UUID of the paused task to resume")),
+    responses(
+        (status = 200, description = "Task resumed (to Waiting or Pending depending on remaining dependencies)"),
+        (status = 400, description = "Task could not be resumed (not in Paused state)"),
+        (status = 404, description = "Task not found"),
+    ),
+    tag = "tasks"
+)]
+/// Resume a paused task
+pub async fn resume_task(
+    state: web::Data<AppState>,
+    task_id: web::Path<Uuid>,
+) -> actix_web::Result<HttpResponse> {
+    let mut conn = state.conn().await?;
+
+    db_operation::resume_task(&task_id, &mut conn)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(HttpResponse::Ok().finish())
 }

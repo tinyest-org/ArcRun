@@ -229,9 +229,14 @@ async fn test_diamond_dag_mixed_results() {
     assert!(d.failure_reason.is_some());
 }
 
-/// Test PATCH /task/pause on a Running task.
+/// PATCH /task/pause on a Running task is refused (400) — contract change
+/// (audit 2, A3, décision utilisateur 2026-07-09): a Running task is already
+/// executing at the consumer, so a server-side pause would strand it (it escapes
+/// the timeout loop and the worker's terminal PATCH would 404). Cancel is the
+/// right tool for in-flight work. Previously this test asserted the opposite
+/// (pause of Running succeeded), which was part of the A3 trap state.
 #[tokio::test]
-async fn test_pause_running_task() {
+async fn test_pause_running_task_returns_400() {
     let (_g, state) = setup_test_app().await;
     let app = test_service!(state);
 
@@ -255,16 +260,17 @@ async fn test_pause_running_task() {
         .uri(&format!("/task/pause/{}", task_id))
         .to_request();
     let resp = actix_web::test::call_service(&app, pause_req).await;
-    assert!(
-        resp.status().is_success(),
-        "pausing a running task should succeed"
+    assert_eq!(
+        resp.status(),
+        actix_web::http::StatusCode::BAD_REQUEST,
+        "pausing a running task must be refused (cancel it instead)"
     );
 
     assert_task_status(
         &app,
         task_id,
-        StatusKind::Paused,
-        "running task should be paused",
+        StatusKind::Running,
+        "running task must stay Running after a refused pause",
     )
     .await;
 }

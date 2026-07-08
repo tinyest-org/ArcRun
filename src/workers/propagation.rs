@@ -15,7 +15,7 @@ use super::webhooks::{
 ///
 /// When a parent task completes:
 /// 1. If parent failed/canceled: batch-mark all requires_success children as Failure
-/// 2. Batch-decrement wait_finished for all remaining children in Waiting status
+/// 2. Batch-decrement wait_finished for all remaining children in Waiting/Paused status
 /// 3. Batch-decrement wait_success for children where parent succeeded AND requires_success
 /// 4. Batch-transition children to Pending where both counters reach 0
 ///
@@ -23,6 +23,14 @@ use super::webhooks::{
 /// so callers can fire on_failure webhooks for them after the transaction commits.
 ///
 /// This uses O(1) queries per propagation level instead of O(N) per child.
+///
+/// **Paused children (Audit 2, A3)**: a `Paused` task is NOT protected from its
+/// dependencies. The cascade-fail (step 1) and the counter decrements (steps 2-3)
+/// apply to `Paused` children exactly like `Waiting` ones — so a pause never
+/// silently strands `wait_*` counters or shields a task from a required parent's
+/// failure. The **transition to Pending (step 4) stays `Waiting`-only**: a `Paused`
+/// task whose counters reach 0 remains `Paused` (only an explicit resume moves it
+/// out of `Paused`).
 #[tracing::instrument(name = "propagate_to_children", level = "debug", skip(conn), fields(parent_id = %parent_id, status = ?result_status))]
 pub(crate) async fn propagate_to_children<'a>(
     parent_id: &uuid::Uuid,
@@ -81,7 +89,9 @@ pub(crate) async fn propagate_to_children<'a>(
             task_dsl::task.filter(
                 task_dsl::id
                     .eq_any(&fail_child_ids)
-                    .and(task_dsl::status.eq(StatusKind::Waiting)),
+                    // A3: cascade-fail reaches Paused children too — a pause does not
+                    // protect a task from a required parent's failure.
+                    .and(task_dsl::status.eq_any([StatusKind::Waiting, StatusKind::Paused])),
             ),
         )
         .set((
@@ -115,12 +125,14 @@ pub(crate) async fn propagate_to_children<'a>(
 
     // 2. Batch-decrement counters for remaining children
     if !decrement_child_ids.is_empty() {
-        // Decrement wait_finished for all remaining children
+        // Decrement wait_finished for all remaining children.
+        // A3: Paused children receive the decrements too (a pause must not strand
+        // the counters), so they resume with an accurate view of their deps.
         diesel::update(
             task_dsl::task.filter(
                 task_dsl::id
                     .eq_any(&decrement_child_ids)
-                    .and(task_dsl::status.eq(StatusKind::Waiting)),
+                    .and(task_dsl::status.eq_any([StatusKind::Waiting, StatusKind::Paused])),
             ),
         )
         .set(task_dsl::wait_finished.eq(task_dsl::wait_finished - 1))
@@ -133,7 +145,7 @@ pub(crate) async fn propagate_to_children<'a>(
                 task_dsl::task.filter(
                     task_dsl::id
                         .eq_any(&decrement_success_child_ids)
-                        .and(task_dsl::status.eq(StatusKind::Waiting)),
+                        .and(task_dsl::status.eq_any([StatusKind::Waiting, StatusKind::Paused])),
                 ),
             )
             .set(task_dsl::wait_success.eq(task_dsl::wait_success - 1))
@@ -141,7 +153,9 @@ pub(crate) async fn propagate_to_children<'a>(
             .await?;
         }
 
-        // 3. Batch-transition to Pending where both counters reach 0
+        // 3. Batch-transition to Pending where both counters reach 0.
+        // A3: this stays Waiting-only on purpose — a Paused task whose counters
+        // reach 0 stays Paused; only an explicit resume moves it out of Paused.
         let unblocked_ids: Vec<uuid::Uuid> = diesel::update(
             task_dsl::task.filter(
                 task_dsl::id

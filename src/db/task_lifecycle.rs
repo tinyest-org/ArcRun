@@ -454,29 +454,101 @@ pub(crate) async fn stop_batch<'a>(
     .await
 }
 
+/// Pause a task (A3). Only tasks that have NOT started executing may be paused:
+/// `Pending` or `Waiting`. Pausing is a single atomic guarded UPDATE
+/// (`WHERE status IN ('pending','waiting')`), so there is no check-then-act race.
+///
+/// A `Running`/`Claimed` task is already executing (its `on_start` webhook may have
+/// fired) — pausing it would strand it (it escapes the timeout loop and the worker's
+/// PATCH would 404), so we refuse and point the caller at cancel. A terminal task is
+/// immutable. All refusals surface as a 400 with an explanatory message; a missing
+/// task surfaces as a 404.
 pub(crate) async fn pause_task<'a>(
     task_id: &uuid::Uuid,
     conn: &mut Conn<'a>,
 ) -> Result<(), DbError> {
-    use crate::schema::task::dsl::{id, status, task};
+    use crate::schema::task::dsl::{id, last_updated, status, task};
     let updated = diesel::update(
         task.filter(
-            id.eq(task_id).and(
-                status
-                    .eq(StatusKind::Pending)
-                    .or(status.eq(StatusKind::Claimed))
-                    .or(status.eq(StatusKind::Running))
-                    .or(status.eq(StatusKind::Waiting)),
-            ),
+            id.eq(task_id)
+                .and(status.eq_any([StatusKind::Pending, StatusKind::Waiting])),
         ),
     )
-    .set(status.eq(StatusKind::Paused))
+    .set((
+        status.eq(StatusKind::Paused),
+        last_updated.eq(diesel::dsl::now),
+    ))
     .execute(conn)
     .await?;
     if updated == 0 {
-        return Err(crate::error::ArcRunError::InvalidState {
-            message: "Invalid operation: cannot pause task in this state".into(),
-        });
+        return Err(refuse_transition(conn, task_id, "pause", "Pending or Waiting").await);
     }
     Ok(())
+}
+
+/// Resume a paused task (A3). Only a `Paused` task may be resumed. The target state is
+/// derived atomically from the task's outstanding dependency counters in a single
+/// guarded UPDATE (no SELECT-then-UPDATE race): if any `wait_*` counter is still
+/// outstanding the task returns to `Waiting`, otherwise straight to `Pending`. This is
+/// the ONLY path that moves a task out of `Paused` back into the schedulable flow
+/// (propagation never auto-transitions a Paused task to Pending — see
+/// `propagate_to_children`).
+pub(crate) async fn resume_task<'a>(
+    task_id: &uuid::Uuid,
+    conn: &mut Conn<'a>,
+) -> Result<(), DbError> {
+    let updated = diesel::sql_query(
+        "UPDATE task \
+         SET status = CASE WHEN wait_finished > 0 OR wait_success > 0 \
+                           THEN 'waiting'::status_kind \
+                           ELSE 'pending'::status_kind END, \
+             last_updated = now() \
+         WHERE id = $1 AND status = 'paused'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(conn)
+    .await?;
+    if updated == 0 {
+        return Err(refuse_transition(conn, task_id, "resume", "Paused").await);
+    }
+    Ok(())
+}
+
+/// Build the error for a refused pause/resume: 404 if the task is gone, otherwise a
+/// 400 whose message names the current state and (for a running task being paused)
+/// suggests cancel. The guarded UPDATE already committed nothing; this best-effort
+/// SELECT only shapes the diagnostic and does not affect atomicity.
+async fn refuse_transition<'a>(
+    conn: &mut Conn<'a>,
+    task_id: &uuid::Uuid,
+    op: &str,
+    allowed: &str,
+) -> DbError {
+    use crate::schema::task::dsl::{id, status, task};
+    let current: Option<StatusKind> = match task
+        .filter(id.eq(task_id))
+        .select(status)
+        .first::<StatusKind>(conn)
+        .await
+    {
+        Ok(s) => Some(s),
+        Err(diesel::result::Error::NotFound) => None,
+        Err(e) => return DbError::from(e),
+    };
+    match current {
+        None => crate::error::ArcRunError::NotFound {
+            message: format!("Task {} not found", task_id),
+        },
+        Some(StatusKind::Running) if op == "pause" => crate::error::ArcRunError::InvalidState {
+            message: "Cannot pause a Running task (its on_start webhook may have fired); \
+                      cancel it instead (DELETE /task/{id})"
+                .into(),
+        },
+        Some(s) => crate::error::ArcRunError::InvalidState {
+            message: format!(
+                "Cannot {} task in {:?} state (only {} tasks can be {}d)",
+                op, s, allowed, op
+            ),
+        },
+    }
 }

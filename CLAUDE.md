@@ -26,7 +26,7 @@ ArcRun is a Rust-based task orchestration service that manages task execution wi
 - `Success` - Completed successfully
 - `Failure` - Failed (timeout, explicit failure, or parent failure)
 - `Canceled` - Manually canceled
-- `Paused` - Manually paused
+- `Paused` - Manually paused (Audit 2, A3). Only a **`Pending` or `Waiting`** task can be paused (`PATCH /task/pause/{id}`); pausing a `Running`/`Claimed` task is refused with 400 (cancel it instead), as are terminal tasks. A `Paused` task is not scheduled by the worker loop, but it is **not shielded from its dependencies**: it still receives `wait_*` decrements and is still cascade-failed when a required parent fails (see Dependency Propagation). It never auto-transitions to `Pending` — only an explicit resume (`PATCH /task/resume/{id}`) moves it out of `Paused`, back to `Waiting` (if dependencies remain outstanding) or `Pending` (if all met). Both transitions are single atomic guarded UPDATEs. A `Paused` task can still be canceled/stop_batched.
 
 ### Action Model
 Actions are webhook calls triggered by task lifecycle events:
@@ -65,6 +65,8 @@ When a task completes, `propagate_to_children` in `src/workers.rs` handles:
 1. **Success**: Decrements `wait_finished` and `wait_success` counters on children
 2. **Failure/Canceled**: Children with `requires_success=true` are marked as `Failure` (recursively)
 3. **Transition to Pending**: When `wait_finished=0` and `wait_success=0`, child becomes `Pending`
+
+**Paused children (Audit 2, A3)**: steps 1 and 2 apply to `Paused` children as well as `Waiting` ones — the counter decrements and the cascade-fail both target `status IN ('waiting','paused')`. A pause never strands `wait_*` counters and never shields a task from a required parent's failure (Paused → Failure, propagated recursively, on_failure outbox enqueued as for a Waiting task). Step 3 stays **`Waiting`-only on purpose**: a `Paused` child whose counters reach 0 stays `Paused` (it does NOT auto-transition to `Pending` — resume decides).
 
 ### Worker Loops
 There are five background workers (spawned in `src/main.rs::spawn_workers`): `start_loop`, `timeout_loop`, `batch_updater`, `retention_cleanup_loop`, and `delivery_loop`. All share the same `watch::Receiver<bool>` shutdown channel.
@@ -109,7 +111,8 @@ All HTTP handler functions and route configuration:
 - `update_task` - PATCH /task/{task_id}
 - `batch_task_updater` - PUT /task/{task_id} (high-throughput counter updates)
 - `cancel_task` - DELETE /task/{task_id}
-- `pause_task` - PATCH /task/pause/{task_id}
+- `pause_task` - PATCH /task/pause/{task_id} (Pending/Waiting only)
+- `resume_task` - PATCH /task/resume/{task_id} (Paused only; → Waiting or Pending by remaining deps)
 - `list_webhook_deliveries` - GET /webhook-deliveries (outbox observability; `?status=exhausted`, paginated)
 - `get_dag` - GET /dag/{batch_id}
 - `view_dag_page` - GET /view (serves static HTML)
@@ -143,7 +146,7 @@ All HTTP handler functions and route configuration:
 - `find_detailed_task_by_id` - Single query with LEFT JOIN for task + actions
 - `list_task_filtered_paged` - Filtered listing with pagination
 - `get_dag_for_batch` - Fetches tasks + links for DAG visualization
-- `pause_task` - Sets task status to Paused
+- `pause_task` / `resume_task` - Atomic guarded Pending/Waiting → Paused, and Paused → Waiting/Pending (A3)
 - `set_started_task` - Atomically transitions Pending -> Running
 
 **`src/workers.rs`**:

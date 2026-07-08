@@ -1268,3 +1268,405 @@ async fn test_audit2_a7_clamp_prevents_i32_overflow() {
         "pipeline must stay alive: a later task's counters are still persisted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A3 — `Paused` is no longer an escape-hatch / state-trap.
+// ---------------------------------------------------------------------------
+//
+// # Original bug
+// `Paused` combined three defects: (1) no resume path existed (the endpoint doc
+// promised "PATCH to Pending" but `validate_update_task` only accepted
+// Success/Failure and `update_running_task` only matched Running/Claimed, so the
+// only way out of Paused was cancel); (2) all propagation filtered `status =
+// 'waiting'`, so a task paused while `Waiting` never received the `wait_*`
+// decrements nor the cascade-fail from parents that finished during the pause —
+// counters were stranded forever, the batch never went terminal and
+// `on_batch_complete` never fired; (3) a `Running` task could be paused, escaping
+// the timeout loop while the external worker's PATCH 404'd — a wedged task.
+//
+// # Fix
+// * Pause is restricted to `Pending`/`Waiting` (atomic guarded UPDATE); Running
+//   (suggest cancel), Claimed and terminal states are refused with a 400.
+// * A new `PATCH /task/resume/{id}` moves a `Paused` task back to `Waiting` (if any
+//   dependency is still outstanding) or `Pending` (all met), in one atomic guarded
+//   UPDATE (`CASE` on the counters — no SELECT-then-UPDATE race). Only `Paused` is
+//   resumable.
+// * Propagation now targets `status IN ('waiting','paused')` for the `wait_*`
+//   decrements AND the cascade-fail, so a paused task is kept consistent and is not
+//   shielded from a required parent's failure. The transition-to-Pending stays
+//   `Waiting`-only: a Paused task whose counters reach 0 stays Paused until resume.
+
+use actix_http::Request as ActixRequest;
+use actix_web::body::MessageBody as ActixMessageBody;
+use actix_web::dev::{Service as ActixService, ServiceResponse as ActixServiceResponse};
+use actix_web::http::StatusCode;
+use arcrun::handlers::AppState;
+
+/// PATCH /task/pause/{id}, returning the HTTP status.
+async fn pause_task_http<S, B>(app: &S, id: uuid::Uuid) -> StatusCode
+where
+    S: ActixService<ActixRequest, Response = ActixServiceResponse<B>, Error = actix_web::Error>,
+    B: ActixMessageBody,
+{
+    let req = actix_web::test::TestRequest::patch()
+        .uri(&format!("/task/pause/{}", id))
+        .to_request();
+    actix_web::test::call_service(app, req).await.status()
+}
+
+/// PATCH /task/resume/{id}, returning the HTTP status.
+async fn resume_task_http<S, B>(app: &S, id: uuid::Uuid) -> StatusCode
+where
+    S: ActixService<ActixRequest, Response = ActixServiceResponse<B>, Error = actix_web::Error>,
+    B: ActixMessageBody,
+{
+    let req = actix_web::test::TestRequest::patch()
+        .uri(&format!("/task/resume/{}", id))
+        .to_request();
+    actix_web::test::call_service(app, req).await.status()
+}
+
+/// Drive a Pending task straight to `Claimed` (no on_start), for the refusal tests.
+async fn force_claimed(state: &AppState, task_id: uuid::Uuid) {
+    let mut conn = state.pool.get().await.unwrap();
+    assert!(
+        arcrun::db_operation::claim_task(&mut conn, &task_id)
+            .await
+            .unwrap(),
+        "task should be claimed"
+    );
+}
+
+/// A3 test 1 — a `Paused` task still receives `wait_*` decrements when a parent
+/// finishes, but does NOT auto-transition to Pending; resume then unblocks it.
+///
+/// DAG: parent -> child (requires_success). Child is Waiting, then paused. When the
+/// parent succeeds, the (Paused) child's counters must be decremented to 0 while it
+/// stays Paused. Resuming it (counters 0) moves it to Pending. With the fix reverted
+/// the decrement is filtered out (`status = 'waiting'` only) and the counters stay
+/// frozen at 1/1 — the child could never run even after resume.
+#[tokio::test]
+async fn test_audit2_a3_paused_receives_decrements() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let created = create_tasks_ok(
+        &app,
+        &[
+            task_json("parent", "Parent", "a3"),
+            task_with_deps("child", "Child", "a3", vec![("parent", true)]),
+        ],
+    )
+    .await;
+    let parent = created[0].id;
+    let child = created[1].id;
+    assert_eq!(created[1].status, StatusKind::Waiting);
+
+    // Pause the Waiting child.
+    assert_eq!(pause_task_http(&app, child).await, StatusCode::OK);
+    assert_task_status(&app, child, StatusKind::Paused, "child should be Paused").await;
+    assert_eq!(
+        read_wait_counters(&state.pool, child).await,
+        (1, 1),
+        "child starts with one unmet dependency"
+    );
+
+    // Parent succeeds -> the Paused child must be decremented, but stay Paused.
+    succeed_task(&state, parent).await;
+    assert_eq!(
+        read_wait_counters(&state.pool, child).await,
+        (0, 0),
+        "Paused child must receive the wait_* decrements from its parent"
+    );
+    assert_task_status(
+        &app,
+        child,
+        StatusKind::Paused,
+        "child must stay Paused (no auto-transition to Pending)",
+    )
+    .await;
+
+    // Resume -> counters are 0, so it goes straight to Pending.
+    assert_eq!(resume_task_http(&app, child).await, StatusCode::OK);
+    assert_task_status(
+        &app,
+        child,
+        StatusKind::Pending,
+        "resumed child with met deps should be Pending",
+    )
+    .await;
+}
+
+/// A3 test 2 — cascade-fail reaches a `Paused` task and propagates recursively.
+///
+/// DAG: parent -> child -> grandchild (all requires_success). Child is paused, then
+/// the parent fails. The Paused child must be marked Failure (a pause does not shield
+/// it), and the failure must cascade recursively to the grandchild. With the fix
+/// reverted the cascade skips the Paused child (and thus the grandchild), leaving both
+/// stuck Waiting/Paused forever.
+#[tokio::test]
+async fn test_audit2_a3_cascade_fail_reaches_paused() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let created = create_tasks_ok(
+        &app,
+        &[
+            task_json("parent", "Parent", "a3"),
+            task_with_deps("child", "Child", "a3", vec![("parent", true)]),
+            task_with_deps("grandchild", "Grandchild", "a3", vec![("child", true)]),
+        ],
+    )
+    .await;
+    let parent = created[0].id;
+    let child = created[1].id;
+    let grandchild = created[2].id;
+
+    assert_eq!(pause_task_http(&app, child).await, StatusCode::OK);
+    assert_task_status(&app, child, StatusKind::Paused, "child should be Paused").await;
+
+    // Parent fails -> cascade must reach the Paused child AND recurse to grandchild.
+    fail_task(&state, parent, "boom").await;
+    assert_task_status(
+        &app,
+        child,
+        StatusKind::Failure,
+        "Paused child must be cascade-failed by its required parent",
+    )
+    .await;
+    assert_task_status(
+        &app,
+        grandchild,
+        StatusKind::Failure,
+        "failure must propagate recursively through the (formerly Paused) child",
+    )
+    .await;
+}
+
+/// A3 test 3 — resume is contextual: a task with outstanding deps resumes to Waiting,
+/// a task with all deps met resumes to Pending.
+#[tokio::test]
+async fn test_audit2_a3_resume_is_contextual() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // Two-parent child.
+    let created = create_tasks_ok(
+        &app,
+        &[
+            task_json("p1", "P1", "a3"),
+            task_json("p2", "P2", "a3"),
+            task_with_deps("child", "Child", "a3", vec![("p1", true), ("p2", true)]),
+        ],
+    )
+    .await;
+    let p1 = created[0].id;
+    let p2 = created[1].id;
+    let child = created[2].id;
+
+    assert_eq!(pause_task_http(&app, child).await, StatusCode::OK);
+
+    // Only ONE parent succeeds -> child still has an outstanding dependency.
+    succeed_task(&state, p1).await;
+    assert_eq!(read_wait_counters(&state.pool, child).await, (1, 1));
+
+    // Resume -> Waiting (deps still outstanding), NOT Pending.
+    assert_eq!(resume_task_http(&app, child).await, StatusCode::OK);
+    assert_task_status(
+        &app,
+        child,
+        StatusKind::Waiting,
+        "resume with outstanding deps must return to Waiting",
+    )
+    .await;
+
+    // The remaining parent succeeds -> child (now Waiting) transitions to Pending.
+    succeed_task(&state, p2).await;
+    assert_task_status(
+        &app,
+        child,
+        StatusKind::Pending,
+        "child becomes Pending once all deps are met",
+    )
+    .await;
+
+    // Simple case: pause a Pending task, resume -> Pending.
+    let standalone = create_tasks_ok(&app, &[task_json("solo", "Solo", "a3")]).await;
+    let solo = standalone[0].id;
+    assert_eq!(solo_status(&app, solo).await, StatusKind::Pending);
+    assert_eq!(pause_task_http(&app, solo).await, StatusCode::OK);
+    assert_task_status(&app, solo, StatusKind::Paused, "solo should be Paused").await;
+    assert_eq!(resume_task_http(&app, solo).await, StatusCode::OK);
+    assert_task_status(
+        &app,
+        solo,
+        StatusKind::Pending,
+        "resumed Pending task returns to Pending",
+    )
+    .await;
+}
+
+/// Read a task's status via GET /task/{id}.
+async fn solo_status<S, B>(app: &S, id: uuid::Uuid) -> StatusKind
+where
+    S: ActixService<ActixRequest, Response = ActixServiceResponse<B>, Error = actix_web::Error>,
+    B: ActixMessageBody,
+{
+    get_task_ok(app, id).await.status
+}
+
+/// A3 test 4 — pause/resume refusals: pausing a Running/Claimed/terminal task and
+/// resuming a non-Paused task all return 400.
+#[tokio::test]
+async fn test_audit2_a3_pause_resume_refusals() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let created = create_tasks_ok(
+        &app,
+        &[
+            task_json("running", "Running", "a3"),
+            task_json("claimed", "Claimed", "a3"),
+            task_json("terminal", "Terminal", "a3"),
+            task_json("pending", "Pending", "a3"),
+        ],
+    )
+    .await;
+    let running = created[0].id;
+    let claimed = created[1].id;
+    let terminal = created[2].id;
+    let pending = created[3].id;
+
+    // Running -> pause refused.
+    {
+        let mut conn = state.pool.get().await.unwrap();
+        assert!(
+            arcrun::db_operation::claim_task(&mut conn, &running)
+                .await
+                .unwrap()
+        );
+        assert!(
+            arcrun::db_operation::mark_task_running(&mut conn, &running)
+                .await
+                .unwrap()
+        );
+    }
+    assert_task_status(&app, running, StatusKind::Running, "should be Running").await;
+    assert_eq!(
+        pause_task_http(&app, running).await,
+        StatusCode::BAD_REQUEST,
+        "pausing a Running task must be refused (cancel instead)"
+    );
+
+    // Claimed -> pause refused.
+    force_claimed(&state, claimed).await;
+    assert_task_status(&app, claimed, StatusKind::Claimed, "should be Claimed").await;
+    assert_eq!(
+        pause_task_http(&app, claimed).await,
+        StatusCode::BAD_REQUEST,
+        "pausing a Claimed task must be refused"
+    );
+
+    // Terminal -> pause refused.
+    succeed_task(&state, terminal).await;
+    assert_task_status(&app, terminal, StatusKind::Success, "should be Success").await;
+    assert_eq!(
+        pause_task_http(&app, terminal).await,
+        StatusCode::BAD_REQUEST,
+        "pausing a terminal task must be refused"
+    );
+
+    // Resume of a non-Paused (Pending) task -> refused.
+    assert_eq!(
+        resume_task_http(&app, pending).await,
+        StatusCode::BAD_REQUEST,
+        "resuming a non-Paused task must be refused"
+    );
+}
+
+/// A3 test 5 — the `on_batch_complete` signal still fires when the batch's last
+/// non-terminal task is a `Paused` task that gets cascade-failed.
+///
+/// Batch (object form) with `on_batch_complete`: parent -> child (requires_success).
+/// The child is paused, then the parent fails, cascade-failing the Paused child. Both
+/// tasks are now terminal, so the batch-complete signal (enqueued via the centralized
+/// helper on the parent's terminal transition) must be delivered exactly once. With
+/// the cascade-fail-reaches-Paused fix reverted, the child stays Paused (non-terminal)
+/// and the signal never fires.
+#[tokio::test]
+async fn test_audit2_a3_batch_complete_after_cascade_fail_of_paused() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits.clone());
+
+    let body = json!({
+        "tasks": [
+            task_json("parent", "Parent", "a3bc"),
+            task_with_deps("child", "Child", "a3bc", vec![("parent", true)])
+        ],
+        "on_batch_complete": [
+            {"kind": "Webhook", "params": {"url": webhook_url, "verb": "Post"}}
+        ]
+    });
+    let req = actix_web::test::TestRequest::post()
+        .uri("/task")
+        .insert_header(("requester", "test"))
+        .set_json(&body)
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let batch_id: uuid::Uuid = resp
+        .headers()
+        .get("X-Batch-ID")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Identify parent (Pending) and child (Waiting) via the DAG.
+    let dag_req = actix_web::test::TestRequest::get()
+        .uri(&format!("/dag/{}", batch_id))
+        .to_request();
+    let dag_resp = actix_web::test::call_service(&app, dag_req).await;
+    let dag: serde_json::Value = actix_web::test::read_body_json(dag_resp).await;
+    let mut parent = None;
+    let mut child = None;
+    for t in dag["tasks"].as_array().unwrap() {
+        let id = uuid::Uuid::parse_str(t["id"].as_str().unwrap()).unwrap();
+        match t["name"].as_str().unwrap() {
+            "Parent" => parent = Some(id),
+            "Child" => child = Some(id),
+            _ => {}
+        }
+    }
+    let parent = parent.unwrap();
+    let child = child.unwrap();
+
+    // Pause the Waiting child -> the batch now has a Pending parent + a Paused child
+    // (no task terminal yet, no signal).
+    assert_eq!(pause_task_http(&app, child).await, StatusCode::OK);
+    assert_task_status(&app, child, StatusKind::Paused, "child should be Paused").await;
+
+    // Parent fails -> cascade-fails the Paused child; both terminal -> signal enqueued.
+    fail_task(&state, parent, "boom").await;
+    assert_task_status(
+        &app,
+        child,
+        StatusKind::Failure,
+        "Paused child cascade-failed",
+    )
+    .await;
+
+    drain_outbox(&state).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "on_batch_complete must fire once after the last non-terminal (Paused) task is cascade-failed"
+    );
+
+    let _ = shutdown_server.send(());
+}

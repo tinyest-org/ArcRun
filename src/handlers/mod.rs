@@ -28,7 +28,8 @@ pub use batch::{get_batch_stats, list_batches, stop_batch, update_batch_rules};
 pub use dag::{get_dag, view_dag_page};
 pub use health::{favicon, health_check, readiness_check};
 pub use task::{
-    add_task, batch_task_updater, cancel_task, get_task, list_task, pause_task, update_task,
+    add_task, batch_task_updater, cancel_task, get_task, list_task, pause_task, resume_task,
+    update_task,
 };
 pub use webhook::list_webhook_deliveries;
 
@@ -143,6 +144,7 @@ pub async fn get_conn_with_retry<'a>(
         task::batch_task_updater,
         task::cancel_task,
         task::pause_task,
+        task::resume_task,
         batch::get_batch_stats,
         batch::stop_batch,
         batch::update_batch_rules,
@@ -215,6 +217,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         .route("/task/{task_id}", web::put().to(batch_task_updater))
         .route("/task/{task_id}", web::delete().to(cancel_task))
         .route("/task/pause/{task_id}", web::patch().to(pause_task))
+        .route("/task/resume/{task_id}", web::patch().to(resume_task))
         .route("/batch/{batch_id}", web::get().to(get_batch_stats))
         .route("/batch/{batch_id}", web::delete().to(stop_batch))
         .route(

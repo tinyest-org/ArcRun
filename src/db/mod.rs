@@ -22,7 +22,7 @@ pub(crate) use task_crud::{find_detailed_task_by_id, insert_task_batch};
 // Re-exports from task_lifecycle
 pub use task_lifecycle::{UpdateTaskResult, update_running_task};
 pub(crate) use task_lifecycle::{
-    fail_task_and_propagate, pause_task, save_cancel_actions, stop_batch,
+    fail_task_and_propagate, pause_task, resume_task, save_cancel_actions, stop_batch,
 };
 
 // Re-exports from task_query
