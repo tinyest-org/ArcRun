@@ -1,6 +1,6 @@
 use crate::common::*;
 
-use arcrun::dtos::{BasicTaskDto, TaskDto};
+use arcrun::dtos::BasicTaskDto;
 use serde_json::json;
 
 /// Bug #9: Duplicate local IDs in a batch should be rejected.
@@ -253,7 +253,7 @@ async fn test_bug19_put_ignores_status_validation() {
         .to_request();
     let create_resp = actix_web::test::call_service(&app, create_req).await;
     assert_eq!(create_resp.status(), actix_web::http::StatusCode::CREATED);
-    let tasks: Vec<TaskDto> = actix_web::test::read_body_json(create_resp).await;
+    let tasks: Vec<BasicTaskDto> = actix_web::test::read_body_json(create_resp).await;
     let task_id = tasks[0].id;
 
     // PUT with status=Failure and no failure_reason (plus a valid counter)
@@ -292,7 +292,7 @@ async fn test_bug19_patch_still_validates_status() {
         .to_request();
     let create_resp = actix_web::test::call_service(&app, create_req).await;
     assert_eq!(create_resp.status(), actix_web::http::StatusCode::CREATED);
-    let tasks: Vec<TaskDto> = actix_web::test::read_body_json(create_resp).await;
+    let tasks: Vec<BasicTaskDto> = actix_web::test::read_body_json(create_resp).await;
     let task_id = tasks[0].id;
 
     // PATCH with status=Failure and no failure_reason — should be rejected

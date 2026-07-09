@@ -200,7 +200,7 @@ async fn test_dag_endpoint_returns_tasks_and_links() {
         .unwrap()
         .to_string();
 
-    let created: Vec<arcrun::dtos::TaskDto> = actix_web::test::read_body_json(resp).await;
+    let created: Vec<arcrun::dtos::BasicTaskDto> = actix_web::test::read_body_json(resp).await;
     assert_eq!(created.len(), 4);
 
     let id_a = created[0].id;

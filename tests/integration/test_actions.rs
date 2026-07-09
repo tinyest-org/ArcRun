@@ -20,5 +20,6 @@ async fn test_task_with_success_and_failure_actions() {
 
     let body = create_tasks_ok(&app, &[task]).await;
     // Should have 3 actions: on_start, on_success, on_failure
-    assert_eq!(body[0].actions.len(), 3);
+    let full = get_task_ok(&app, body[0].id).await;
+    assert_eq!(full.actions.len(), 3);
 }

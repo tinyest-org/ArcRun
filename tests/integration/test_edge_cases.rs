@@ -1,6 +1,5 @@
 use crate::common::*;
 
-use arcrun::dtos::TaskDto;
 use serde_json::json;
 
 #[tokio::test]
@@ -28,7 +27,8 @@ async fn test_task_with_large_metadata() {
     });
 
     let body = create_tasks_ok(&app, &[task]).await;
-    assert!(body[0].metadata.get("array").is_some());
+    let full = get_task_ok(&app, body[0].id).await;
+    assert!(full.metadata.get("array").is_some());
 }
 
 #[tokio::test]
@@ -45,7 +45,7 @@ async fn test_task_with_special_characters_in_name() {
         "on_start": webhook_action()
     });
 
-    let body: Vec<TaskDto> = create_tasks_ok(&app, &[task]).await;
+    let body = create_tasks_ok(&app, &[task]).await;
     assert!(body[0].name.contains("quotes"));
     assert!(body[0].name.contains("日本語"));
 }

@@ -12,7 +12,7 @@
 
 use crate::common::*;
 
-use arcrun::dtos::{BatchStatsDto, BatchSummaryDto, TaskDto};
+use arcrun::dtos::{BasicTaskDto, BatchStatsDto, BatchSummaryDto};
 use serde_json::json;
 
 // ============================================================================
@@ -35,7 +35,7 @@ fn enc(s: &str) -> String {
 }
 
 /// POST an object-form body; assert 201 and return (batch_id, created tasks).
-async fn create_batch<S, B>(app: &S, body: &serde_json::Value) -> (uuid::Uuid, Vec<TaskDto>)
+async fn create_batch<S, B>(app: &S, body: &serde_json::Value) -> (uuid::Uuid, Vec<BasicTaskDto>)
 where
     S: actix_web::dev::Service<
             actix_http::Request,
@@ -60,7 +60,7 @@ where
         .and_then(|h| h.to_str().ok())
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .expect("X-Batch-ID header");
-    let tasks: Vec<TaskDto> = actix_web::test::read_body_json(resp).await;
+    let tasks: Vec<BasicTaskDto> = actix_web::test::read_body_json(resp).await;
     (batch_id, tasks)
 }
 

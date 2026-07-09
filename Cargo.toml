@@ -18,7 +18,7 @@ diesel = { version = "2.3.4", features = [
     "chrono",
     "32-column-tables",
 ], default-features = false }
-uuid = { version = "1.18.1", features = ["v4", "serde"] }
+uuid = { version = "1.18.1", features = ["v4", "v7", "serde"] }
 env_logger = "0.11.8"
 log = "0.4.28"
 reqwest = { version = "0.13", features = [

@@ -2889,21 +2889,23 @@ async fn test_audit2_a10_limits_bind_param_ceiling_chunked_insert_succeeds() {
         })
         .collect();
 
-    // create_tasks_ok asserts 201 and returns the created TaskDtos.
+    // create_tasks_ok asserts 201 and returns BasicTaskDtos (no actions field).
     let created = create_tasks_ok(&app, &tasks).await;
     assert_eq!(
         created.len(),
         1000,
         "all 1000 tasks must be created despite > 65535 total action binds (chunked INSERT)"
     );
+    // Verify actions via GET /task/{id} (BasicTaskDto doesn't carry actions).
+    let first = get_task_ok(&app, created[0].id).await;
     assert_eq!(
-        created[0].actions.len(),
+        first.actions.len(),
         14,
         "each task must have its 14 actions (1 on_start + 13 on_success) persisted"
     );
-    // Spot-check the tail of the batch too (chunk boundaries fall mid-batch).
+    let last = get_task_ok(&app, created[999].id).await;
     assert_eq!(
-        created[999].actions.len(),
+        last.actions.len(),
         14,
         "the last task in the batch must also have all 14 actions"
     );

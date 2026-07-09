@@ -76,7 +76,7 @@ pub(crate) async fn list_batches<'a>(
                    OR b.scope ILIKE '%' || $8 || '%'
                    OR b.metadata::text ILIKE '%' || $8 || '%')
             GROUP BY t.batch_id, b.scope, b.metadata
-            ORDER BY first_created DESC
+            ORDER BY first_created DESC, t.batch_id DESC
             LIMIT $9 OFFSET $10
         )
         SELECT

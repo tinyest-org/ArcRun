@@ -1,7 +1,7 @@
 use actix_http::Request;
 use actix_web::body::MessageBody;
 use actix_web::dev::{Service, ServiceResponse};
-use arcrun::dtos::TaskDto;
+use arcrun::dtos::{BasicTaskDto, TaskDto};
 use arcrun::handlers::AppState;
 use arcrun::models::StatusKind;
 
@@ -25,8 +25,8 @@ pub async fn setup_test_app_with_batch_updater() -> (TestApp, TestStateWithBatch
     (test_app, test_state)
 }
 
-/// POST /task with given tasks, assert 201, return deserialized Vec<TaskDto>.
-pub async fn create_tasks_ok<S, B>(app: &S, tasks: &[serde_json::Value]) -> Vec<TaskDto>
+/// POST /task with given tasks, assert 201, return deserialized Vec<BasicTaskDto>.
+pub async fn create_tasks_ok<S, B>(app: &S, tasks: &[serde_json::Value]) -> Vec<BasicTaskDto>
 where
     S: Service<Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
     B: MessageBody,

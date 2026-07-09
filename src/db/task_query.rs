@@ -259,7 +259,7 @@ pub(crate) async fn list_task_filtered_paged<'a>(
         .into_boxed()
         .offset(pagination.offset)
         .limit(pagination.limit)
-        .order(created_at.desc());
+        .order((created_at.desc(), id.desc()));
 
     // Only apply the LIKE filters when a pattern is provided. `name`/`kind` are
     // NOT NULL, so skipping the filter on an empty string is equivalent to
@@ -306,7 +306,7 @@ pub(crate) async fn get_dag_for_batch<'a>(
     // Get all tasks in the batch
     let tasks_result = task
         .filter(batch_id.eq(bid))
-        .order(created_at.asc())
+        .order((created_at.asc(), id.asc()))
         .load::<models::Task>(conn)
         .await?;
 

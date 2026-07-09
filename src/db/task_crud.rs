@@ -1,6 +1,6 @@
 use crate::{
     Conn,
-    dtos::{self, TaskDto},
+    dtos::{self, BasicTaskDto, TaskDto},
     metrics,
     models::{self, Action, Link, NewAction, StatusKind, Task},
     rule::{self, Matcher, Strategy},
@@ -197,7 +197,7 @@ struct PreparedTask {
 /// while still evaluating dedupe tasks one-at-a-time so they can match tasks
 /// inserted earlier in the same batch.
 ///
-/// UUIDs are generated app-side (`Uuid::new_v4()`) so the full `id_mapping` is
+/// UUIDs are generated app-side (`Uuid::now_v7()`) so the full `id_mapping` is
 /// known before any insert, letting links be built without intermediate RETURNINGs.
 ///
 /// Semantics preserved exactly from the old per-task `insert_new_task`:
@@ -205,15 +205,15 @@ struct PreparedTask {
 ///   skipped parent has that dependency ignored with a warn),
 /// - `wait_*` counters, initial Waiting/Pending status, and per-task metrics are
 ///   identical,
-/// - the returned `TaskDto`s preserve input order.
+/// - the returned `BasicTaskDto`s preserve input order.
 pub(crate) async fn insert_task_batch<'a>(
     conn: &mut Conn<'a>,
     dtos_in: Vec<dtos::NewTaskDto>,
     batch_id: Option<Uuid>,
-) -> Result<Vec<TaskDto>, DbError> {
+) -> Result<Vec<BasicTaskDto>, DbError> {
     crate::metrics::record_batch_insert_tasks(dtos_in.len());
     let mut id_mapping: HashMap<String, Uuid> = HashMap::new();
-    let mut results: Vec<TaskDto> = Vec::with_capacity(dtos_in.len());
+    let mut results: Vec<BasicTaskDto> = Vec::with_capacity(dtos_in.len());
 
     // Buffer of prepared, dedupe-free tasks in the current contiguous run.
     let mut run: Vec<PreparedTask> = Vec::new();
@@ -234,7 +234,7 @@ pub(crate) async fn insert_task_batch<'a>(
                 continue;
             }
 
-            let task_id = Uuid::new_v4();
+            let task_id = Uuid::now_v7();
             let prepared = resolve_task(dto, task_id, batch_id, &id_mapping);
             id_mapping.insert(local_id, task_id);
             // A dedupe task is its own one-element run (it may not be batched with
@@ -243,7 +243,7 @@ pub(crate) async fn insert_task_batch<'a>(
             flush_run(conn, &mut run, &mut results).await?;
         } else {
             let local_id = dto.id.clone();
-            let task_id = Uuid::new_v4();
+            let task_id = Uuid::now_v7();
             let prepared = resolve_task(dto, task_id, batch_id, &id_mapping);
             id_mapping.insert(local_id, task_id);
             run.push(prepared);
@@ -322,12 +322,15 @@ fn resolve_task(
 }
 
 /// Flush a run of prepared tasks into the DB with up to three multi-row INSERTs
-/// (task, link, action), then append their `TaskDto`s to `results` (preserving
-/// run order) and record per-task metrics. Clears `run`.
+/// (task, link, action), then append their `BasicTaskDto`s to `results`
+/// (preserving run order) and record per-task metrics. Clears `run`.
+///
+/// Actions are inserted but NOT returned — `BasicTaskDto` doesn't carry them,
+/// so we skip the action RETURNING round-trip (B6 conformity).
 async fn flush_run<'a>(
     conn: &mut Conn<'a>,
     run: &mut Vec<PreparedTask>,
-    results: &mut Vec<TaskDto>,
+    results: &mut Vec<BasicTaskDto>,
 ) -> Result<(), DbError> {
     use crate::schema::action::dsl::action as action_tbl;
     use crate::schema::link::dsl::link as link_tbl;
@@ -343,15 +346,11 @@ async fn flush_run<'a>(
     let new_tasks: Vec<&models::NewTask> = prepared.iter().map(|p| &p.new_task).collect();
     let mut task_by_id: HashMap<Uuid, Task> = HashMap::with_capacity(new_tasks.len());
     for chunk in new_tasks.chunks(chunk_rows(TASK_BINDS_PER_ROW)) {
-        // `chunk` is `&[&NewTask]`; Diesel's `Insertable` wants `Vec<&NewTask>` (or
-        // `&NewTask`), so hand it an owned Vec of the (cheap) references.
         let inserted_tasks: Vec<Task> = diesel::insert_into(task_tbl)
             .values(chunk.to_vec())
             .returning(Task::as_returning())
             .get_results(conn)
             .await?;
-        // Map id -> inserted Task so we can return them in input order regardless of
-        // the order the DB returns rows.
         for t in inserted_tasks {
             task_by_id.insert(t.id, t);
         }
@@ -367,6 +366,8 @@ async fn flush_run<'a>(
     }
 
     // 3. Multi-row INSERT of all actions across the run (start + failure + success).
+    //    Actions are fire-and-forget here — BasicTaskDto doesn't include them, so we
+    //    use `.execute()` instead of `.returning().get_results()` to skip the round-trip.
     let mut all_new_actions: Vec<NewAction> = Vec::new();
     for p in &prepared {
         all_new_actions.push(NewAction {
@@ -395,19 +396,11 @@ async fn flush_run<'a>(
             });
         }
     }
-
-    // Group inserted actions by task_id to assemble per-task TaskDtos. Chunked to stay
-    // under the bind-param ceiling (actions multiply out fastest: several per task).
-    let mut actions_by_task: HashMap<Uuid, Vec<Action>> = HashMap::new();
     for chunk in all_new_actions.chunks(chunk_rows(ACTION_BINDS_PER_ROW)) {
-        let inserted_actions: Vec<Action> = diesel::insert_into(action_tbl)
+        diesel::insert_into(action_tbl)
             .values(chunk)
-            .returning(Action::as_returning())
-            .get_results(conn)
+            .execute(conn)
             .await?;
-        for a in inserted_actions {
-            actions_by_task.entry(a.task_id).or_default().push(a);
-        }
     }
 
     // Assemble results in input (run) order + record metrics.
@@ -415,14 +408,13 @@ async fn flush_run<'a>(
         let task = task_by_id
             .remove(&p.id)
             .expect("inserted task row missing for prepared id");
-        let actions = actions_by_task.remove(&p.id).unwrap_or_default();
 
         metrics::record_task_created();
         if p.wait_finished > 0 {
             metrics::record_task_with_dependencies();
         }
 
-        results.push(TaskDto::new(task, actions));
+        results.push(BasicTaskDto::from(task));
     }
 
     Ok(())

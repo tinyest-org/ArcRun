@@ -78,7 +78,8 @@ async fn test_concurrency_rules_stored_on_task() {
 
     let body = create_tasks_ok(&app, &[task]).await;
     assert_eq!(body[0].status, StatusKind::Pending);
-    assert!(!body[0].rules.0.is_empty());
+    let full = get_task_ok(&app, body[0].id).await;
+    assert!(!full.rules.0.is_empty());
 }
 
 /// Merged test: rules are stored per-project AND different projects get independent rules.
@@ -145,7 +146,12 @@ async fn test_concurrency_rules_stored_per_project() {
     assert_eq!(created.len(), 3);
     for t in &created {
         assert_eq!(t.status, StatusKind::Pending);
-        assert!(!t.rules.0.is_empty(), "task {} should have rules", t.name);
+        let full = get_task_ok(&app, t.id).await;
+        assert!(
+            !full.rules.0.is_empty(),
+            "task {} should have rules",
+            t.name
+        );
     }
 }
 
@@ -455,8 +461,9 @@ async fn test_capacity_rule_stored_on_task() {
 
     let body = create_tasks_ok(&app, &[task]).await;
     assert_eq!(body[0].status, StatusKind::Pending);
-    assert_eq!(body[0].rules.0.len(), 1);
-    match &body[0].rules.0[0] {
+    let full = get_task_ok(&app, body[0].id).await;
+    assert_eq!(full.rules.0.len(), 1);
+    match &full.rules.0[0] {
         Strategy::Capacity(rule) => {
             assert_eq!(rule.max_capacity, 500);
             assert_eq!(rule.matcher.kind, "cap-kind");

@@ -567,7 +567,7 @@ pub async fn list_webhook_deliveries<'a>(
         query = query.filter(dsl::status.eq(s));
     }
     let rows = query
-        .order(dsl::updated_at.desc())
+        .order((dsl::updated_at.desc(), dsl::id.desc()))
         .limit(limit)
         .offset(offset)
         .load::<WebhookExecution>(conn)

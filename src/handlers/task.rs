@@ -227,7 +227,7 @@ pub async fn add_task(
     form: web::Json<dtos::CreateTaskBody>,
 ) -> actix_web::Result<HttpResponse> {
     // Generate batch_id for tracing this entire DAG
-    let batch_id = Uuid::new_v4();
+    let batch_id = Uuid::now_v7();
 
     // Accept both the legacy bare array and the object form
     // `{ "tasks": [...], "on_batch_complete": [...], "scope": ..., "metadata": ... }`.

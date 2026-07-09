@@ -50,6 +50,7 @@ async fn main() -> std::io::Result<()> {
 
     init_security(&config);
     init_auth(&config);
+    init_retention(&config);
 
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -183,6 +184,27 @@ fn init_auth(config: &Config) {
                 log::warn!("{msg}");
             }
         }
+    }
+}
+
+/// Warn when automatic retention cleanup is disabled (B7 hygiene). Without it,
+/// webhook_execution rows and terminal tasks accumulate without bound.
+fn init_retention(config: &Config) {
+    if !config.retention.enabled {
+        let msg = "RETENTION_ENABLED is off (default): completed webhook_execution rows and \
+                   terminal tasks accumulate without bound. Set RETENTION_ENABLED=1 or run \
+                   external cleanup to prevent unbounded growth.";
+        if cfg!(debug_assertions) {
+            log::info!("{msg}");
+        } else {
+            log::warn!("{msg}");
+        }
+    } else {
+        log::info!(
+            "Retention cleanup ENABLED (RETENTION_DAYS={}, interval={}s)",
+            config.retention.retention_days,
+            config.retention.cleanup_interval_secs
+        );
     }
 }
 
