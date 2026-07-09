@@ -5,11 +5,24 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use std::sync::{
-    LazyLock,
+    LazyLock, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use testcontainers::{ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
+
+/// Container ID for atexit cleanup (statics are never dropped in Rust).
+static CONTAINER_ID: Mutex<Option<String>> = Mutex::new(None);
+
+extern "C" fn cleanup_container() {
+    if let Ok(guard) = CONTAINER_ID.lock() {
+        if let Some(id) = guard.as_ref() {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", id])
+                .output();
+        }
+    }
+}
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
@@ -35,6 +48,13 @@ static SHARED_PG: LazyLock<SharedPg> = LazyLock::new(|| {
                 .start()
                 .await
                 .expect("Failed to start shared PostgreSQL container");
+
+            // Register atexit cleanup: Rust never drops statics, so without
+            // this the container leaks after every test run.
+            let cid = container.id().to_string();
+            *CONTAINER_ID.lock().unwrap() = Some(cid);
+            unsafe { libc::atexit(cleanup_container) };
+
             let host_port = container.get_host_port_ipv4(5432).await.unwrap();
             let base_url = format!(
                 "postgres://postgres:postgres@127.0.0.1:{}/postgres",
