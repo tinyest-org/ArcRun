@@ -687,10 +687,15 @@ impl Config {
             });
         }
 
-        if self.worker.webhook_concurrency > self.pool.max_size as usize {
+        if self.worker.webhook_concurrency >= self.pool.max_size as usize {
             log::warn!(
-                "WORKER_WEBHOOK_CONCURRENCY ({}) exceeds POOL_MAX_SIZE ({}); \
-                 webhook tasks may stall waiting for connections",
+                "WORKER_WEBHOOK_CONCURRENCY ({}) is >= POOL_MAX_SIZE ({}); since B1, \
+                 on_start webhooks no longer hold a pool connection during the HTTP \
+                 call itself, but each still briefly borrows one in the phase-A claim \
+                 and phase-C running-transition windows. At `==` a full burst of \
+                 on_start work leaves zero connection headroom for HTTP handlers and \
+                 the other worker loops during those windows; keep \
+                 WORKER_WEBHOOK_CONCURRENCY strictly below POOL_MAX_SIZE",
                 self.worker.webhook_concurrency,
                 self.pool.max_size
             );

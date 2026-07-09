@@ -2956,3 +2956,202 @@ async fn test_audit2_a10_limits_forward_reference_rejected() {
         "a forward dependency reference must be rejected with 400 (this is what excludes cycles)"
     );
 }
+
+// =============================================================================
+// B1 — on_start no longer holds a DB connection during the HTTP call (Lot 6.1)
+// =============================================================================
+
+/// B1 (perf, HIGH): before the fix, `execute_webhook_for_task` acquired a pool
+/// connection and held it across the entire on_start HTTP call (up to the webhook
+/// timeout, ~10 s each). With `WORKER_WEBHOOK_CONCURRENCY == POOL_MAX_SIZE` (the
+/// default 10 == 10), a burst of slow on_start webhooks pinned every pool
+/// connection, starving HTTP handlers and the four other worker loops — exactly the
+/// pathology the Lot 2 outbox eliminated for end/cancel deliveries.
+///
+/// # Fix
+/// `execute_webhook_for_task` is split into phases, mirroring the delivery loop:
+/// phase A borrows a connection for the claim + A4 re-check + action load then
+/// **drops** it, phase B runs the on_start HTTP with **no connection held**, phase C
+/// re-acquires a connection only for the A2/A4 running-transition transaction.
+///
+/// # What this test asserts
+/// Running the real start loop against a **size-1 pool** with a deliberately slow
+/// (~2 s) on_start webhook: while that HTTP is in flight (the start loop is parked
+/// inside `webhook_phase` awaiting it), an independent `pool.get()` + `SELECT 1`
+/// over the SAME pool completes in well under the webhook delay (< 1 s). Pre-fix the
+/// single connection was pinned for the full ~2 s, so the concurrent request would
+/// block until the webhook returned and the `< 1 s` assertion fails. It also asserts
+/// the flow is unchanged: the task reaches Running, its start row is `success`, and
+/// the webhook was received exactly once.
+#[tokio::test]
+async fn test_audit2_b1_on_start_http_does_not_hold_db_connection() {
+    let test_app = setup_test_db_with_pool_size(1).await;
+    let state = create_test_state(test_app.pool.clone());
+    let app = test_service!(state);
+
+    let webhook_delay = Duration::from_secs(2);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_slow_200_webhook_server(hits.clone(), webhook_delay);
+
+    let task_payload = json!({
+        "id": "b1-slow",
+        "name": "B1 Slow on_start",
+        "kind": "b1-kind",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": { "kind": "Webhook", "params": { "url": webhook_url, "verb": "Post" } }
+    });
+    let created = create_tasks_ok(&app, &[task_payload]).await;
+    let task_id = created[0].id;
+
+    // Spawn the real start loop over the size-1 pool. It claims the task, then enters
+    // the on_start HTTP (phase B), which — with the fix — holds no connection.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let evaluator = state.action_executor.clone();
+    let pool = state.pool.clone();
+    let handle = tokio::spawn(async move {
+        arcrun::workers::start_loop(
+            &evaluator,
+            pool,
+            Duration::from_millis(50),
+            true,
+            50,
+            10,
+            shutdown_rx,
+        )
+        .await;
+    });
+
+    // Wait until the on_start HTTP is in flight. The slow server bumps `hits` BEFORE
+    // sleeping, so `hits >= 1` means we are inside the ~2 s HTTP window.
+    let mut waited = Duration::ZERO;
+    while hits.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        waited += Duration::from_millis(10);
+        assert!(
+            waited < Duration::from_secs(5),
+            "start loop never fired the on_start webhook"
+        );
+    }
+
+    // The HTTP will keep the mock server busy for ~2 s. Time an independent DB
+    // request over the SAME size-1 pool: with the fix the connection is free during
+    // phase B, so this returns near-instantly.
+    let probe_start = std::time::Instant::now();
+    {
+        let mut conn = tokio::time::timeout(Duration::from_secs(5), state.pool.get())
+            .await
+            .expect("pool.get() timed out — connection still pinned by the on_start HTTP")
+            .expect("failed to acquire connection");
+        diesel_async::RunQueryDsl::execute(diesel::sql_query("SELECT 1"), &mut *conn)
+            .await
+            .expect("SELECT 1 failed");
+    }
+    let probe_elapsed = probe_start.elapsed();
+
+    assert!(
+        probe_elapsed < Duration::from_secs(1),
+        "concurrent DB request took {:?}, expected < 1s — the on_start HTTP is holding \
+         the pool connection (B1 regression). webhook delay = {:?}",
+        probe_elapsed,
+        webhook_delay
+    );
+
+    // Flow non-regression: the slow webhook still drives the task to Running.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let t = get_task_ok(&app, task_id).await;
+            if t.status == StatusKind::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("task never reached Running after slow on_start");
+
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+    let _ = shutdown_server.send(());
+
+    assert_task_status(&app, task_id, StatusKind::Running, "task should be Running").await;
+    assert_eq!(
+        start_row_status(&state.pool, task_id).await.as_deref(),
+        Some("success"),
+        "start outbox row should be completed as success"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "on_start webhook should be received exactly once"
+    );
+}
+
+/// B1 flow non-regression (clean E2E, default pool): a normal-speed on_start webhook
+/// still drives Pending -> Claimed -> Running, completes the `start` outbox row as
+/// `success`, and is received exactly once — the phase split changes only WHERE the
+/// connection is held, never the semantics.
+#[tokio::test]
+async fn test_audit2_b1_flow_unchanged_after_phase_split() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits.clone());
+
+    let task_payload = json!({
+        "id": "b1-flow",
+        "name": "B1 Flow",
+        "kind": "b1-flow-kind",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": { "kind": "Webhook", "params": { "url": webhook_url, "verb": "Post" } }
+    });
+    let created = create_tasks_ok(&app, &[task_payload]).await;
+    let task_id = created[0].id;
+    assert_eq!(created[0].status, StatusKind::Pending);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let evaluator = state.action_executor.clone();
+    let pool = state.pool.clone();
+    let handle = tokio::spawn(async move {
+        arcrun::workers::start_loop(
+            &evaluator,
+            pool,
+            Duration::from_millis(50),
+            true,
+            50,
+            10,
+            shutdown_rx,
+        )
+        .await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let t = get_task_ok(&app, task_id).await;
+            if t.status == StatusKind::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("task never reached Running");
+
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+    let _ = shutdown_server.send(());
+
+    assert_task_status(&app, task_id, StatusKind::Running, "task should be Running").await;
+    assert_eq!(
+        start_row_status(&state.pool, task_id).await.as_deref(),
+        Some("success"),
+        "start outbox row should be completed as success"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "on_start webhook should be received exactly once"
+    );
+}

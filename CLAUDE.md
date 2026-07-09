@@ -75,7 +75,7 @@ There are five background workers (spawned in `src/main.rs::spawn_workers`): `st
 1. Finds `Pending` tasks (ordered by priority DESC, then created_at ASC) via paginated keyset scan
 2. Checks concurrency rules against running tasks
 3. Claims eligible tasks atomically (Pending → Claimed → Running)
-4. Executes on_start webhooks **synchronously** (control-flow — its response can register a cancel action; its failure marks the task Failed)
+4. Executes on_start webhooks **synchronously** (control-flow — its response can register a cancel action; its failure marks the task Failed). **The DB connection is NOT held during the HTTP call (B1):** `execute_webhook_for_task` is split into phases like the delivery loop — phase A borrows a connection to claim the `start` outbox slot + A4 re-check + load the Start actions then **drops it**, phase B runs the on_start HTTP with **no connection held**, phase C re-acquires a connection for the A2/A4 running-transition transaction. This stops a burst of slow on_start webhooks from starving the pool (handlers + the other loops). A failed phase-C re-acquire leaves the task `Claimed` with a `pending` start row — recovered by requeue-stale + the A2 freshness bound, exactly as a process crash would be.
 5. On webhook failure: marks task as Failed, propagates to children, enqueues on_failure outbox rows (in-tx)
 
 **Timeout Loop** (`timeout_loop`, `src/workers/timeout_loop.rs`):
@@ -153,7 +153,7 @@ All HTTP handler functions and route configuration:
 - `propagate_to_children` - Handles dependency propagation (recursive for failures)
 - `cancel_task` - Cancels task and propagates to children
 - `check_concurrency` - Evaluates concurrency rules
-- `start_task` - Executes on_start webhooks
+- `start_task_phase_a` - Connection-holding preamble of on_start (claim slot + A4 re-check + load actions); the on_start HTTP then runs with no connection held (B1)
 - `end_task` - Executes on_success/on_failure webhooks
 - `batch_updater` - Batches success/failure count updates to database (see below)
 

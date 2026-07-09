@@ -6,10 +6,10 @@ Contexte de reprise pour la prochaine session.
 
 **Avancement au 2026-07-09** : **Lots 4 et 5 terminés** — Lot 4 (4.1 → 4.8,
 dernier commit 01d034f) ; Lot 5 : 5.1 (A5 SSRF, 36b6f7a), 5.2 (A6 auth,
-c3bee32), 5.3 (A10 limites structurelles POST /task). Suivant : **Lot 6**
-(perf non-breaking), premier item 6.1 (B1, on_start sans connexion DB pendant
-le HTTP). Détail et notes de relecture par item dans
-`docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
+c3bee32), 5.3 (A10 limites, eaf67f6). **Lot 6 en cours** : 6.1 (B1, on_start
+sans connexion DB pendant le HTTP — phases A/B/C) fait ; suivant 6.2 (B3,
+index partiel batch-complete, à valider par EXPLAIN comme au Lot 0). Détail
+et notes de relecture par item dans `docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
 Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7) ; renversement
 assumé du commit 2e50620 en 4.4 (compteurs terminaux gelés) ; HMAC du `?handle=`
 → Lot 7 (5.2) ; auth non-breaking (token absent ⇒ ouvert + warn release, 5.2) ;

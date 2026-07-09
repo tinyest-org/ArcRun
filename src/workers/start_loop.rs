@@ -23,10 +23,22 @@ struct EvaluationContext {
     ko: HashSet<i64>,
 }
 
-struct StartTaskResult {
-    cancel_tasks: Vec<NewActionDto>,
-    idempotency_key: String,
-    claimed: bool,
+/// Outcome of `start_task_phase_a` — the connection-holding preamble of on_start
+/// (B1). Carries just enough state for phase B (HTTP) and phase C (the running
+/// transition) to proceed without re-reading the DB.
+enum StartPhaseA {
+    /// No on_start HTTP should run: either the `start` slot was already claimed
+    /// (idempotent conflict) or the A4 re-check found the task no longer `Claimed`.
+    /// In both cases the start row is already completed; phase C only needs to run
+    /// `mark_task_running` (the `claimed == false` path of the transition tx).
+    Skip { idempotency_key: String },
+    /// The slot was freshly claimed and the task is still `Claimed`; `actions` must
+    /// be executed via HTTP in phase B (no connection held), then phase C completes
+    /// the transition + start row + cancel actions in one transaction.
+    Proceed {
+        idempotency_key: String,
+        actions: Vec<Action>,
+    },
 }
 
 pub async fn start_loop(
@@ -321,138 +333,245 @@ async fn webhook_phase(
     tasks_processed
 }
 
-/// Execute the full webhook lifecycle for a single claimed task:
-/// 1. start_task (on_start webhooks)
-/// 2. mark_task_running + save_cancel_actions + start-row completion (one transaction —
-///    A2 keeps the running transition & start-row completion atomic; A4 folds the
-///    cancel-action save into the same tx so it is committed before the start-before-end
-///    gate can release the task's cancel row)
-/// On failure: fail_task_and_propagate
+/// Execute the full on_start lifecycle for a single claimed task, split into three
+/// phases so a slow on_start webhook never holds a pool connection (B1 — the same
+/// discipline the delivery loop already uses for end/cancel deliveries):
 ///
-/// Returns true if the task was successfully started.
+/// * **Phase A — `start_task_phase_a` (holds a connection, then drops it):** claim
+///   the `start` outbox slot (idempotency guard), re-check the task is still
+///   `Claimed` (A4 permit-wait window), and load the `Start` actions. The connection
+///   is returned to the pool at the end of this phase — BEFORE any HTTP runs. This
+///   drop is the core of the B1 fix.
+/// * **Phase B — HTTP (holds NO connection):** execute the on_start webhooks
+///   (sequential per task; up to `WORKER_WEBHOOK_CONCURRENCY` tasks run in parallel).
+///   Because no pool connection is pinned here, a burst of slow downstreams can no
+///   longer starve HTTP handlers and the other worker loops.
+/// * **Phase C (re-acquires a connection):** the A2/A4 transaction —
+///   `mark_task_running` + (when the webhook actually ran) `save_cancel_actions` +
+///   `complete_webhook_execution` — in ONE transaction.
+///
+/// On on_start failure the task is marked Failed and propagated via
+/// `fail_started_task` (also off the HTTP call path).
+///
+/// Returns true if the on_start path completed without a webhook failure.
 async fn execute_webhook_for_task(
     evaluator: &ActionExecutor,
     task: Task,
     pool: &DbPool,
     dead_end_enabled: bool,
 ) -> bool {
+    // ---- Phase A: connection-holding preamble. The connection is dropped at the
+    // end of this block, BEFORE the phase-B HTTP — the core of the B1 fix. ----
+    let phase_a = {
+        let Ok(mut conn) = pool.get().await else {
+            log::error!(
+                "Start worker: failed to acquire DB connection for task {} (phase A)",
+                task.id
+            );
+            return false;
+        };
+        start_task_phase_a(evaluator, &task, &mut conn).await
+        // `conn` is dropped here (returned to the pool): no connection is held
+        // across the phase-B HTTP below.
+    };
+
+    let (idempotency_key, actions, claimed) = match phase_a {
+        Ok(StartPhaseA::Skip { idempotency_key }) => (idempotency_key, Vec::new(), false),
+        Ok(StartPhaseA::Proceed {
+            idempotency_key,
+            actions,
+        }) => (idempotency_key, actions, true),
+        Err(e) => {
+            // Genuine DB error in the preamble (claim / re-check / load / skip-completion).
+            // Same handling as the pre-split code: mark the task Failed and propagate. The
+            // start row is left untouched here (never completed `false`) — matching the
+            // pre-split behaviour, which only completed `false` after the HTTP actually ran.
+            log::error!(
+                "Start worker: on_start preamble failed for task {}: {}",
+                task.id,
+                e
+            );
+            fail_started_task(
+                pool,
+                &task,
+                dead_end_enabled,
+                "on_start webhook failed",
+                None,
+            )
+            .await;
+            return false;
+        }
+    };
+
+    // ---- Phase B: HTTP execution of the on_start actions. NO pool connection is
+    // held here (B1). The per-task loop stays sequential, as before. ----
+    let mut cancel_tasks: Vec<NewActionDto> = Vec::new();
+    if claimed {
+        let mut errors: Vec<String> = Vec::new();
+        for act in &actions {
+            match evaluator.execute(act, &task, Some(&idempotency_key)).await {
+                Ok(res) => {
+                    if let Some(t) = res {
+                        cancel_tasks.push(t);
+                    }
+                    log::debug!("Action {} executed successfully", act.id);
+                }
+                Err(e) => {
+                    log::error!("Action {} failed: {}", act.id, e);
+                    errors.push(e);
+                }
+            }
+        }
+        if !errors.is_empty() {
+            // Webhook failed after claim -> complete the start row `false` and mark the
+            // task Failed + propagate. Both run on a freshly re-acquired connection
+            // (fail_started_task), never on the HTTP call path.
+            log::error!(
+                "Start worker: on_start webhook failed for task {}: {}",
+                task.id,
+                errors.join("; ")
+            );
+            fail_started_task(
+                pool,
+                &task,
+                dead_end_enabled,
+                "on_start webhook failed",
+                Some(&idempotency_key),
+            )
+            .await;
+            return false;
+        }
+    }
+
+    // ---- Phase C: re-acquire a connection for the A2/A4 transaction. ----
     let Ok(mut conn) = pool.get().await else {
+        // Safety net (same failure mode as a process crash right here): we could not
+        // re-acquire a connection to commit the running transition. The task stays
+        // `Claimed` with its `start` row still `pending`. The requeue-stale path
+        // re-picks it, and the A2 start-row freshness bound keeps the delivery loop's
+        // start-before-end gate from blocking end/cancel forever. So the task is never
+        // silently lost — it is simply re-processed on a later iteration.
         log::error!(
-            "Start worker: failed to acquire DB connection for task {}",
+            "Start worker: failed to re-acquire DB connection for task {} (phase C); \
+             task stays Claimed with pending start row, recovered by requeue-stale",
             task.id
         );
         return false;
     };
 
-    match start_task(evaluator, &task, &mut conn).await {
-        Ok(start_result) => {
-            let StartTaskResult {
-                cancel_tasks,
-                idempotency_key,
-                claimed,
-            } = start_result;
-
-            // A2 fix: transition Claimed -> Running AND complete the `start` outbox row
-            // in ONE transaction. Previously these were two separate autocommit
-            // statements; a crash (or a swallowed UPDATE error) between them left the
-            // task Running with its `start` row stuck `pending` forever, which the
-            // delivery loop's start-before-end gate then read as "hold end/cancel
-            // forever". Committing them together closes that window on the nominal
-            // path. The start row is completed whenever the on_start webhook was
-            // actually executed (`claimed == true`), even if the running transition
-            // itself is a no-op (task no longer Claimed) — so the row never lingers.
-            //
-            // A4 fix: `save_cancel_actions` now runs INSIDE this same tx, BEFORE the
-            // start-row completion. The delivery loop's start-before-end gate holds a
-            // task's cancel outbox row while its start row is `pending`; the start row
-            // goes non-pending only when THIS tx commits, and that commit now also
-            // contains the cancel actions. So a cancel row concurrently enqueued by a
-            // DELETE/stop_batch that fired while on_start was in flight (the task left
-            // `Claimed`, giving `Ok(false)` below) can never be prefetched by the
-            // delivery loop before its actions exist — the consumer, which received
-            // on_start and started work, will receive the cancel WITH those actions.
-            // `save_cancel_actions` is best-effort on validation (invalid actions are
-            // logged + skipped, never rolling back the transition — the 4.2 decision),
-            // so the tx rolls back only on a genuine DB error.
-            let task_id = task.id;
-            let tx_result: Result<bool, _> =
-                db_operation::run_in_transaction(&mut conn, move |conn| {
-                    let key = idempotency_key;
-                    let cancel_tasks = cancel_tasks;
-                    Box::pin(async move {
-                        let ran = db_operation::mark_task_running(conn, &task_id).await?;
-                        if claimed {
-                            db_operation::save_cancel_actions(conn, task_id, &cancel_tasks).await?;
-                            db_operation::complete_webhook_execution(conn, &key, true).await?;
-                        }
-                        Ok(ran)
-                    })
-                })
-                .await;
-
-            match tx_result {
-                Ok(true) => {
-                    metrics::record_status_transition("Claimed", "Running");
-                    // Scheduler latency: time from task creation to actually running.
-                    let wait_secs = (chrono::Utc::now() - task.created_at)
-                        .num_milliseconds()
-                        .max(0) as f64
-                        / 1000.0;
-                    metrics::record_task_wait(&task.kind, wait_secs);
-                    log::debug!("Start worker: task {} started", task.id);
-                }
-                Ok(false) => {
-                    // Task left `Claimed` during the on_start webhook (canceled, stopped,
-                    // failed, or paused by a concurrent request). The cancel actions were
-                    // still persisted inside the tx above (A4), atomically with the
-                    // start-row completion, so a cancel notification already enqueued by
-                    // the concurrent transition will be delivered WITH them.
-                    log::warn!(
-                        "Start worker: task {} no longer claimed; skipping running transition",
-                        task.id
-                    );
-                }
-                Err(e) => {
-                    // Genuine DB error: the tx rolled back, so the running transition, the
-                    // start-row completion AND the cancel-action save were all undone.
-                    // The task stays `Claimed` with its start row `pending`; the
-                    // requeue-stale path re-picks it, and the start-row freshness bound
-                    // (A2) keeps the gate from blocking end/cancel forever.
-                    log::error!(
-                        "Start worker: failed to commit running transition / start-row \
-                         completion for task {}: {:?}",
-                        task.id,
-                        e
-                    );
-                }
+    // A2 fix: transition Claimed -> Running AND complete the `start` outbox row
+    // in ONE transaction. Previously these were two separate autocommit
+    // statements; a crash (or a swallowed UPDATE error) between them left the
+    // task Running with its `start` row stuck `pending` forever, which the
+    // delivery loop's start-before-end gate then read as "hold end/cancel
+    // forever". Committing them together closes that window on the nominal
+    // path. The start row is completed whenever the on_start webhook was
+    // actually executed (`claimed == true`), even if the running transition
+    // itself is a no-op (task no longer Claimed) — so the row never lingers.
+    //
+    // A4 fix: `save_cancel_actions` now runs INSIDE this same tx, BEFORE the
+    // start-row completion. The delivery loop's start-before-end gate holds a
+    // task's cancel outbox row while its start row is `pending`; the start row
+    // goes non-pending only when THIS tx commits, and that commit now also
+    // contains the cancel actions. So a cancel row concurrently enqueued by a
+    // DELETE/stop_batch that fired while on_start was in flight (the task left
+    // `Claimed`, giving `Ok(false)` below) can never be prefetched by the
+    // delivery loop before its actions exist — the consumer, which received
+    // on_start and started work, will receive the cancel WITH those actions.
+    // `save_cancel_actions` is best-effort on validation (invalid actions are
+    // logged + skipped, never rolling back the transition — the 4.2 decision),
+    // so the tx rolls back only on a genuine DB error.
+    let task_id = task.id;
+    let tx_result: Result<bool, _> = db_operation::run_in_transaction(&mut conn, move |conn| {
+        let key = idempotency_key;
+        let cancel_tasks = cancel_tasks;
+        Box::pin(async move {
+            let ran = db_operation::mark_task_running(conn, &task_id).await?;
+            if claimed {
+                db_operation::save_cancel_actions(conn, task_id, &cancel_tasks).await?;
+                db_operation::complete_webhook_execution(conn, &key, true).await?;
             }
+            Ok(ran)
+        })
+    })
+    .await;
 
-            true
+    match tx_result {
+        Ok(true) => {
+            metrics::record_status_transition("Claimed", "Running");
+            // Scheduler latency: time from task creation to actually running.
+            let wait_secs = (chrono::Utc::now() - task.created_at)
+                .num_milliseconds()
+                .max(0) as f64
+                / 1000.0;
+            metrics::record_task_wait(&task.kind, wait_secs);
+            log::debug!("Start worker: task {} started", task.id);
+        }
+        Ok(false) => {
+            // Task left `Claimed` during the on_start webhook (canceled, stopped,
+            // failed, or paused by a concurrent request). The cancel actions were
+            // still persisted inside the tx above (A4), atomically with the
+            // start-row completion, so a cancel notification already enqueued by
+            // the concurrent transition will be delivered WITH them.
+            log::warn!(
+                "Start worker: task {} no longer claimed; skipping running transition",
+                task.id
+            );
         }
         Err(e) => {
-            // Webhook failed after claim -> mark task as failed,
-            // propagate to children, and fire on_failure webhooks
+            // Genuine DB error: the tx rolled back, so the running transition, the
+            // start-row completion AND the cancel-action save were all undone.
+            // The task stays `Claimed` with its start row `pending`; the
+            // requeue-stale path re-picks it, and the start-row freshness bound
+            // (A2) keeps the gate from blocking end/cancel forever.
             log::error!(
-                "Start worker: on_start webhook failed for task {}: {:?}",
+                "Start worker: failed to commit running transition / start-row \
+                 completion for task {}: {:?}",
                 task.id,
                 e
             );
-            if let Err(e2) = db_operation::fail_task_and_propagate(
-                &mut conn,
-                &task.id,
-                "on_start webhook failed",
-                dead_end_enabled,
-            )
-            .await
-            {
-                log::error!(
-                    "Start worker: failed to mark task {} as failed and propagate: {:?}",
-                    task.id,
-                    e2
-                );
-            }
-            false
         }
+    }
+
+    true
+}
+
+/// Run the on_start-failure path off the HTTP call path (B1): re-acquire a
+/// connection, optionally complete the task's `start` outbox row as failed (only
+/// when the HTTP actions actually ran — matching the pre-split behaviour, which
+/// left the row untouched on a preamble/DB error), then mark the task Failed and
+/// propagate (which also enqueues its on_failure outbox rows).
+async fn fail_started_task(
+    pool: &DbPool,
+    task: &Task,
+    dead_end_enabled: bool,
+    reason: &str,
+    complete_start_false: Option<&str>,
+) {
+    let Ok(mut conn) = pool.get().await else {
+        log::error!(
+            "Start worker: failed to acquire DB connection to fail task {}",
+            task.id
+        );
+        return;
+    };
+    if let Some(key) = complete_start_false {
+        if let Err(e) = db_operation::complete_webhook_execution(&mut conn, key, false).await {
+            log::error!(
+                "Failed to complete webhook execution record for key {}: {}",
+                key,
+                e
+            );
+        }
+    }
+    if let Err(e2) =
+        db_operation::fail_task_and_propagate(&mut conn, &task.id, reason, dead_end_enabled).await
+    {
+        log::error!(
+            "Start worker: failed to mark task {} as failed and propagate: {:?}",
+            task.id,
+            e2
+        );
     }
 }
 
@@ -474,11 +593,23 @@ fn is_prefilter_blocked(task: &Task, ctx: &EvaluationContext) -> bool {
     })
 }
 
-async fn start_task<'a>(
+/// Phase A of on_start processing: the connection-holding preamble (B1).
+///
+/// Claims the `start` outbox slot (idempotency guard), performs the A4 re-check
+/// (the task may have left `Claimed` while waiting for a webhook permit), and loads
+/// the `Start` actions. Runs NO HTTP — the caller drops the connection immediately
+/// after this returns and executes the webhooks (phase B) without a connection held.
+///
+/// Returns `Skip` when no HTTP should run (idempotent conflict, or the A4 re-check
+/// found the task no longer `Claimed`); in both cases the start row is already
+/// completed and phase C only runs `mark_task_running`. Returns `Proceed` with the
+/// actions to execute otherwise. `Err` is a genuine DB error → the caller runs the
+/// on_start-failure path, matching the pre-split behaviour.
+async fn start_task_phase_a<'a>(
     evaluator: &ActionExecutor,
     task: &Task,
     conn: &mut Conn<'a>,
-) -> Result<StartTaskResult, String> {
+) -> Result<StartPhaseA, String> {
     use crate::schema::action::dsl::*;
 
     // Idempotency guard: claim the start trigger slot
@@ -502,10 +633,8 @@ async fn start_task<'a>(
         );
         metrics::record_webhook_idempotent_skip("start");
         metrics::record_webhook_idempotent_conflict();
-        return Ok(StartTaskResult {
-            cancel_tasks: vec![],
+        return Ok(StartPhaseA::Skip {
             idempotency_key: key,
-            claimed: false,
         });
     }
 
@@ -537,10 +666,8 @@ async fn start_task<'a>(
             db_operation::complete_webhook_execution(conn, &key, true)
                 .await
                 .map_err(|e| format!("Failed to complete skipped start row: {}", e))?;
-            return Ok(StartTaskResult {
-                cancel_tasks: vec![],
+            return Ok(StartPhaseA::Skip {
                 idempotency_key: key,
-                claimed: false,
             });
         }
     }
@@ -550,42 +677,9 @@ async fn start_task<'a>(
         .load::<Action>(conn)
         .await
         .map_err(|e| e.to_string())?;
-    let mut tasks = vec![];
-    let mut errors: Vec<String> = Vec::new();
-    for act in actions.iter() {
-        let res = evaluator.execute(act, task, Some(&key)).await;
-        match res {
-            Ok(r) => {
-                if let Some(t) = r {
-                    tasks.push(t);
-                };
-                log::debug!("Action {} executed successfully", act.id);
-            }
-            Err(e) => {
-                log::error!("Action {} failed: {}", act.id, e);
-                errors.push(e);
-            }
-        }
-    }
 
-    let succeeded = errors.is_empty();
-    if !succeeded {
-        if let Err(e) = db_operation::complete_webhook_execution(conn, &key, false).await {
-            log::error!(
-                "Failed to complete webhook execution record for key {}: {}",
-                key,
-                e
-            );
-        }
-        return Err(format!(
-            "one or more on_start actions failed for task {}: {}",
-            task.id,
-            errors.join("; ")
-        ));
-    }
-    Ok(StartTaskResult {
-        cancel_tasks: tasks,
+    Ok(StartPhaseA::Proceed {
         idempotency_key: key,
-        claimed: true,
+        actions,
     })
 }
