@@ -134,6 +134,14 @@ pub async fn get_conn_with_retry<'a>(
                 return Ok(conn);
             }
             Err(e) => {
+                // Record EACH failed acquisition (Audit 2, B7), not just once after
+                // all retries are exhausted. With a 30s pool timeout and 3 retries,
+                // the old "count once at the end" meant a single request's ~90s of
+                // retries produced ONE failure — which could almost never land two
+                // failures inside the 10s counting window, so the breaker never
+                // tripped sequentially. Counting per attempt lets consecutive
+                // failures accumulate within the window and actually open the circuit.
+                circuit_breaker.record_failure();
                 last_error = Some(e);
                 if attempt + 1 < effective_retries {
                     log::warn!(
@@ -147,9 +155,6 @@ pub async fn get_conn_with_retry<'a>(
             }
         }
     }
-
-    // All retries failed - record failure for circuit breaker
-    circuit_breaker.record_failure();
 
     let err = last_error.unwrap();
     log::error!(

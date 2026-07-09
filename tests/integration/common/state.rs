@@ -32,6 +32,7 @@ pub fn test_config() -> Arc<Config> {
             batch_channel_capacity: 100,
             dead_end_cancel_enabled: true,
             start_batch_size: 50,
+            timeout_batch_size: 100,
             webhook_concurrency: 10,
             webhook_delivery_interval: std::time::Duration::from_millis(1000),
             webhook_delivery_batch_size: 50,

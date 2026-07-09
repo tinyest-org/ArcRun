@@ -126,6 +126,7 @@ async fn test_timeout_loop_fires_on_failure_webhook() {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
             true,
+            100,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
         )
@@ -227,6 +228,7 @@ async fn test_recent_batch_update_prevents_timeout() {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
             true,
+            100,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
         )
@@ -299,6 +301,7 @@ async fn test_timeout_propagates_failure_to_children() {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
             true,
+            100,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
         )

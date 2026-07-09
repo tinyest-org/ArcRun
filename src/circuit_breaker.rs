@@ -11,7 +11,7 @@
 //! This implementation is fully lock-free using atomic operations.
 //! The hot path (Closed state) is a single atomic load with no contention.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const STATE_CLOSED: u8 = 0;
@@ -85,6 +85,16 @@ pub struct CircuitBreaker {
     failure_count: AtomicU32,
     /// Success count in half-open state
     half_open_successes: AtomicU32,
+    /// Whether a probe request is currently in flight in HalfOpen. Ensures only
+    /// ONE probe is admitted at a time (all other HalfOpen requests are rejected
+    /// like Open) until the probe's verdict is recorded.
+    probe_in_flight: AtomicBool,
+    /// When the in-flight probe was admitted (epoch millis). A probe whose future
+    /// is dropped before recording a verdict (client disconnect mid-acquire) would
+    /// otherwise leave `probe_in_flight` stuck true and wedge HalfOpen forever —
+    /// after `recovery_timeout` a new probe may take over the slot (see
+    /// `try_admit_probe`).
+    probe_started_at: AtomicU64,
     /// Timestamp when failure window started (as epoch millis)
     window_start: AtomicU64,
     /// Timestamp when circuit opened (as epoch millis)
@@ -102,6 +112,8 @@ impl CircuitBreaker {
             state: AtomicU8::new(STATE_CLOSED),
             failure_count: AtomicU32::new(0),
             half_open_successes: AtomicU32::new(0),
+            probe_in_flight: AtomicBool::new(false),
+            probe_started_at: AtomicU64::new(0),
             window_start: AtomicU64::new(0),
             opened_at: AtomicU64::new(0),
             epoch,
@@ -155,20 +167,58 @@ impl CircuitBreaker {
                     {
                         log::info!("Circuit breaker transitioning from Open to HalfOpen");
                         self.half_open_successes.store(0, Ordering::Relaxed);
+                        // Fresh probe slot for this HalfOpen window.
+                        self.probe_in_flight.store(false, Ordering::Relaxed);
                         crate::metrics::record_circuit_breaker_state("half_open");
                     }
-                    // Even if CAS failed, another thread transitioned it — allow through
-                    Ok(())
+                    // Now in HalfOpen (whether we or another thread transitioned it):
+                    // admit at most ONE probe; reject all other requests as Open.
+                    self.try_admit_probe()
                 } else {
                     Err(State::Open)
                 }
             }
-            STATE_HALF_OPEN => {
-                // Allow the request through for probing
-                Ok(())
-            }
+            STATE_HALF_OPEN => self.try_admit_probe(),
             _ => Ok(()),
         }
+    }
+
+    /// Admit a single probe in HalfOpen: the first caller to flip `probe_in_flight`
+    /// from false to true is allowed through; concurrent/subsequent callers are
+    /// rejected as Open until the probe's verdict is recorded.
+    ///
+    /// **Stale-probe takeover**: a probe that never records a verdict (its future
+    /// was dropped between `check()` and the record call — e.g. the client
+    /// disconnected while the acquire was pending, exactly the load pattern that
+    /// puts the breaker in HalfOpen) must not wedge the slot forever. If the
+    /// in-flight probe is older than `recovery_timeout`, the next caller takes the
+    /// slot over (CAS on the admission timestamp so exactly one taker wins).
+    fn try_admit_probe(&self) -> Result<(), State> {
+        let now = self.now_millis();
+        if self
+            .probe_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.probe_started_at.store(now, Ordering::Relaxed);
+            return Ok(());
+        }
+        // Slot taken — is the holder stale (verdict never recorded)?
+        let started = self.probe_started_at.load(Ordering::Relaxed);
+        if now.saturating_sub(started) > self.config.recovery_timeout.as_millis() as u64
+            && self
+                .probe_started_at
+                .compare_exchange(started, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            log::warn!(
+                "Circuit breaker: half-open probe never recorded a verdict for {:?}; \
+                 admitting a replacement probe",
+                self.config.recovery_timeout
+            );
+            return Ok(());
+        }
+        Err(State::Open)
     }
 
     /// Record a successful operation
@@ -198,6 +248,11 @@ impl CircuitBreaker {
                         .store(self.now_millis(), Ordering::Relaxed);
                     crate::metrics::record_circuit_breaker_state("closed");
                 }
+            } else {
+                // Not enough probes yet (success_threshold > 1). Release the probe
+                // slot so the NEXT request becomes the next probe — probes are
+                // admitted strictly one at a time.
+                self.probe_in_flight.store(false, Ordering::Relaxed);
             }
         }
         // Closed or Open: nothing to do
@@ -388,6 +443,154 @@ mod tests {
         // Failure in half-open returns to open
         cb.record_failure();
         assert_eq!(cb.state(), State::Open);
+    }
+
+    /// Audit 2, B7 (a): several failures inside the counting window trip the
+    /// breaker. Mirrors what `get_conn_with_retry` now produces by recording a
+    /// failure per failed acquisition attempt (rather than once after all retries).
+    #[test]
+    fn test_consecutive_failures_within_window_open() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            failure_window: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::new(config);
+
+        // Three rapid failures (as if from one request's three retry attempts, or
+        // three requests) all land inside the 10s window and open the circuit.
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), State::Closed);
+        cb.record_failure();
+        assert_eq!(cb.state(), State::Open);
+    }
+
+    /// Audit 2, B7 (b): in HalfOpen only ONE probe is admitted. The first request
+    /// passes; a second is rejected (as Open) while the probe is unresolved. A
+    /// successful probe (threshold 1) closes the circuit.
+    #[test]
+    fn test_half_open_admits_single_probe_then_closes_on_success() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            recovery_timeout: Duration::from_millis(1),
+            success_threshold: 1,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::new(config);
+
+        // Trip and wait out the recovery timeout.
+        cb.record_failure();
+        assert_eq!(cb.state(), State::Open);
+        std::thread::sleep(Duration::from_millis(5));
+
+        // First request in HalfOpen is admitted as the probe.
+        assert!(cb.check().is_ok());
+        assert_eq!(cb.state(), State::HalfOpen);
+
+        // Second request while the probe is unresolved is rejected as Open.
+        let second = cb.check();
+        assert!(second.is_err());
+        assert_eq!(second.unwrap_err(), State::Open);
+        // Still HalfOpen — the rejection did not change state.
+        assert_eq!(cb.state(), State::HalfOpen);
+
+        // Probe verdict = success -> Closed.
+        cb.record_success();
+        assert_eq!(cb.state(), State::Closed);
+    }
+
+    /// Audit 2, B7 (b): a failed probe returns to Open, and extra HalfOpen requests
+    /// were rejected while it was in flight.
+    #[test]
+    fn test_half_open_single_probe_failure_reopens() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            recovery_timeout: Duration::from_millis(1),
+            success_threshold: 1,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::new(config);
+
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Probe admitted, extra request rejected.
+        assert!(cb.check().is_ok());
+        assert!(cb.check().is_err());
+
+        // Probe verdict = failure -> back to Open.
+        cb.record_failure();
+        assert_eq!(cb.state(), State::Open);
+    }
+
+    /// Audit 2, B7 (b): with success_threshold > 1, probes are admitted strictly
+    /// one at a time — a partial success releases the slot for the next probe.
+    #[test]
+    fn test_half_open_probes_are_serial_with_threshold_two() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            recovery_timeout: Duration::from_millis(1),
+            success_threshold: 2,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::new(config);
+
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Probe #1 admitted; a concurrent request is rejected.
+        assert!(cb.check().is_ok());
+        assert!(cb.check().is_err());
+        assert_eq!(cb.state(), State::HalfOpen);
+
+        // Partial success (1 of 2): stays HalfOpen, releases the slot.
+        cb.record_success();
+        assert_eq!(cb.state(), State::HalfOpen);
+
+        // Probe #2 is now admitted; another concurrent request is still rejected.
+        assert!(cb.check().is_ok());
+        assert!(cb.check().is_err());
+
+        // Second success reaches the threshold -> Closed.
+        cb.record_success();
+        assert_eq!(cb.state(), State::Closed);
+    }
+
+    /// Review hardening of B7 (b): a probe whose future is dropped WITHOUT recording
+    /// a verdict (client disconnect between `check()` and the record call) must not
+    /// wedge HalfOpen forever. After `recovery_timeout`, a new probe takes over the
+    /// slot; before that, requests are still rejected (single-probe invariant).
+    #[test]
+    fn test_half_open_stale_probe_is_taken_over() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            recovery_timeout: Duration::from_millis(10),
+            success_threshold: 1,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::new(config);
+
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(15));
+
+        // Probe admitted... and its caller vanishes without a verdict.
+        assert!(cb.check().is_ok());
+        // Immediately after: still rejected (probe not stale yet).
+        assert!(cb.check().is_err());
+
+        // Once the probe is older than recovery_timeout, a replacement is admitted.
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(
+            cb.check().is_ok(),
+            "a stale (never-resolved) probe must be taken over, not wedge HalfOpen"
+        );
+        // And the single-probe invariant holds for the replacement too.
+        assert!(cb.check().is_err());
+
+        // The replacement's verdict works as usual.
+        cb.record_success();
+        assert_eq!(cb.state(), State::Closed);
     }
 
     #[test]

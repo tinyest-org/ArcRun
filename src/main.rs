@@ -326,6 +326,7 @@ fn spawn_workers(
         let interval = config.worker.timeout_check_interval;
         let claim_timeout = config.worker.claim_timeout;
         let dead_end_enabled = config.worker.dead_end_cancel_enabled;
+        let timeout_batch_size = config.worker.timeout_batch_size;
         let shutdown = shutdown_rx.clone();
         let nudges = nudges.clone();
         actix_web::rt::spawn(async move {
@@ -334,6 +335,7 @@ fn spawn_workers(
                 interval,
                 claim_timeout,
                 dead_end_enabled,
+                timeout_batch_size,
                 shutdown,
                 nudges,
             )

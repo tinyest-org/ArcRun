@@ -48,6 +48,7 @@ async fn test_stale_claimed_task_requeued_to_pending() {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30), // claim_timeout
             true,
+            100,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
         )
@@ -98,6 +99,7 @@ async fn test_recently_claimed_task_not_requeued() {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
             true,
+            100,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
         )
@@ -156,6 +158,7 @@ async fn test_requeued_task_picked_up_by_start_loop() {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
             true,
+            100,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
         )

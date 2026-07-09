@@ -43,11 +43,19 @@ pub(crate) async fn count_running_tasks_by_kind<'a>(
     Ok(rows.into_iter().map(|r| (r.label, r.count)).collect())
 }
 
-/// Find all Running tasks that have exceeded their timeout (based on `last_updated`).
-/// Returns matching task IDs without modifying them — callers should use
-/// `timeout_task_and_propagate` to atomically mark each as failed and propagate.
+/// Find up to `limit` Running tasks that have exceeded their timeout (based on
+/// `last_updated`). Returns matching task IDs without modifying them — callers
+/// should use `timeout_task_and_propagate` to atomically mark each as failed and
+/// propagate.
+///
+/// Bounded by `limit` (Audit 2, B7): a mass-timeout of thousands of tasks would
+/// otherwise pin the timeout loop for a long time in one pass, delaying the stale
+/// Claimed requeue that shares the loop. The caller drains in bounded passes.
+/// Ordered oldest-first (`last_updated ASC`) so the most overdue tasks are handled
+/// first and each drain pass makes deterministic progress.
 pub(crate) async fn find_timed_out_tasks<'a>(
     conn: &mut Conn<'a>,
+    limit: i64,
 ) -> Result<Vec<uuid::Uuid>, DbError> {
     use {
         crate::schema::task::dsl::*,
@@ -62,6 +70,8 @@ pub(crate) async fn find_timed_out_tasks<'a>(
                     - (PgInterval::from_microseconds(1_000_000).into_sql::<sql_types::Interval>()
                         * timeout))),
         )
+        .order(last_updated.asc())
+        .limit(limit)
         .select(id)
         .get_results::<uuid::Uuid>(conn)
         .await?;
@@ -155,11 +165,15 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
 }
 
 /// Requeue Claimed tasks that never started within the claim timeout.
-/// Returns the tasks moved back to Pending.
+/// Returns the ids of the tasks moved back to Pending.
+///
+/// Targeted RETURNING (Audit 2, B7): the only caller (`timeout_loop`) consumes
+/// just the count and the ids for logging/metrics, so we RETURN `id` alone
+/// instead of the full (JSONB-carrying) row.
 pub(crate) async fn requeue_stale_claimed_tasks<'a>(
     conn: &mut Conn<'a>,
     claim_timeout: std::time::Duration,
-) -> Result<Vec<Task>, DbError> {
+) -> Result<Vec<uuid::Uuid>, DbError> {
     use {
         crate::schema::task::dsl::*,
         diesel::{dsl::now, pg::data_types::PgInterval},
@@ -176,8 +190,8 @@ pub(crate) async fn requeue_stale_claimed_tasks<'a>(
         ),
     )
     .set((status.eq(models::StatusKind::Pending), last_updated.eq(now)))
-    .returning(Task::as_returning())
-    .get_results::<Task>(conn)
+    .returning(id)
+    .get_results::<uuid::Uuid>(conn)
     .await?;
 
     Ok(updated)
@@ -288,7 +302,12 @@ pub(crate) async fn list_task_filtered_paged<'a>(
         query = query.filter(timeout.eq(t));
     }
 
-    let result = query.load::<models::Task>(conn).await?;
+    // Targeted projection (Audit 2, B7): BasicTaskDto carries none of the heavy
+    // JSONB columns, so select only the light columns instead of the full row.
+    let result = query
+        .select(dtos::BasicTaskRow::as_select())
+        .load::<dtos::BasicTaskRow>(conn)
+        .await?;
 
     let tasks: Vec<dtos::BasicTaskDto> = result.into_iter().map(dtos::BasicTaskDto::from).collect();
 
@@ -303,11 +322,13 @@ pub(crate) async fn get_dag_for_batch<'a>(
     use crate::schema::link::dsl::link;
     use crate::schema::task::dsl::*;
 
-    // Get all tasks in the batch
+    // Get all tasks in the batch. Targeted projection (Audit 2, B7): the DAG
+    // response is BasicTaskDto, which carries none of the heavy JSONB columns.
     let tasks_result = task
         .filter(batch_id.eq(bid))
         .order((created_at.asc(), id.asc()))
-        .load::<models::Task>(conn)
+        .select(dtos::BasicTaskRow::as_select())
+        .load::<dtos::BasicTaskRow>(conn)
         .await?;
 
     let task_ids: Vec<Uuid> = tasks_result.iter().map(|t| t.id).collect();

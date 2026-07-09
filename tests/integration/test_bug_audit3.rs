@@ -4104,3 +4104,287 @@ async fn test_audit2_b2_heartbeat_prevents_requeue_during_permit_wait() {
         "both on_start webhooks must have fired (no requeue churn)"
     );
 }
+
+// =============================================================================
+// Audit 2, item 6.6b (B6/B7) — dead-index drop, index tiebreaker, timeout drain,
+// and probe timeout regressions.
+// =============================================================================
+
+#[derive(diesel::QueryableByName)]
+struct B6bPlanText {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    plan: String,
+}
+
+/// EXPLAIN an arbitrary read-only SQL statement and return its plan text.
+///
+/// EXPLAIN's output column is literally `QUERY PLAN` (a space diesel cannot bind
+/// by name), so the statement is wrapped in a temp plpgsql function whose
+/// SETOF-text result is aliased to `plan` and aggregated into one string — same
+/// trick as the B3 probe helper. `disable_seqscan` forces the planner to prefer
+/// a usable index (a tiny test relation is otherwise cheapest to seqscan).
+async fn b6b_explain_plan(pool: &arcrun::DbPool, query_sql: &str, disable_seqscan: bool) -> String {
+    use diesel_async::RunQueryDsl;
+    let mut conn = pool.get().await.unwrap();
+
+    diesel::sql_query(if disable_seqscan {
+        "SET enable_seqscan = off"
+    } else {
+        "SET enable_seqscan = on"
+    })
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let create = format!(
+        "CREATE OR REPLACE FUNCTION pg_temp.b6b_explain() RETURNS SETOF text AS $$ \
+         BEGIN RETURN QUERY EXECUTE 'EXPLAIN (FORMAT TEXT) {}'; END $$ LANGUAGE plpgsql;",
+        query_sql.replace('\'', "''")
+    );
+    diesel::sql_query(create).execute(&mut conn).await.unwrap();
+
+    let rows: Vec<B6bPlanText> = diesel::sql_query(
+        "SELECT string_agg(line, E'\n') AS plan FROM pg_temp.b6b_explain() AS t(line)",
+    )
+    .get_results(&mut conn)
+    .await
+    .unwrap();
+
+    let _ = diesel::sql_query("RESET enable_seqscan")
+        .execute(&mut conn)
+        .await;
+
+    rows.into_iter().next().map(|r| r.plan).unwrap_or_default()
+}
+
+/// B7 — after dropping the redundant `idx_action_task_id`, an action lookup by
+/// `task_id` is still index-served, by the composite `idx_action_task_id_trigger`
+/// (task_id is its leading column). Guards that the drop did not force a seqscan
+/// on the hot `action` table.
+#[tokio::test]
+async fn test_audit2_b6b_action_by_task_id_uses_composite_index() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // Each task_json carries an on_start webhook => one `action` row per task.
+    let created = create_tasks_ok(
+        &app,
+        &[
+            task_json("b6b-a-1", "B6b action 1", "b6b"),
+            task_json("b6b-a-2", "B6b action 2", "b6b"),
+            task_json("b6b-a-3", "B6b action 3", "b6b"),
+        ],
+    )
+    .await;
+    let task_id = created[0].id;
+
+    {
+        use diesel_async::RunQueryDsl;
+        let mut conn = state.pool.get().await.unwrap();
+        diesel::sql_query("ANALYZE action")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // The task_id-only lookup (the case the dropped single-column index used to
+    // serve) must now be served by the composite index via its leading column.
+    let sql = format!("SELECT id FROM action WHERE task_id = '{}'::uuid", task_id);
+    let plan = b6b_explain_plan(&state.pool, &sql, true).await;
+    assert!(
+        plan.contains("idx_action_task_id_trigger"),
+        "action lookup by task_id must be served by idx_action_task_id_trigger \
+         after idx_action_task_id was dropped; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan"),
+        "action lookup by task_id must not fall back to a seqscan; plan was:\n{plan}"
+    );
+}
+
+/// B7 — with the `id` tiebreaker added to `idx_task_priority`, the start_loop
+/// Pending scan (ORDER BY priority DESC, created_at ASC, id ASC) is a pure Index
+/// Scan with NO Incremental Sort node. The pre-fix index (without `id`) forced an
+/// Incremental Sort on every keyset page.
+#[tokio::test]
+async fn test_audit2_b6b_pending_scan_no_incremental_sort() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // A handful of Pending tasks so the index has live entries.
+    create_tasks_ok(
+        &app,
+        &[
+            task_json("b6b-p-1", "B6b pending 1", "b6b"),
+            task_json("b6b-p-2", "B6b pending 2", "b6b"),
+            task_json("b6b-p-3", "B6b pending 3", "b6b"),
+            task_json("b6b-p-4", "B6b pending 4", "b6b"),
+        ],
+    )
+    .await;
+
+    {
+        use diesel_async::RunQueryDsl;
+        let mut conn = state.pool.get().await.unwrap();
+        diesel::sql_query("ANALYZE task")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // Byte-for-byte the ordering of list_pending_page.
+    let sql = "SELECT id FROM task WHERE status = 'pending' \
+               ORDER BY priority DESC, created_at ASC, id ASC LIMIT 500";
+    let plan = b6b_explain_plan(&state.pool, sql, true).await;
+
+    assert!(
+        plan.contains("idx_task_priority"),
+        "the Pending claim scan must be served by idx_task_priority; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Incremental Sort") && !plan.contains("Sort Key"),
+        "the Pending claim scan must not need a Sort/Incremental Sort node once the \
+         index carries the id tiebreaker; plan was:\n{plan}"
+    );
+}
+
+/// B7 — the timeout loop drains a mass-timeout in bounded passes: with a small
+/// `timeout_batch_size`, more tasks than one batch still all get timed out within
+/// a single loop iteration (the drain re-fetches until exhausted).
+#[tokio::test]
+async fn test_audit2_b6b_timeout_loop_drains_more_than_batch() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // 15 tasks, timeout=1s each.
+    let mut payloads = Vec::new();
+    for i in 0..15 {
+        payloads.push(json!({
+            "id": format!("b6b-to-{}", i),
+            "name": format!("B6b timeout {}", i),
+            "kind": "b6b-timeout",
+            "timeout": 1,
+            "metadata": {"test": true},
+            "on_start": webhook_action()
+        }));
+    }
+    let created = create_tasks_ok(&app, &payloads).await;
+    let ids: Vec<uuid::Uuid> = created.iter().map(|t| t.id).collect();
+
+    // Force all to Running with last_updated well in the past so they are overdue.
+    {
+        use diesel::sql_query;
+        use diesel::sql_types::Timestamptz;
+        use diesel_async::RunQueryDsl;
+        let mut conn = state.pool.get().await.unwrap();
+        let past = chrono::Utc::now() - chrono::Duration::seconds(120);
+        sql_query(
+            "UPDATE task SET status = 'running', started_at = $1, last_updated = $1 \
+             WHERE kind = 'b6b-timeout'",
+        )
+        .bind::<Timestamptz, _>(past)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    // Run the loop with a deliberately tiny batch size (5) so 15 tasks require a
+    // multi-pass drain within a single iteration.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let pool = state.pool.clone();
+    let handle = tokio::spawn(async move {
+        arcrun::workers::timeout_loop(
+            pool,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(30),
+            false,
+            5,
+            shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
+        )
+        .await;
+    });
+
+    // Poll until all are Failure (or bail out).
+    let mut all_failed = false;
+    for _ in 0..40 {
+        let mut n = 0;
+        for &id in &ids {
+            let t = get_task_ok(&app, id).await;
+            if t.status == StatusKind::Failure {
+                n += 1;
+            }
+        }
+        if n == ids.len() {
+            all_failed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+
+    assert!(
+        all_failed,
+        "all 15 timed-out tasks must be Failure after the bounded drain (batch size 5)"
+    );
+}
+
+/// B7 — probe endpoints answer fast under pool exhaustion (bounded acquire, no 30s
+/// hang): `/ready` returns 503 (shed traffic), `/health` returns 200 degraded
+/// (liveness must not restart the pod). A pool of size 1 with its only connection
+/// held out makes every probe acquisition block until the short probe timeout.
+#[tokio::test]
+async fn test_audit2_b6b_probes_fast_under_pool_exhaustion() {
+    let test_app = setup_test_db_with_pool_size(1).await;
+    let state = create_test_state(test_app.pool.clone());
+    let app = test_service!(state);
+
+    // Hold the pool's only connection so every probe acquisition blocks.
+    let _held = state.pool.get().await.unwrap();
+
+    // /ready must return 503 quickly (well under the pool's 30s connection timeout).
+    let start = std::time::Instant::now();
+    let req = actix_web::test::TestRequest::get()
+        .uri("/ready")
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    let elapsed = start.elapsed();
+    assert_eq!(
+        resp.status(),
+        actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+        "/ready must be 503 when the pool is exhausted"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "/ready must answer fast (bounded acquire), took {:?}",
+        elapsed
+    );
+
+    // /health must return 200 quickly with a degraded body (liveness stays up).
+    let start = std::time::Instant::now();
+    let req = actix_web::test::TestRequest::get()
+        .uri("/health")
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    let elapsed = start.elapsed();
+    assert_eq!(
+        resp.status(),
+        actix_web::http::StatusCode::OK,
+        "/health must be 200 even under pool exhaustion (liveness must not restart the pod)"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "/health must answer fast (bounded acquire), took {:?}",
+        elapsed
+    );
+
+    let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+    assert_eq!(
+        body["status"], "degraded",
+        "/health body must report degraded under pool exhaustion; got {body}"
+    );
+
+    drop(_held);
+}

@@ -6,12 +6,15 @@ Contexte de reprise pour la prochaine session.
 
 **Avancement au 2026-07-09** : **Lots 4 et 5 terminés** — Lot 4 (4.1 → 4.8,
 dernier commit 01d034f) ; Lot 5 : 5.1 (A5 SSRF, 36b6f7a), 5.2 (A6 auth,
-c3bee32), 5.3 (A10 limites, eaf67f6). **Lot 6 en cours** : 6.1 (B1, phases
-A/B/C, 1623934), 6.2 (B3, index partiel + lock batch, bd64090), 6.3 (B5,
-cascade par frontière — bug de multiplicité des décréments attrapé en
-relecture) faits ; suivant 6.4 (B4, wake-ups `tokio::sync::Notify`), puis
-6.5 (B2, après 6.1) et 6.6 (B6/B7, découpable). Détail et notes de
-relecture par item dans `docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
+c3bee32), 5.3 (A10 limites, eaf67f6). **Lot 6 TERMINÉ** : 6.1 (B1, 1623934),
+6.2 (B3, bd64090), 6.3 (B5, aac34c0), 6.4 (B4, 395b9a2), 6.5 (B2, 21f38bc),
+6.6a (B6/B7, ceb6ea3), 6.6b (index morts + idx_task_priority + selects
+ciblés + timeout_loop borné + probes 2 s + circuit breaker opérant).
+**La campagne non-breaking (Lots 4/5/6) est CLOSE.** Il ne reste que le
+Lot 7 (breaking : API v1/HMAC handle, batch.remaining, rule_slot,
+GET /work, split outbox) — sur décision explicite de l'utilisateur, hors
+boucle. Détail et notes de relecture par item dans
+`docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
 Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7) ; renversement
 assumé du commit 2e50620 en 4.4 (compteurs terminaux gelés) ; HMAC du `?handle=`
 → Lot 7 (5.2) ; auth non-breaking (token absent ⇒ ouvert + warn release, 5.2) ;

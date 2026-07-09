@@ -196,6 +196,52 @@ pub struct BasicTaskDto {
     pub priority: i32,
 }
 
+/// Targeted `SELECT` projection for building a [`BasicTaskDto`] (Audit 2, B7).
+///
+/// Listings and `get_dag_for_batch` produce `BasicTaskDto`s, which carry none of
+/// the heavy JSONB columns (`metadata`, `start_condition` — up to 64 KiB each).
+/// Selecting the full `task` row over-fetched those blobs on every listed/DAG
+/// row for nothing. This struct selects only the columns `BasicTaskDto` actually
+/// consumes, so the query never reads the JSONB columns off disk.
+#[derive(diesel::prelude::Queryable, diesel::prelude::Selectable)]
+#[diesel(table_name = crate::schema::task)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct BasicTaskRow {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub kind: String,
+    pub status: StatusKind,
+    pub created_at: chrono::DateTime<Utc>,
+    pub started_at: Option<chrono::DateTime<Utc>>,
+    pub success: i32,
+    pub failures: i32,
+    pub expected_count: Option<i32>,
+    pub ended_at: Option<chrono::DateTime<Utc>>,
+    pub batch_id: Option<uuid::Uuid>,
+    pub dead_end_barrier: bool,
+    pub priority: i32,
+}
+
+impl From<BasicTaskRow> for BasicTaskDto {
+    fn from(t: BasicTaskRow) -> Self {
+        Self {
+            id: t.id,
+            name: t.name,
+            kind: t.kind,
+            status: t.status,
+            created_at: t.created_at,
+            started_at: t.started_at,
+            success: t.success,
+            failures: t.failures,
+            expected_count: t.expected_count,
+            ended_at: t.ended_at,
+            batch_id: t.batch_id,
+            dead_end_barrier: t.dead_end_barrier,
+            priority: t.priority,
+        }
+    }
+}
+
 /// Payload for updating a task. Used by both `PATCH /task/{id}` (status update) and `PUT /task/{id}` (counter update).
 ///
 /// ## For PATCH (status update):

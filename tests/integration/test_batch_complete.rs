@@ -419,6 +419,7 @@ async fn test_batch_complete_via_timeout() {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(30),
             true,
+            100,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
         )

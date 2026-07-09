@@ -83,10 +83,12 @@ There are five background workers (spawned in `src/main.rs::spawn_workers`): `st
 5. On webhook failure: marks task as Failed, propagates to children, enqueues on_failure outbox rows (in-tx)
 
 **Timeout Loop** (`timeout_loop`, `src/workers/timeout_loop.rs`):
-1. Finds `Running` tasks where `last_updated < now - timeout` (in seconds)
-2. Marks them as `Failure` with reason "Timeout"
+0. **Requeues stale `Claimed` tasks first**, once per iteration, before the timeout drain — so a mass-timeout can never starve the requeue.
+1. Finds up to `WORKER_TIMEOUT_BATCH_SIZE` (default 100) `Running` tasks where `last_updated < now - timeout` (in seconds), oldest-first (**bounded per pass**, Audit 2, B7)
+2. Marks them as `Failure` with reason "Timeout" (one tx per task)
 3. Propagates failure to dependent children
 4. Enqueues on_failure outbox rows (in the same transaction)
+5. **Bounded drain**: if a pass returned a full batch there may be more, so it re-fetches immediately (no tick wait) until a short pass or a safety cap of `MAX_TIMEOUT_DRAIN_PASSES` (50) is hit — a mass-timeout of thousands of tasks no longer pins the loop for minutes and delays the stale-Claimed requeue.
 
 **Delivery Loop** (`delivery_loop`, `src/workers/delivery_loop.rs`) — the webhook outbox drainer. `run_delivery_once` runs in **four phases** instead of one long transaction (so HTTP never holds a lock or a connection, and deliveries within a batch run in parallel):
 1. **Claim (short tx, lease).** `claim_due_outbox_leased` selects mature `pending` end/cancel/batch_complete rows (`next_attempt_at <= now()`, `FOR UPDATE SKIP LOCKED`, gated so an `end`/`cancel` row waits until the task's `start` row is no longer `pending` — per-task ordering, **bounded by freshness**: the gate only holds while the pending `start` row's `updated_at > now() - WORKER_CLAIM_TIMEOUT_SECS` (passed as `start_stale_secs`), so a start row that never completes eventually stops blocking end/cancel — Audit 2, A2) AND pushes their `next_attempt_at = now() + WEBHOOK_DELIVERY_LEASE_SECS` in one `UPDATE … FROM (SELECT … FOR UPDATE SKIP LOCKED) … RETURNING` statement, then commits. The **lease** is a soft lock: a concurrent worker / next iteration won't re-claim a leased row; on crash mid-delivery the lease expires and the row matures again (at-least-once). The lease does **not** bump `attempts`.
@@ -108,7 +110,7 @@ Exposed as `run_delivery_once` for deterministic test driving (signature unchang
 ### HTTP Handlers (`src/handlers.rs`)
 All HTTP handler functions and route configuration:
 - `configure_routes` - Registers all routes on the Actix `ServiceConfig`
-- `health_check` / `readiness_check` - Health and readiness probes
+- `health_check` / `readiness_check` - Health and readiness probes. Both acquire a connection under a short 2s bound (Audit 2, B7 — never the pool's 30s `connection_timeout`, which would hang the kubelet under pool exhaustion). **`/health` (liveness) always returns 200** — a healthy body when the DB is reachable, a `degraded` body when the pool is saturated/unreachable (a restart cannot fix that, so liveness must not kill the pod). **`/ready` (readiness) returns 503** on acquire failure/timeout — the correct signal to remove the pod from the load balancer without restarting it.
 - `add_task` - POST /task (batch create)
 - `get_task` - GET /task/{task_id}
 - `list_task` - GET /task (filtered, paginated). A malformed `?metadata=` filter is a **400** (A10) — not silently ignored (which used to return every task).
@@ -341,12 +343,21 @@ idx_webhook_execution_task_id ON webhook_execution(task_id)
 idx_webhook_execution_status ON webhook_execution(status)
 idx_webhook_execution_pending_due ON webhook_execution(next_attempt_at) WHERE status = 'pending'
 idx_webhook_execution_batch_id ON webhook_execution(batch_id) WHERE batch_id IS NOT NULL
-idx_task_priority ON task(status, priority DESC, created_at ASC)
+idx_task_priority ON task(status, priority DESC, created_at ASC, id ASC)
+  -- the trailing `id ASC` (Audit 2, B7) matches the start_loop keyset ORDER BY exactly
+  --   (priority DESC, created_at ASC, id ASC), so the Pending claim scan is a pure Index
+  --   Scan with no Incremental Sort node per page.
+idx_action_task_id_trigger ON action(task_id, trigger)
+  -- serves both `WHERE task_id = $ AND trigger = $` and task_id-only lookups (leading column)
 idx_task_batch_active ON task(batch_id) WHERE status NOT IN ('success','failure','canceled')
   -- partial index (Audit 2, B3): makes the batch-complete NOT EXISTS probe O(1) as a
   --   batch drains (contains only still-active rows), instead of O(N) over all terminal rows
 idx_batch_scope ON batch(scope) WHERE scope IS NOT NULL
 idx_batch_metadata_gin ON batch USING GIN(metadata)
+-- Dropped as dead/redundant (Audit 2, B7): idx_action_task_id (prefix of
+--   idx_action_task_id_trigger), idx_action_trigger (no query filters trigger alone),
+--   idx_task_kind (every kind predicate is paired with status → idx_task_status_kind,
+--   or is a substring LIKE that no b-tree can serve).
 ```
 
 ## Metrics
@@ -382,6 +393,7 @@ All configuration is via environment variables (loaded in `src/config.rs`):
 - `PAGINATION_MAX` (default: 100) - Max items per page
 - `WORKER_LOOP_INTERVAL_MS` (default: 1000) - Worker loop interval
 - `WORKER_START_BATCH_SIZE` (default: 50) - Max claims per start_loop iteration (claim cap). The Pending backlog is scanned page-by-page via keyset pagination (internal page size ~500) so the full backlog stays visible; only the number of claims per iteration is capped, never visibility. Early stop only fires once this cap is reached.
+- `WORKER_TIMEOUT_BATCH_SIZE` (default: 100, must be > 0) - Max timed-out `Running` tasks processed per timeout_loop pass (Audit 2, B7). The loop drains in bounded passes (up to `MAX_TIMEOUT_DRAIN_PASSES` = 50 per iteration) so a mass-timeout never pins the loop and starves the stale-`Claimed` requeue that shares it.
 - `WORKER_WEBHOOK_CONCURRENCY` (default: 10) - Max concurrent on_start webhook executions (should not exceed `POOL_MAX_SIZE`)
 - `WEBHOOK_DELIVERY_INTERVAL_MS` (default: 1000) - Interval between webhook delivery-loop iterations (outbox drain)
 - `WEBHOOK_DELIVERY_BATCH_SIZE` (default: 50) - Max outbox rows claimed per delivery-loop iteration

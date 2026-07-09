@@ -133,6 +133,11 @@ pub struct WorkerConfig {
     /// Maximum number of Pending tasks to fetch per start_loop iteration
     pub start_batch_size: i64,
 
+    /// Maximum number of timed-out Running tasks processed per timeout_loop pass.
+    /// The loop drains in bounded passes so a mass-timeout never pins the loop and
+    /// delays the stale-Claimed requeue that shares it.
+    pub timeout_batch_size: i64,
+
     /// Maximum number of concurrent webhook executions in start_loop
     pub webhook_concurrency: usize,
 
@@ -279,6 +284,7 @@ impl Default for WorkerConfig {
             batch_channel_capacity: 100,
             dead_end_cancel_enabled: true,
             start_batch_size: 50,
+            timeout_batch_size: 100,
             webhook_concurrency: 10,
             webhook_delivery_interval: Duration::from_millis(1000),
             webhook_delivery_batch_size: 50,
@@ -439,6 +445,7 @@ impl Config {
             batch_channel_capacity: parse_env_or("BATCH_CHANNEL_CAPACITY", 100)?,
             dead_end_cancel_enabled: parse_env_or("DEAD_END_CANCEL_ENABLED", 1)? != 0,
             start_batch_size: parse_env_or("WORKER_START_BATCH_SIZE", 50)?,
+            timeout_batch_size: parse_env_or("WORKER_TIMEOUT_BATCH_SIZE", 100)?,
             webhook_concurrency: parse_env_or("WORKER_WEBHOOK_CONCURRENCY", 10)?,
             webhook_delivery_interval: Duration::from_millis(parse_env_or(
                 "WEBHOOK_DELIVERY_INTERVAL_MS",
@@ -604,6 +611,15 @@ impl Config {
         if self.worker.start_batch_size <= 0 {
             return Err(ConfigError {
                 field: "WORKER_START_BATCH_SIZE".to_string(),
+                message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        // A non-positive limit would make the timeout drain fetch 0 rows and never
+        // time anything out; reject 0 and negatives.
+        if self.worker.timeout_batch_size <= 0 {
+            return Err(ConfigError {
+                field: "WORKER_TIMEOUT_BATCH_SIZE".to_string(),
                 message: "Must be greater than 0".to_string(),
             });
         }
