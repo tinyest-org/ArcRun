@@ -24,6 +24,11 @@ pub struct BatchSummaryDto {
     pub scope: Option<String>,
     /// Structured metadata attached to the batch (`{}` when none was set).
     pub metadata: serde_json::Value,
+    /// Number of tasks not yet terminal, from the denormalized `batch.remaining`
+    /// counter (Audit 2, D2). `0` means the batch is complete. `null` for batches
+    /// that have no `batch` row (no on_batch_complete / scope / metadata was set —
+    /// such batches are tracked only via `task.batch_id`, so no counter exists).
+    pub remaining: Option<i32>,
 }
 
 /// Per-status task counts within a batch.

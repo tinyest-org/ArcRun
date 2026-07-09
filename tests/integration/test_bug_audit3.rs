@@ -3195,14 +3195,21 @@ async fn test_audit2_b1_flow_unchanged_after_phase_split() {
 //      (`on_complete <> '[]'::jsonb`): a no-webhook batch no longer matches, so the
 //      `SELECT ... FOR UPDATE` returns no row, takes no lock, and early-returns.
 //
-// # What these tests assert
-//   * The probe's EXPLAIN plan qualifies `idx_task_batch_active` (with seqscan
-//     disabled, which is required on a tiny test table — see the documented limit).
+// # SUPERSEDED BY D2 (batch.remaining counter)
+// D2 replaced the probe + `batch` row lock entirely with a denormalized
+// `batch.remaining` counter (each terminal transition does
+// `UPDATE batch SET remaining = GREATEST(remaining - N, 0) … RETURNING remaining`;
+// `remaining = 0` is the completion signal). The B3 partial index was the probe's
+// only consumer, so migration `2026-07-09-000004_batch_remaining` drops it. See
+// `tests/integration/test_batch_remaining.rs` for the D2 behaviour coverage.
+//
+// # What these tests assert (post-D2)
+//   * `idx_task_batch_active` no longer exists (the old EXPLAIN-plan test is retired;
+//     D2 dropped the index — this asserts the migration cleanup landed).
 //   * A scope-only batch (`on_complete = '[]'`) reaches full termination WITHOUT
-//     enqueuing any `batch_complete` outbox row (behaviour unchanged; no lock/probe
-//     work is spent on it).
+//     enqueuing any `batch_complete` outbox row (behaviour unchanged under D2).
 //   * A webhook batch still fires its `on_batch_complete` exactly once, on the last
-//     task's terminal transition (non-regression of the modified locking path).
+//     task's terminal transition (non-regression of the counter path).
 
 /// Total `batch_complete` outbox rows for a batch (any status).
 async fn b3_batch_complete_total(pool: &arcrun::DbPool, batch_id: uuid::Uuid) -> i64 {
@@ -3267,121 +3274,37 @@ where
         .expect("X-Batch-ID header")
 }
 
-#[derive(diesel::QueryableByName)]
-struct B3PlanText {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    plan: String,
-}
-
-/// EXPLAIN the EXACT batch-complete probe SQL for `batch_id` and return the plan text.
+/// B3/D2 — the partial index `idx_task_batch_active` no longer exists.
 ///
-/// The probe's `NOT EXISTS (...)` inner query is EXPLAINed. EXPLAIN's output column is
-/// literally named `QUERY PLAN` (a space diesel cannot bind by name), so the statement
-/// is wrapped in a temp plpgsql function whose SETOF-text result we alias to `plan` and
-/// aggregate into one string.
-///
-/// With `disable_seqscan = true` the planner is forced to prefer any usable index. On a
-/// tiny test table a seqscan is otherwise cheapest, so WITHOUT this the plan is a seqscan
-/// — that is the planner behaving correctly for a small relation, NOT a failure of the
-/// index (documented limit; the control assertion below relies on it).
-async fn b3_explain_probe_plan(
-    pool: &arcrun::DbPool,
-    batch_id: uuid::Uuid,
-    disable_seqscan: bool,
-) -> String {
-    use diesel_async::RunQueryDsl;
-    let mut conn = pool.get().await.unwrap();
-
-    diesel::sql_query(if disable_seqscan {
-        "SET enable_seqscan = off"
-    } else {
-        "SET enable_seqscan = on"
-    })
-    .execute(&mut conn)
-    .await
-    .unwrap();
-
-    // The dynamic SQL is the byte-for-byte inner probe of `maybe_enqueue_batch_complete`
-    // (same status literals, same predicate) so the partial index qualifies identically.
-    diesel::sql_query(
-        "CREATE OR REPLACE FUNCTION pg_temp.b3_explain_probe(bid uuid)
-         RETURNS SETOF text AS $$
-         BEGIN
-             RETURN QUERY EXECUTE
-               'EXPLAIN (FORMAT TEXT) SELECT NOT EXISTS (
-                    SELECT 1 FROM task t
-                    WHERE t.batch_id = ' || quote_literal(bid) || '::uuid
-                      AND t.status NOT IN (''success'', ''failure'', ''canceled'')
-                ) AS ready';
-         END
-         $$ LANGUAGE plpgsql;",
-    )
-    .execute(&mut conn)
-    .await
-    .unwrap();
-
-    let rows: Vec<B3PlanText> = diesel::sql_query(
-        "SELECT string_agg(line, E'\n') AS plan FROM pg_temp.b3_explain_probe($1) AS t(line)",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(batch_id)
-    .get_results(&mut conn)
-    .await
-    .unwrap();
-
-    let _ = diesel::sql_query("RESET enable_seqscan")
-        .execute(&mut conn)
-        .await;
-
-    rows.into_iter().next().map(|r| r.plan).unwrap_or_default()
-}
-
-/// B3 — the batch-complete probe's plan qualifies the partial index `idx_task_batch_active`.
-///
-/// Seeds a batch with a mix of terminal and active tasks (so the partial index holds
-/// entries), then EXPLAINs the exact probe with seqscan disabled and asserts the plan
-/// references `idx_task_batch_active`. Reverting the migration (no such index) makes the
-/// plan fall back to `idx_task_batch_id` / a seqscan and this assertion fails.
+/// SUPERSEDED BY D2: the B3 partial index existed SOLELY to serve the batch-complete
+/// `NOT EXISTS (task active)` probe. D2 (`batch.remaining` counter) retired that probe
+/// entirely, so the index is dead weight and migration `2026-07-09-000004_batch_remaining`
+/// drops it. The old test EXPLAINed the probe and asserted the plan used the index; both
+/// the probe and the index are gone, making that assertion meaningless. This replacement
+/// asserts the migration actually dropped the index — a regression guard that D2's
+/// cleanup landed (reverting the DROP in the migration makes this fail).
 #[tokio::test]
-async fn test_audit2_b3_probe_uses_partial_index() {
+async fn test_audit2_b3_partial_index_dropped_by_d2() {
+    use diesel_async::RunQueryDsl;
     let (_g, state) = setup_test_app().await;
-    let app = test_service!(state);
 
-    // A batch of independent tasks; succeed some (terminal), leave some Pending
-    // (active) so `idx_task_batch_active` has live entries for this batch.
-    let created = create_tasks_ok(
-        &app,
-        &[
-            task_json("b3-idx-1", "B3 idx 1", "b3"),
-            task_json("b3-idx-2", "B3 idx 2", "b3"),
-            task_json("b3-idx-3", "B3 idx 3", "b3"),
-        ],
-    )
-    .await;
-    let batch_id = created[0].batch_id.expect("tasks should share a batch_id");
-    succeed_task(&state, created[0].id).await;
-
-    // ANALYZE so the planner has stats (still tiny — hence enable_seqscan=off).
-    {
-        use diesel_async::RunQueryDsl;
-        let mut conn = state.pool.get().await.unwrap();
-        diesel::sql_query("ANALYZE task")
-            .execute(&mut conn)
-            .await
-            .unwrap();
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        c: i64,
     }
-
-    let plan = b3_explain_probe_plan(&state.pool, batch_id, true).await;
-    assert!(
-        plan.contains("idx_task_batch_active"),
-        "the batch-complete probe must be served by the partial index \
-         idx_task_batch_active (seqscan disabled); plan was:\n{plan}"
+    let mut conn = state.pool.get().await.unwrap();
+    let r: Cnt = diesel::sql_query(
+        "SELECT count(*) AS c FROM pg_indexes WHERE indexname = 'idx_task_batch_active'",
+    )
+    .get_result(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        r.c, 0,
+        "idx_task_batch_active must be dropped by D2 (its only consumer, the \
+         batch-complete NOT EXISTS probe, was replaced by the batch.remaining counter)"
     );
-
-    // Documented limit: without disabling seqscan, a tiny relation is cheapest to
-    // seqscan. We do NOT assert index use here — a seqscan is the planner behaving
-    // correctly for a small table, not an index failure. (Left as an observation.)
-    let plan_default = b3_explain_probe_plan(&state.pool, batch_id, false).await;
-    let _ = plan_default; // recorded for local inspection; intentionally not asserted.
 }
 
 /// B3 — a scope-only batch (`on_complete = '[]'`) reaches full termination WITHOUT

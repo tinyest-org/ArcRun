@@ -463,15 +463,17 @@ async fn test_batch_complete_single_row_under_concurrent_detection() {
     let batch_id = batch_id.unwrap();
     let ids = get_batch_task_ids(&app, batch_id).await;
 
-    // Complete both. The detection runs in each transition; only the one that finds
-    // the batch fully terminal inserts a row, and even a double insert is deduped.
+    // Complete both. Each terminal transition decrements batch.remaining (D2); the one
+    // that drives it to 0 inserts the batch_complete row, and even a re-signal is
+    // deduped by the unique idempotency key.
     succeed_task(&state, ids[0]).await;
     succeed_task(&state, ids[1]).await;
 
-    // Simulate a redundant detection call (as if a concurrent transition raced):
-    // calling maybe_enqueue again must NOT add a second row.
+    // Simulate a redundant detection (as if a concurrent transition raced): a second
+    // decrement of an already-terminal task keeps remaining clamped at 0 and tries to
+    // enqueue again — the ON CONFLICT DO NOTHING belt must keep it at ONE row.
     let mut conn = state.pool.get().await.unwrap();
-    arcrun::db_operation::maybe_enqueue_batch_complete(&mut conn, batch_id, "test")
+    arcrun::db_operation::decrement_batch_remaining_for_task(&mut conn, ids[0], "test")
         .await
         .unwrap();
     drop(conn);
@@ -636,19 +638,22 @@ async fn test_batch_complete_retry_and_exhausted() {
     let _ = shutdown_server.send(());
 }
 
-/// Régression (relecture Lot 3) : write-skew sur la détection batch-complete.
+/// Régression (D2) : pas de signal batch_complete perdu quand les deux dernières
+/// tâches du batch terminent concurremment.
 ///
-/// Bug : deux transactions terminant chacune l'une des DEUX dernières tâches du
-/// batch pouvaient, sous READ COMMITTED, chacune voir l'autre tâche encore
-/// non-terminale — aucune des deux n'enqueueait le signal, perdu pour toujours.
-/// Fix : `maybe_enqueue_batch_complete` verrouille la ligne `batch` (FOR UPDATE)
-/// dans un statement séparé AVANT le check de terminalité ; la seconde transaction
-/// attend le commit de la première et re-vérifie sur un snapshot frais.
+/// Sous l'ancien mécanisme (FOR UPDATE + NOT EXISTS), un write-skew sous READ
+/// COMMITTED pouvait faire que chaque transaction voie l'autre tâche encore
+/// non-terminale — aucune n'enqueueait, signal perdu. Le compteur `batch.remaining`
+/// (D2) rend ce write-skew structurellement impossible : chaque décrément
+/// `UPDATE batch SET remaining = remaining - 1` prend NATURELLEMENT le verrou de
+/// ligne `batch`, donc les deux décréments se sérialisent et EXACTEMENT un observe
+/// `remaining = 0`.
 ///
-/// Le test orchestre l'entrelacement exact : A termine t1 et fait sa détection sans
-/// committer (verrou pris) ; B termine t2 et fait sa détection — elle doit BLOQUER ;
-/// A committe ; B se débloque, voit le batch complet, enqueue. Sans le fix, B ne
-/// bloque pas, ne voit pas t1 terminal, et aucun signal n'existe à la fin.
+/// Le test orchestre l'entrelacement : A termine t1 et décrémente (remaining 2→1,
+/// verrou de ligne pris, non committé) ; B termine t2 et décrémente — son UPDATE
+/// doit BLOQUER sur le verrou de ligne jusqu'au commit de A ; A committe (remaining=1
+/// persisté) ; B se débloque, décrémente 1→0, enqueue. Résultat : exactement une
+/// ligne batch_complete.
 #[tokio::test]
 async fn test_batch_complete_concurrent_last_two_tasks_no_lost_signal() {
     let (_g, state) = setup_test_app().await;
@@ -682,23 +687,23 @@ async fn test_batch_complete_concurrent_last_two_tasks_no_lost_signal() {
         .unwrap();
     }
 
-    // A : termine t1 (non committé) puis détection — prend le verrou batch, voit t2
-    // non-terminal, n'enqueue pas, GARDE le verrou jusqu'au commit.
+    // A : termine t1 (non committé) puis décrémente — remaining 2→1, prend le verrou
+    // de ligne batch, n'enqueue pas (remaining ≠ 0), GARDE le verrou jusqu'au commit.
     let mut conn_a = state.pool.get().await.unwrap();
     begin_and_terminate(&mut conn_a, t1).await;
-    arcrun::db_operation::maybe_enqueue_batch_complete(&mut conn_a, batch_id, "test-A")
+    arcrun::db_operation::decrement_batch_remaining_for_task(&mut conn_a, t1, "test-A")
         .await
         .unwrap();
 
-    // B : termine t2 (non committé) puis détection — doit bloquer sur le verrou
-    // jusqu'au commit de A. Les deux futures tournent via join! (PooledConnection
-    // n'est pas 'static, pas de tokio::spawn possible).
+    // B : termine t2 (non committé) puis décrémente — son UPDATE batch doit bloquer
+    // sur le verrou de ligne jusqu'au commit de A. Les deux futures tournent via
+    // join! (PooledConnection n'est pas 'static, pas de tokio::spawn possible).
     let mut conn_b = state.pool.get().await.unwrap();
     begin_and_terminate(&mut conn_b, t2).await;
 
     let b_reached_enqueue = std::sync::atomic::AtomicBool::new(false);
     let fut_b = async {
-        arcrun::db_operation::maybe_enqueue_batch_complete(&mut conn_b, batch_id, "test-B")
+        arcrun::db_operation::decrement_batch_remaining_for_task(&mut conn_b, t2, "test-B")
             .await
             .unwrap();
         b_reached_enqueue.store(true, Ordering::SeqCst);
@@ -712,7 +717,7 @@ async fn test_batch_complete_concurrent_last_two_tasks_no_lost_signal() {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         assert!(
             !b_reached_enqueue.load(Ordering::SeqCst),
-            "B's detection must block on the batch row lock until A commits"
+            "B's decrement must block on the batch row lock until A commits"
         );
         diesel_async::RunQueryDsl::execute(diesel::sql_query("COMMIT"), &mut conn_a)
             .await

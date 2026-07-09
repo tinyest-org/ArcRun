@@ -620,10 +620,17 @@ pub async fn cancel_task<'a>(
             }
             enqueue_outbox_for_canceled_ancestors(&canceled_ancestors, conn).await?;
 
-            // Batch-complete detection (Lot 3b): a manual cancel can be the batch's
-            // last terminal transition.
-            db_operation::maybe_enqueue_batch_complete_for_task(&mut *conn, task_id, "cancel_task")
-                .await?;
+            // Batch-complete detection (D2): decrement `batch.remaining` for the
+            // canceled task + its cascade-failed children + dead-end-canceled ancestors.
+            let mut terminal_ids = vec![task_id];
+            terminal_ids.extend_from_slice(&cascade_failed);
+            terminal_ids.extend(canceled_ancestors.iter().map(|a| a.id));
+            db_operation::decrement_batch_remaining_for_tasks(
+                &mut *conn,
+                &terminal_ids,
+                "cancel_task",
+            )
+            .await?;
 
             Ok(())
         })

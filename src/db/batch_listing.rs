@@ -32,6 +32,9 @@ struct BatchStatusRow {
     /// Batch metadata (NULL when the batch has no `batch` row).
     #[diesel(sql_type = sql_types::Nullable<sql_types::Jsonb>)]
     metadata: Option<serde_json::Value>,
+    /// Denormalized non-terminal task counter (NULL when the batch has no `batch` row).
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Integer>)]
+    remaining: Option<i32>,
 }
 
 /// List batches with aggregated statistics, supporting optional filters and pagination.
@@ -61,7 +64,8 @@ pub(crate) async fn list_batches<'a>(
                 ARRAY_AGG(DISTINCT t.kind) AS kinds,
                 MIN(t.created_at) AS first_created,
                 b.scope AS scope,
-                b.metadata AS metadata
+                b.metadata AS metadata,
+                b.remaining AS remaining
             FROM task t
             LEFT JOIN batch b ON b.id = t.batch_id
             WHERE t.batch_id IS NOT NULL
@@ -75,7 +79,7 @@ pub(crate) async fn list_batches<'a>(
               AND ($8::text        IS NULL
                    OR b.scope ILIKE '%' || $8 || '%'
                    OR b.metadata::text ILIKE '%' || $8 || '%')
-            GROUP BY t.batch_id, b.scope, b.metadata
+            GROUP BY t.batch_id, b.scope, b.metadata, b.remaining
             ORDER BY first_created DESC, t.batch_id DESC
             LIMIT $9 OFFSET $10
         )
@@ -87,10 +91,11 @@ pub(crate) async fn list_batches<'a>(
             MAX(t.last_updated) AS latest_updated_at,
             pb.kinds,
             pb.scope,
-            pb.metadata
+            pb.metadata,
+            pb.remaining
         FROM task t
         INNER JOIN paginated_batches pb ON t.batch_id = pb.batch_id
-        GROUP BY t.batch_id, t.status, pb.kinds, pb.first_created, pb.scope, pb.metadata
+        GROUP BY t.batch_id, t.status, pb.kinds, pb.first_created, pb.scope, pb.metadata, pb.remaining
         ORDER BY pb.first_created DESC, t.batch_id
         "#,
     )
@@ -123,6 +128,7 @@ pub(crate) async fn list_batches<'a>(
                 metadata: row
                     .metadata
                     .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+                remaining: row.remaining,
             });
         }
         let entry = batches.last_mut().unwrap();

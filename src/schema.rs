@@ -46,6 +46,7 @@ diesel::table! {
         created_at -> Timestamptz,
         scope -> Nullable<Text>,
         metadata -> Jsonb,
+        remaining -> Int4,
     }
 }
 

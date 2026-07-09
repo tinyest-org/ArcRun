@@ -8,7 +8,7 @@ use diesel_async::RunQueryDsl;
 use uuid::Uuid;
 
 use super::webhook_execution::{
-    maybe_enqueue_batch_complete, maybe_enqueue_batch_complete_for_task,
+    decrement_batch_remaining_for_tasks, zero_batch_remaining_and_complete,
 };
 use super::{DbError, run_in_transaction, task_crud::insert_actions};
 
@@ -111,11 +111,21 @@ pub async fn update_running_task<'a>(
                         .await?;
                         workers::enqueue_outbox_for_canceled_ancestors(&ancestors, conn).await?;
 
-                        // Batch-complete detection (Lot 3b): if this task's batch now
-                        // has no non-terminal tasks and registered an on_batch_complete
-                        // webhook, enqueue the batch_complete outbox row in this same tx.
-                        maybe_enqueue_batch_complete_for_task(conn, task_id, "update_running_task")
-                            .await?;
+                        // Batch-complete detection (D2): every task terminalized in this
+                        // tx — the PATCHed task (Success/Failure, guaranteed terminal by
+                        // `validate_update_task`), its cascade-failed children, and any
+                        // dead-end-canceled ancestors — decrements `batch.remaining`. A
+                        // batch that reaches 0 (with a registered webhook) enqueues the
+                        // batch_complete row in this same tx.
+                        let mut terminal_ids = vec![task_id];
+                        terminal_ids.extend_from_slice(&cascade);
+                        terminal_ids.extend(ancestors.iter().map(|a| a.id));
+                        decrement_batch_remaining_for_tasks(
+                            conn,
+                            &terminal_ids,
+                            "update_running_task",
+                        )
+                        .await?;
                     }
                 }
 
@@ -306,8 +316,13 @@ pub(crate) async fn fail_task_and_propagate<'a>(
                     .await?;
                 workers::enqueue_outbox_for_canceled_ancestors(&ancestors, conn).await?;
 
-                // Batch-complete detection (Lot 3b).
-                maybe_enqueue_batch_complete_for_task(conn, tid, "fail_task_and_propagate").await?;
+                // Batch-complete detection (D2): decrement `batch.remaining` for the
+                // failed task + its cascade-failed children + dead-end-canceled ancestors.
+                let mut terminal_ids = vec![tid];
+                terminal_ids.extend_from_slice(&cascade);
+                terminal_ids.extend(ancestors.iter().map(|a| a.id));
+                decrement_batch_remaining_for_tasks(conn, &terminal_ids, "fail_task_and_propagate")
+                    .await?;
             }
             Ok(updated)
         })
@@ -469,9 +484,11 @@ pub(crate) async fn stop_batch<'a>(
                 crate::workers::enqueue_cancel_outbox(rid, conn).await?;
             }
 
-            // Batch-complete detection (Lot 3b): stopping a batch makes every task
-            // terminal, so this fires the batch_complete webhook (if registered).
-            maybe_enqueue_batch_complete(conn, batch_id, "stop_batch").await?;
+            // Batch-complete detection (D2): stopping a batch cancels every remaining
+            // task in one sweep, so `batch.remaining` goes straight to 0 (rather than
+            // being decremented task-by-task). This fires the batch_complete webhook
+            // if one was registered.
+            zero_batch_remaining_and_complete(conn, batch_id, "stop_batch").await?;
 
             Ok(StopBatchResult {
                 canceled_waiting,

@@ -322,10 +322,13 @@ pub async fn add_task(
             // a few multi-row INSERTs; dedupe tasks are still evaluated one-at-a-time.
             let result = db_operation::insert_task_batch(conn, f, Some(batch_id)).await?;
 
-            // Empty batch (all tasks dedupe-skipped) with a registered webhook: the
-            // batch is vacuously complete — enqueue the signal now so the consumer
-            // doesn't wait forever. (No-op when no `batch` row was inserted.)
-            db_operation::maybe_enqueue_batch_complete(conn, batch_id, "add_task").await?;
+            // Initialize `batch.remaining` (D2) to the number of tasks ACTUALLY inserted
+            // (dedupe-skips excluded — `result` omits them). When 0 (empty / all-deduped
+            // batch) and a webhook was registered, the batch is vacuously complete and
+            // the signal is enqueued now so the consumer doesn't wait forever. No-op when
+            // no `batch` row was inserted.
+            db_operation::init_batch_remaining(conn, batch_id, result.len() as i32, "add_task")
+                .await?;
 
             Ok(result)
         })

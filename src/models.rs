@@ -98,9 +98,16 @@ pub struct Batch {
     pub scope: Option<String>,
     /// Arbitrary structured metadata for filtering/search (defaults to `{}`).
     pub metadata: serde_json::Value,
+    /// Number of the batch's tasks that are NOT yet terminal (Audit 2, D2). Every
+    /// terminal transition decrements it in-tx; `remaining = 0` is the batch-complete
+    /// signal. Initialized to the number of tasks actually inserted (dedupe-skips
+    /// excluded).
+    pub remaining: i32,
 }
 
 /// Insertable struct for a batch row (webhook payload and/or scope/metadata).
+/// `remaining` is omitted on purpose: it defaults to 0 in the DB and is set to the
+/// actual inserted-task count right after `insert_task_batch` (see `add_task`).
 #[derive(Debug, Insertable)]
 #[diesel(table_name = crate::schema::batch)]
 pub struct NewBatch {

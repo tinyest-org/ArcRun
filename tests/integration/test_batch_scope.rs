@@ -266,7 +266,7 @@ async fn test_scope_only_batch_no_complete_signal() {
     )
     .await;
 
-    // Drive the only task terminal — this calls maybe_enqueue_batch_complete.
+    // Drive the only task terminal — this decrements batch.remaining (D2).
     succeed_task(&state, tasks[0].id).await;
 
     assert_eq!(

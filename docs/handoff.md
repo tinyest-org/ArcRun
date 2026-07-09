@@ -10,10 +10,17 @@ c3bee32), 5.3 (A10 limites, eaf67f6). **Lot 6 TERMINÉ** : 6.1 (B1, 1623934),
 6.2 (B3, bd64090), 6.3 (B5, aac34c0), 6.4 (B4, 395b9a2), 6.5 (B2, 21f38bc),
 6.6a (B6/B7, ceb6ea3), 6.6b (index morts + idx_task_priority + selects
 ciblés + timeout_loop borné + probes 2 s + circuit breaker opérant).
-**La campagne non-breaking (Lots 4/5/6) est CLOSE.** Il ne reste que le
-Lot 7 (breaking : API v1/HMAC handle, batch.remaining, rule_slot,
-GET /work, split outbox) — sur décision explicite de l'utilisateur, hors
-boucle. Détail et notes de relecture par item dans
+**La campagne non-breaking (Lots 4/5/6) est CLOSE.** Le **Lot 7 (breaking)
+est partiellement ouvert** sur décision utilisateur du 2026-07-09 : périmètre
+= **7.2 puis 7.3 uniquement** (7.1 API v1/HMAC, 7.4 GET /work, 7.5 split
+outbox restent non décidés). **7.2 (D2, `batch.remaining`) : FAIT** —
+compteur dénormalisé remplaçant le FOR UPDATE + NOT EXISTS (et l'index
+partiel B3, droppé), décrément groupé en-tx à chaque site terminal,
+`remaining` exposé dans GET /batches. **Suivant : 7.3** (D1/D7, `rule_slot`
++ bundle multi-réplica) avec décisions actées : Concurrency + **Capacity
+d'emblée** (deltas poussés depuis le flush du batch_updater), coordination
+start_loop par **leader-lease advisory** (`pg_try_advisory_lock`).
+Détail et notes de relecture par item dans
 `docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
 Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7) ; renversement
 assumé du commit 2e50620 en 4.4 (compteurs terminaux gelés) ; HMAC du `?handle=`

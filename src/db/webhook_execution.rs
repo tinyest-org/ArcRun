@@ -156,84 +156,128 @@ pub async fn enqueue_batch_complete_outbox<'a>(
     Ok(())
 }
 
-/// Check whether `batch_id` is fully terminal (no task with a non-terminal status)
-/// and, if so, enqueue a `batch_complete` outbox row — but ONLY if the batch has a
-/// non-empty `on_complete` (a registered `on_batch_complete` webhook payload). A
-/// batch with no `batch` row, or a `batch` row whose `on_complete` is `'[]'`
-/// (scope/metadata-only batch, #601), carries no completion signal and is skipped
-/// without taking the batch lock (Audit 2, B3).
+/// Decrement `batch.remaining` (Audit 2, D2) by the number of just-terminalized
+/// tasks in `terminal_task_ids`, grouped by their batch, and — for any batch whose
+/// counter reaches 0 with a non-empty `on_complete` (#601 gate) — enqueue exactly one
+/// `batch_complete` outbox row.
 ///
-/// Idempotent and concurrency-safe: the unique idempotency key + `ON CONFLICT DO
-/// NOTHING` mean repeated/concurrent calls enqueue at most one row. Call inside the
-/// transaction that made the last task terminal so the signal commits atomically.
+/// This REPLACES the old `FOR UPDATE` + `NOT EXISTS (task active)` probe. The
+/// decrement is a single `UPDATE batch SET remaining = GREATEST(remaining - N, 0) …
+/// RETURNING remaining` per batch: atomic, O(1), and naturally serialized on the
+/// `batch` row (two transactions finishing the batch's last two tasks each apply
+/// their own `-1`, so exactly one of them observes `remaining = 0`). `remaining = 0`
+/// IS the completion signal.
 ///
-/// `caller` is a short label for logs (e.g. "update_running_task").
-pub async fn maybe_enqueue_batch_complete<'a>(
+/// **Exactly-once contract.** Pass ONLY ids of tasks that ACTUALLY transitioned to a
+/// terminal state in the current transaction (the guarded UPDATE / cascade RETURNING
+/// matched them). A re-PATCH/cancel/timeout of an already-terminal task does not
+/// transition it, so its id never reaches here and the counter never double-decrements.
+/// Duplicate ids in the slice are harmless — the COUNT is over distinct matching
+/// `task` rows, so each task is counted at most once.
+///
+/// The decrement itself is UNCONDITIONAL for every batched task (it also drives free
+/// progress reporting for scope/metadata-only batches, whose `on_complete = '[]'`);
+/// only the `batch_complete` ENQUEUE is gated on a non-empty `on_complete`. A task
+/// with no `batch` row (its `batch_id` has no row, or is NULL) matches no batch, so
+/// the UPDATE is a near-free no-op and nothing is enqueued.
+///
+/// Belt-and-braces: the unique idempotency key + `ON CONFLICT DO NOTHING` in
+/// [`enqueue_batch_complete_outbox`] make a re-signal of an already-signalled batch
+/// inoffensive. Must run inside the same transaction as the terminal transition(s)
+/// (outbox contract, Lot 2). `caller` is a short label for logs.
+pub async fn decrement_batch_remaining_for_tasks<'a>(
     conn: &mut Conn<'a>,
-    batch_id: uuid::Uuid,
+    terminal_task_ids: &[uuid::Uuid],
     caller: &str,
 ) -> Result<(), DbError> {
-    use crate::schema::batch::dsl;
-
-    // Serialize concurrent detection per batch by locking the `batch` row FIRST, in
-    // its own statement. Under READ COMMITTED, two transactions each finishing one
-    // of the batch's last two tasks could otherwise BOTH see the other's task as
-    // still non-terminal (write skew) and neither would enqueue the signal — losing
-    // it forever. With the row lock, the second transaction waits for the first to
-    // commit, and its terminality check below then runs on a fresh statement
-    // snapshot that includes the first one's update. (Folding the terminality
-    // subquery into this locking statement would NOT work: the subquery would be
-    // evaluated on the pre-wait snapshot.)
-    //
-    // Non-vacuity is pushed INTO the locking statement (Audit 2, B3). A batch with an
-    // EMPTY `on_complete` (scope/metadata-only batch, #601, or a batch with no
-    // `on_batch_complete` at all) carries no completion signal, so it must NOT be
-    // locked: otherwise EVERY terminal transition of such a batch would serialise on
-    // this lock for nothing. The `on_complete <> '[]'::jsonb` predicate lets the
-    // SELECT match (and lock) only webhook batches; a no-webhook batch — or a batch
-    // with no `batch` row — returns no row and early-returns without ever taking the
-    // lock. (`on_complete` is a JSONB array by construction: the `'[]'` column default
-    // or a JSON array of `NewActionDto`. The literal `<> '[]'::jsonb` comparison is
-    // therefore robust and never errors, unlike `jsonb_array_length` on a non-array.)
-    // The lock still serialises concurrent detection for webhook batches, preserving
-    // the write-skew protection above.
-    let locked: Option<uuid::Uuid> = dsl::batch
-        .filter(dsl::id.eq(batch_id))
-        .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
-            "on_complete <> '[]'::jsonb",
-        ))
-        .select(dsl::id)
-        .for_update()
-        .first::<uuid::Uuid>(conn)
-        .await
-        .optional()?;
-
-    if locked.is_none() {
+    if terminal_task_ids.is_empty() {
         return Ok(());
     }
 
     #[derive(diesel::QueryableByName)]
-    struct ReadyRow {
+    struct CompletedBatch {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        remaining: i32,
         #[diesel(sql_type = diesel::sql_types::Bool)]
-        ready: bool,
+        has_webhook: bool,
     }
 
-    let row: ReadyRow = diesel::sql_query(
-        "SELECT NOT EXISTS (
-            SELECT 1 FROM task t
-            WHERE t.batch_id = $1
-              AND t.status NOT IN ('success', 'failure', 'canceled')
-         ) AS ready",
+    // One statement decrements every affected batch by its count of newly-terminal
+    // tasks and RETURNs the post-update `remaining` + whether the batch registered a
+    // webhook. `COUNT(*)::int` keeps arithmetic in int4 (matches the column type).
+    let updated: Vec<CompletedBatch> = diesel::sql_query(
+        "UPDATE batch b
+         SET remaining = GREATEST(b.remaining - sub.cnt, 0)
+         FROM (
+             SELECT batch_id, COUNT(*)::int AS cnt
+             FROM task
+             WHERE id = ANY($1) AND batch_id IS NOT NULL
+             GROUP BY batch_id
+         ) sub
+         WHERE b.id = sub.batch_id
+         RETURNING b.id, b.remaining, (b.on_complete <> '[]'::jsonb) AS has_webhook",
     )
-    .bind::<diesel::sql_types::Uuid, _>(batch_id)
-    .get_result(conn)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(terminal_task_ids)
+    .load::<CompletedBatch>(conn)
     .await?;
 
-    if row.ready {
+    for cb in updated {
+        if cb.remaining == 0 && cb.has_webhook {
+            let key = crate::action::batch_complete_idempotency_key(cb.id);
+            enqueue_batch_complete_outbox(conn, cb.id, &key).await?;
+            log::debug!(
+                "[{}] batch {} reached remaining=0 — enqueued batch_complete outbox row",
+                caller,
+                cb.id
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Convenience wrapper for the single-task terminal sites: decrement `batch.remaining`
+/// for exactly one just-terminalized task. See [`decrement_batch_remaining_for_tasks`].
+pub async fn decrement_batch_remaining_for_task<'a>(
+    conn: &mut Conn<'a>,
+    task_id: uuid::Uuid,
+    caller: &str,
+) -> Result<(), DbError> {
+    decrement_batch_remaining_for_tasks(conn, std::slice::from_ref(&task_id), caller).await
+}
+
+/// Force `batch.remaining` to 0 for a batch (used by `stop_batch`, which cancels every
+/// remaining task in one sweep) and, if the batch registered a webhook (#601 gate),
+/// enqueue the `batch_complete` signal. No-op if the batch has no `batch` row.
+pub async fn zero_batch_remaining_and_complete<'a>(
+    conn: &mut Conn<'a>,
+    batch_id: uuid::Uuid,
+    caller: &str,
+) -> Result<(), DbError> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        has_webhook: bool,
+    }
+
+    let row: Option<Row> = diesel::sql_query(
+        "UPDATE batch SET remaining = 0 WHERE id = $1
+         RETURNING (on_complete <> '[]'::jsonb) AS has_webhook",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(batch_id)
+    .get_result::<Row>(conn)
+    .await
+    .optional()?;
+
+    if let Some(r) = row
+        && r.has_webhook
+    {
         let key = crate::action::batch_complete_idempotency_key(batch_id);
         enqueue_batch_complete_outbox(conn, batch_id, &key).await?;
         log::debug!(
-            "[{}] batch {} fully terminal — enqueued batch_complete outbox row",
+            "[{}] batch {} stopped (remaining set to 0) — enqueued batch_complete outbox row",
             caller,
             batch_id
         );
@@ -242,25 +286,46 @@ pub async fn maybe_enqueue_batch_complete<'a>(
     Ok(())
 }
 
-/// Convenience wrapper: resolve a task's `batch_id` and, if set, run
-/// [`maybe_enqueue_batch_complete`]. A task without a batch is a no-op.
-pub async fn maybe_enqueue_batch_complete_for_task<'a>(
+/// Initialize a freshly-created batch's `remaining` to `count` — the number of tasks
+/// ACTUALLY inserted (dedupe-skips excluded, known at insert time). When `count == 0`
+/// (empty / all-dedupe-skipped batch) AND the batch registered a webhook (non-empty
+/// `on_complete`, #601 gate), the batch is vacuously complete, so the `batch_complete`
+/// signal is enqueued immediately — preserving the pre-D2 vacuous-empty behaviour.
+/// No-op if the batch has no `batch` row (the UPDATE matches nothing).
+pub async fn init_batch_remaining<'a>(
     conn: &mut Conn<'a>,
-    task_id: uuid::Uuid,
+    batch_id: uuid::Uuid,
+    count: i32,
     caller: &str,
 ) -> Result<(), DbError> {
-    use crate::schema::task::dsl;
-    let batch_id: Option<uuid::Uuid> = dsl::task
-        .filter(dsl::id.eq(task_id))
-        .select(dsl::batch_id)
-        .first::<Option<uuid::Uuid>>(conn)
-        .await
-        .optional()?
-        .flatten();
-
-    if let Some(bid) = batch_id {
-        maybe_enqueue_batch_complete(conn, bid, caller).await?;
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        fire: bool,
     }
+
+    let row: Option<Row> = diesel::sql_query(
+        "UPDATE batch SET remaining = $2 WHERE id = $1
+         RETURNING (remaining = 0 AND on_complete <> '[]'::jsonb) AS fire",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(batch_id)
+    .bind::<diesel::sql_types::Integer, _>(count)
+    .get_result::<Row>(conn)
+    .await
+    .optional()?;
+
+    if let Some(r) = row
+        && r.fire
+    {
+        let key = crate::action::batch_complete_idempotency_key(batch_id);
+        enqueue_batch_complete_outbox(conn, batch_id, &key).await?;
+        log::debug!(
+            "[{}] batch {} vacuously complete (0 tasks inserted) — enqueued batch_complete outbox row",
+            caller,
+            batch_id
+        );
+    }
+
     Ok(())
 }
 

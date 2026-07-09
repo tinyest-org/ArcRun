@@ -43,8 +43,8 @@ The `on_start` action can return a `NewActionDto` in the response body to regist
 
 `on_batch_complete` registers a batch-level webhook fired exactly once (at-least-once via the outbox) when the **last** task of the batch becomes terminal. `scope` (text label) and `metadata` (arbitrary JSON) are optional batch-level identity used for filtering/search via `GET /batches` (Tasker #601). A `batch` row is created when **any** of `on_batch_complete` / `scope` / `metadata` is provided (batches with none of them cost nothing); a scope/metadata-only batch stores `on_complete = '[]'`. Scope/metadata are validated (`validation::validate_batch_meta`: scope non-empty + ≤255 chars, metadata ≤64KB). SSRF/param validation runs on the batch-level actions like any other action. Tasks are inserted in **grouped multi-row INSERTs** (Lot 3a): contiguous runs of tasks *without* a `dedupe_strategy` are flushed in one `task` / `link` / `action` INSERT each; UUIDs are app-generated (`Uuid::new_v4()`) so the full `id_mapping` is known before any insert. Each of the three grouped INSERTs is **chunked** (A10) so `rows × binds_per_row` stays under a conservative budget (`BIND_BUDGET = 60000`, below Postgres's 65535 bind-parameter ceiling) — the chunks share the same transaction, so atomicity is unchanged. A task carrying a `dedupe_strategy` ends the current run (the run is flushed first so the dedupe check can match tasks inserted earlier in the same batch) — same guard philosophy as the Lot 1 batch-claim.
 
-### Batch-complete detection (`BatchComplete` trigger — Lot 3b)
-When any task of a batch reaches a terminal state, the transition transaction calls `maybe_enqueue_batch_complete[_for_task]` (`src/db/webhook_execution.rs`): if a `batch` row exists **with a non-empty `on_complete`** AND `NOT EXISTS (task WHERE batch_id = $1 AND status NOT IN (terminal))`, it enqueues one outbox row keyed `batch:<batch_id>:complete`. (The `on_complete` non-empty gate matters since #601: scope/metadata-only batches have a `batch` row but an empty `on_complete`, so they never signal completion.) The unique idempotency key + `ON CONFLICT DO NOTHING` make concurrent detection inoffensive (a single row even if two tasks finish "at once"). The check is centralised in ONE helper, called from every terminal site: `update_running_task`, `fail_task_and_propagate`, `stop_batch` (`task_lifecycle.rs`), `timeout_task_and_propagate` (`task_query.rs`), `cancel_task` (`propagation.rs`), and `add_task` (for the vacuously-complete empty / all-dedupe-skipped batch). The delivery loop (`delivery_loop.rs`: `prepare_batch_complete_row` prefetch + `deliver_plan`) loads `batch.on_complete`, executes each action **without** a `?handle=`, with an `arcrun` body enrichment `{batch_id, counts:{success,failure,canceled}, completed_at}` (counts / `completed_at = max(ended_at)` computed at delivery time). Retry/backoff/exhausted are identical to task-level rows. Retention (`src/db/cleanup.rs`) also deletes orphaned `batch` rows (and their batch-level `webhook_execution` rows) once their tasks are gone.
+### Batch-complete detection (`BatchComplete` trigger — Lot 3b, reworked by Audit 2 D2)
+Detection is driven by a denormalized counter **`batch.remaining`** = number of the batch's tasks not yet terminal (Audit 2, D2 — replaces the old `FOR UPDATE` on the `batch` row + `NOT EXISTS (task active)` probe, and the B3 partial index that served it). `remaining` is initialized at insert (`init_batch_remaining`) to the number of tasks **actually inserted** (dedupe-skips excluded; 0 ⇒ the vacuously-complete batch signals immediately). Every transaction that terminalizes tasks calls `decrement_batch_remaining_for_tasks` (`src/db/webhook_execution.rs`) with **all** the ids it terminalized (origin + cascade-failed children + dead-end-canceled ancestors): one `UPDATE batch SET remaining = GREATEST(remaining - N, 0) … RETURNING remaining, (on_complete <> '[]')` per batch — atomic, O(1), naturally serialized on the `batch` row (two transactions finishing the last two tasks each apply their own decrement; exactly one observes 0). `remaining = 0` **is** the completion signal ⇒ enqueue one outbox row keyed `batch:<batch_id>:complete`, **gated on a non-empty `on_complete`** (#601: scope/metadata-only batches keep `remaining` maintained — free progress reporting, exposed as `remaining` in `GET /batches` — but never signal). The exactly-once contract: callers pass ONLY ids whose guarded terminal UPDATE actually matched (a re-PATCH/cancel/timeout of an already-terminal task never decrements); the unique idempotency key + `ON CONFLICT DO NOTHING` remain as backstop. Call sites: `update_running_task`, `fail_task_and_propagate` (`task_lifecycle.rs`), `timeout_task_and_propagate` (`task_query.rs`), `cancel_task` (`propagation.rs`), `add_task` (init/vacuous), and `stop_batch` which uses `zero_batch_remaining_and_complete` (mass-cancel ⇒ `remaining` set straight to 0). The delivery loop (`delivery_loop.rs`: `prepare_batch_complete_row` prefetch + `deliver_plan`) loads `batch.on_complete`, executes each action **without** a `?handle=`, with an `arcrun` body enrichment `{batch_id, counts:{success,failure,canceled}, completed_at}` (counts / `completed_at = max(ended_at)` computed at delivery time). Retry/backoff/exhausted are identical to task-level rows. Retention (`src/db/cleanup.rs`) also deletes orphaned `batch` rows (and their batch-level `webhook_execution` rows) once their tasks are gone.
 
 ### Webhook Delivery Contract (transactional outbox — Lot 2)
 
@@ -146,7 +146,7 @@ All HTTP handler functions and route configuration:
 
 **`src/db_operation.rs`**:
 - `insert_task_batch` - Creates a whole batch of tasks (grouped multi-row INSERTs, dedupe-aware, Lot 3a)
-- `maybe_enqueue_batch_complete[_for_task]` / `insert_batch` / `load_batch_on_complete` / `batch_completion_stats` - Batch-complete webhook support (Lot 3b)
+- `decrement_batch_remaining_for_tasks[_for_task]` / `zero_batch_remaining_and_complete` / `init_batch_remaining` / `insert_batch` / `load_batch_on_complete` / `batch_completion_stats` - Batch-complete webhook support (Lot 3b, counter-based since D2)
 - `claim_due_outbox_leased` - Lease-based outbox claim for the delivery loop (selects mature rows + pushes `next_attempt_at` a lease into the future in one statement, so HTTP delivery runs out-of-tx and in parallel)
 - `update_running_task` - Updates status, calls `end_task` and `propagate_to_children`
 - `find_detailed_task_by_id` - Single query with LEFT JOIN for task + actions
@@ -309,9 +309,12 @@ task (id, name, kind, status, metadata, timeout, batch_id, start_condition,
       created_at, started_at, ended_at, last_updated, priority)
 action (id, task_id, kind, trigger, condition, params, success)
 link (parent_id, child_id, requires_success)
-batch (id, on_complete, created_at, scope, metadata)
+batch (id, on_complete, created_at, scope, metadata, remaining)
   -- one row per batch that registered on_batch_complete (Lot 3b) AND/OR scope/metadata (#601);
   -- on_complete = JSONB array of NewActionDto ('[]' for a scope/metadata-only batch).
+  -- remaining = denormalized count of not-yet-terminal tasks (Audit 2, D2): initialized to the
+  --   inserted-task count (dedupe-skips excluded), decremented in-tx by every terminal
+  --   transition; 0 IS the batch-complete signal. Exposed via GET /batches (progress).
   -- scope = nullable TEXT label, metadata = JSONB (default '{}') — both filterable/searchable
   --   via GET /batches (?scope= exact, ?metadata= JSONB containment @>, ?search= substring).
   -- Batches with none of on_complete/scope/metadata have no row (tracked only via task.batch_id).
@@ -349,15 +352,14 @@ idx_task_priority ON task(status, priority DESC, created_at ASC, id ASC)
   --   Scan with no Incremental Sort node per page.
 idx_action_task_id_trigger ON action(task_id, trigger)
   -- serves both `WHERE task_id = $ AND trigger = $` and task_id-only lookups (leading column)
-idx_task_batch_active ON task(batch_id) WHERE status NOT IN ('success','failure','canceled')
-  -- partial index (Audit 2, B3): makes the batch-complete NOT EXISTS probe O(1) as a
-  --   batch drains (contains only still-active rows), instead of O(N) over all terminal rows
 idx_batch_scope ON batch(scope) WHERE scope IS NOT NULL
 idx_batch_metadata_gin ON batch USING GIN(metadata)
 -- Dropped as dead/redundant (Audit 2, B7): idx_action_task_id (prefix of
 --   idx_action_task_id_trigger), idx_action_trigger (no query filters trigger alone),
 --   idx_task_kind (every kind predicate is paired with status → idx_task_status_kind,
 --   or is a substring LIKE that no b-tree can serve).
+-- Dropped by D2: idx_task_batch_active (partial index whose sole consumer was the
+--   retired batch-complete NOT EXISTS probe — the batch.remaining counter replaces it).
 ```
 
 ## Metrics

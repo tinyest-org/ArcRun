@@ -101,13 +101,18 @@ Statuts : `À faire` / `En cours` / `Fait (commit)` / `Écarté (raison)`.
 
 ### Lot 7 — Breaking (sur décision explicite, hors boucle par défaut)
 
-| Item | Audit | Description | Statut |
-|---|---|---|---|
-| 7.1 | D4 | API v1 : enveloppe `{batch_id, tasks, deduped}`, `Idempotency-Key` sur POST /task, verbes dédiés, dépréciation du bare-array, handle signé HMAC | À faire |
-| 7.2 | D2 | `batch.remaining` (remplace FOR UPDATE + NOT EXISTS) | À faire |
-| 7.3 | D1/D7 | `rule_slot` + bundle multi-réplica | À faire |
-| 7.4 | D5 | API pull `GET /work` | À faire |
-| 7.5 | D3/D6 | Split outbox/ledger, dispatcher séparé, archive/partitions | À faire |
+Décision utilisateur 2026-07-09 : lancer **7.2 puis 7.3** (pas 7.1). Décisions actées pour
+7.3 : périmètre **Concurrency + Capacity d'emblée** (deltas Capacity poussés depuis le flush
+du batch_updater inclus) ; coordination start_loop multi-réplica par **leader-lease advisory**
+(`pg_try_advisory_lock` en tête d'itération, seul le détenteur scanne).
+
+| Item | Audit | Description | Statut | Notes |
+|---|---|---|---|---|
+| 7.1 | D4 | API v1 : enveloppe `{batch_id, tasks, deduped}`, `Idempotency-Key` sur POST /task, verbes dédiés, dépréciation du bare-array, handle signé HMAC | Non décidé | |
+| 7.2 | D2 | `batch.remaining` (remplace FOR UPDATE + NOT EXISTS) | Fait | Relu : migration `2026-07-09-000004` (colonne + backfill non-terminal + DROP `idx_task_batch_active`, down.sql restaure) ; `decrement_batch_remaining_for_tasks` = 1 UPDATE groupé par batch (`GREATEST(remaining - N, 0)` + `RETURNING remaining, on_complete <> '[]'`) — sérialisation naturelle sur le verrou de ligne (EvalPlanQual re-lit la version committée, exactement une tx observe 0) ; contrat exactly-once : chaque site passe UNIQUEMENT les ids réellement terminalisés dans sa tx (origine + cascade B5 + ancêtres dead-end — vérifié aux 4 sites per-task ; garanti par `validate_update_task` pour le PATCH) ; `stop_batch` → `zero_batch_remaining_and_complete` ; `add_task` → `init_batch_remaining(count inséré, dedupe-skips exclus)` avec signal vacuous préservé ; gate #601 conservé (décrément toujours, enqueue seulement si `on_complete` non vide) ; ceinture idempotency-key/ON CONFLICT conservée ; `remaining` exposé dans GET /batches (progress, null sans ligne batch). Test write-skew Lot 3 réécrit pour prouver la sérialisation du compteur (B bloque sur l'UPDATE non committé de A). Test EXPLAIN B3 remplacé par un garde d'absence d'index. Relecture : `StatusKind::is_terminal` mort supprimé ; contre-épreuve verte (cascade exclue du décrément ⇒ `test_remaining_cascade_b5_multi_decrement` rouge, restauré vert). 9 régressions `test_batch_remaining` ; suite complète (250) + 46 unitaires re-run par le relecteur. |
+| 7.3 | D1/D7 | `rule_slot` + bundle multi-réplica (Concurrency + Capacity, leader-lease) | À faire | |
+| 7.4 | D5 | API pull `GET /work` | Non décidé | |
+| 7.5 | D3/D6 | Split outbox/ledger, dispatcher séparé, archive/partitions | Non décidé | |
 
 ## Journal
 
@@ -131,3 +136,5 @@ Statuts : `À faire` / `En cours` / `Fait (commit)` / `Écarté (raison)`.
 - 2026-07-09 : 6.5 (B2) fait — `acquire_permit_with_heartbeat` : une tâche Claimed en attente du sémaphore de concurrency voit son `last_updated` bumpé toutes les `claim_timeout/3` secondes, empêchant requeue-stale de la reprendre. `start_loop` reçoit le paramètre `claim_timeout: Duration` (transmis depuis main.rs via la config). Test de régression avec concurrency=1, claim_timeout=3s, webhook lent 4s : les deux tâches atteignent Running sans churn. 237/237 tests verts. Suivant : 6.6 (B6/B7, hygiène).
 - 2026-07-09 : 6.6a (B6/B7 partie 1) fait — UUIDv7 (`Uuid::now_v7()` sur 3 sites prod, localité B-tree PK), POST /task renvoie `Vec<BasicTaskDto>` (conformité OpenAPI, `flush_run` saute le RETURNING actions), tiebreaker `id` ajouté sur toutes les paginations OFFSET (`list_task_filtered_paged`, `list_webhook_deliveries`, `list_batches` CTE, `get_dag_for_batch`), warning startup RETENTION_ENABLED off en release. 237/237 verts (2 timing flakes sous charge, verts isolés). Suivant : 6.6b (hygiène restante : index morts, idx_task_priority, select ciblés, LIMIT timeout_loop, circuit breaker).
 - 2026-07-09 : 6.6b (B6/B7 partie 2 + circuit breaker) fait — 6/6 sous-items (index morts droppés avec justification par prédicat, idx_task_priority aligné sur l'ORDER BY, selects ciblés anti-JSONB, timeout_loop borné+drain avec requeue protégé, probes health 2 s (`/health` 200 degraded / `/ready` 503), circuit breaker opérant). Wedge HalfOpen (probe sans verdict) attrapé et corrigé en relecture (takeover après recovery_timeout). **Le Lot 6 est terminé — la campagne non-breaking (Lots 4/5/6) est close.** Reste : Lot 7 (breaking, sur décision explicite).
+- 2026-07-09 : décision utilisateur — le Lot 7 s'ouvre partiellement : **7.2 puis 7.3** (pas 7.1). Décisions 7.3 actées : Concurrency + Capacity d'emblée ; leader-lease advisory sur la start_loop.
+- 2026-07-09 : 7.2 (D2) fait — `batch.remaining` remplace le FOR UPDATE + NOT EXISTS (et l'index partiel B3, droppé). Décrément groupé par batch dans chaque tx terminale (origine + cascade + ancêtres dead-end), sérialisation naturelle sur le verrou de ligne, gate #601 conservé, `remaining` exposé dans GET /batches. Incident de relecture : un `git checkout --` pendant la contre-épreuve a effacé les modifs non commitées de l'agent sur task_lifecycle.rs — réappliquées à l'identique depuis le diff déjà relu (leçon : sauvegarder un patch avant toute contre-épreuve sur du travail non commité). Contre-épreuve concluante (cascade exclue ⇒ régression rouge). 250 intégration + 46 unitaires verts. Suivant : 7.3 (rule_slot).
