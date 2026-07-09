@@ -158,7 +158,10 @@ pub async fn enqueue_batch_complete_outbox<'a>(
 
 /// Check whether `batch_id` is fully terminal (no task with a non-terminal status)
 /// and, if so, enqueue a `batch_complete` outbox row — but ONLY if the batch has a
-/// registered `on_batch_complete` payload (a row in `batch`).
+/// non-empty `on_complete` (a registered `on_batch_complete` webhook payload). A
+/// batch with no `batch` row, or a `batch` row whose `on_complete` is `'[]'`
+/// (scope/metadata-only batch, #601), carries no completion signal and is skipped
+/// without taking the batch lock (Audit 2, B3).
 ///
 /// Idempotent and concurrency-safe: the unique idempotency key + `ON CONFLICT DO
 /// NOTHING` mean repeated/concurrent calls enqueue at most one row. Call inside the
@@ -178,24 +181,34 @@ pub async fn maybe_enqueue_batch_complete<'a>(
     // still non-terminal (write skew) and neither would enqueue the signal — losing
     // it forever. With the row lock, the second transaction waits for the first to
     // commit, and its terminality check below then runs on a fresh statement
-    // snapshot that includes the first one's update. (Folding the lock and the
-    // check into one statement would NOT work: the subquery would be evaluated on
-    // the pre-wait snapshot.)
+    // snapshot that includes the first one's update. (Folding the terminality
+    // subquery into this locking statement would NOT work: the subquery would be
+    // evaluated on the pre-wait snapshot.)
     //
-    // Batches without a `batch` row are a cheap no-op. A batch row may exist with an
-    // EMPTY `on_complete` (scope/metadata-only batch, no webhook) — those carry no
-    // completion signal, so skip them too. We lock + read `on_complete` in one
-    // statement; the lock still serialises concurrent detection for webhook batches.
-    let locked: Option<(uuid::Uuid, serde_json::Value)> = dsl::batch
+    // Non-vacuity is pushed INTO the locking statement (Audit 2, B3). A batch with an
+    // EMPTY `on_complete` (scope/metadata-only batch, #601, or a batch with no
+    // `on_batch_complete` at all) carries no completion signal, so it must NOT be
+    // locked: otherwise EVERY terminal transition of such a batch would serialise on
+    // this lock for nothing. The `on_complete <> '[]'::jsonb` predicate lets the
+    // SELECT match (and lock) only webhook batches; a no-webhook batch — or a batch
+    // with no `batch` row — returns no row and early-returns without ever taking the
+    // lock. (`on_complete` is a JSONB array by construction: the `'[]'` column default
+    // or a JSON array of `NewActionDto`. The literal `<> '[]'::jsonb` comparison is
+    // therefore robust and never errors, unlike `jsonb_array_length` on a non-array.)
+    // The lock still serialises concurrent detection for webhook batches, preserving
+    // the write-skew protection above.
+    let locked: Option<uuid::Uuid> = dsl::batch
         .filter(dsl::id.eq(batch_id))
-        .select((dsl::id, dsl::on_complete))
+        .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+            "on_complete <> '[]'::jsonb",
+        ))
+        .select(dsl::id)
         .for_update()
-        .first::<(uuid::Uuid, serde_json::Value)>(conn)
+        .first::<uuid::Uuid>(conn)
         .await
         .optional()?;
 
-    let has_webhook = matches!(locked, Some((_, ref on_complete)) if on_complete.as_array().is_some_and(|a| !a.is_empty()));
-    if !has_webhook {
+    if locked.is_none() {
         return Ok(());
     }
 

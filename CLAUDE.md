@@ -338,6 +338,9 @@ idx_webhook_execution_status ON webhook_execution(status)
 idx_webhook_execution_pending_due ON webhook_execution(next_attempt_at) WHERE status = 'pending'
 idx_webhook_execution_batch_id ON webhook_execution(batch_id) WHERE batch_id IS NOT NULL
 idx_task_priority ON task(status, priority DESC, created_at ASC)
+idx_task_batch_active ON task(batch_id) WHERE status NOT IN ('success','failure','canceled')
+  -- partial index (Audit 2, B3): makes the batch-complete NOT EXISTS probe O(1) as a
+  --   batch drains (contains only still-active rows), instead of O(N) over all terminal rows
 idx_batch_scope ON batch(scope) WHERE scope IS NOT NULL
 idx_batch_metadata_gin ON batch USING GIN(metadata)
 ```

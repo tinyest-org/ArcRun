@@ -3155,3 +3155,343 @@ async fn test_audit2_b1_flow_unchanged_after_phase_split() {
         "on_start webhook should be received exactly once"
     );
 }
+
+// ===========================================================================
+// Audit 2, B3 — batch-complete detection: O(1) per transition, no lock on
+//               no-webhook batches.
+// ===========================================================================
+//
+// # Original problem
+// `maybe_enqueue_batch_complete` (src/db/webhook_execution.rs) ran, on EVERY
+// terminal transition of a batched task, a `NOT EXISTS (task WHERE batch_id=$1
+// AND status NOT IN (terminal))` probe, serialised per batch by the `batch` row
+// lock. With only `idx_task_batch_id` (every row of the batch), near the end of a
+// large batch's life the probe scanned almost all of the batch's already-terminal
+// rows: O(N) per transition ⇒ O(N^2) per batch (a 50k batch ≈ 1.25 billion
+// cumulative row visits). Two defects:
+//   1. No index qualified the probe's exact predicate.
+//   2. The locking `SELECT ... FOR UPDATE` locked EVERY batch row — including
+//      scope/metadata-only batches (`on_complete = '[]'`, #601) that carry no
+//      completion signal — so their terminal transitions serialised for nothing.
+//
+// # Fix
+//   1. A PARTIAL index `idx_task_batch_active ON task(batch_id) WHERE status NOT IN
+//      ('success','failure','canceled')` — byte-for-byte the probe's predicate — so
+//      the `NOT EXISTS` becomes an index existence check whose cost is independent of
+//      the number of terminal rows (O(1) as the batch drains).
+//   2. The non-vacuity predicate is pushed INTO the locking statement
+//      (`on_complete <> '[]'::jsonb`): a no-webhook batch no longer matches, so the
+//      `SELECT ... FOR UPDATE` returns no row, takes no lock, and early-returns.
+//
+// # What these tests assert
+//   * The probe's EXPLAIN plan qualifies `idx_task_batch_active` (with seqscan
+//     disabled, which is required on a tiny test table — see the documented limit).
+//   * A scope-only batch (`on_complete = '[]'`) reaches full termination WITHOUT
+//     enqueuing any `batch_complete` outbox row (behaviour unchanged; no lock/probe
+//     work is spent on it).
+//   * A webhook batch still fires its `on_batch_complete` exactly once, on the last
+//     task's terminal transition (non-regression of the modified locking path).
+
+/// Total `batch_complete` outbox rows for a batch (any status).
+async fn b3_batch_complete_total(pool: &arcrun::DbPool, batch_id: uuid::Uuid) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        c: i64,
+    }
+    let mut conn = pool.get().await.unwrap();
+    let r: Cnt = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query(
+            "SELECT count(*) AS c FROM webhook_execution \
+             WHERE batch_id = $1 AND trigger = 'batch_complete'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(batch_id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    r.c
+}
+
+/// A batch row's `on_complete` payload as JSON (panics if the row is absent).
+async fn b3_batch_on_complete(pool: &arcrun::DbPool, batch_id: uuid::Uuid) -> serde_json::Value {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        on_complete: serde_json::Value,
+    }
+    let mut conn = pool.get().await.unwrap();
+    let r: Row = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query("SELECT on_complete FROM batch WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(batch_id),
+        &mut *conn,
+    )
+    .await
+    .expect("batch row should exist");
+    r.on_complete
+}
+
+/// POST an object-form body, assert 201, return the `X-Batch-ID`.
+async fn b3_create_batch<S, B>(app: &S, body: &serde_json::Value) -> uuid::Uuid
+where
+    S: ActixService<ActixRequest, Response = ActixServiceResponse<B>, Error = actix_web::Error>,
+    B: ActixMessageBody,
+{
+    let req = actix_web::test::TestRequest::post()
+        .uri("/task")
+        .insert_header(("requester", "test"))
+        .set_json(body)
+        .to_request();
+    let resp = actix_web::test::call_service(app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "POST /task (object form) should return 201 Created"
+    );
+    resp.headers()
+        .get("X-Batch-ID")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .expect("X-Batch-ID header")
+}
+
+#[derive(diesel::QueryableByName)]
+struct B3PlanText {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    plan: String,
+}
+
+/// EXPLAIN the EXACT batch-complete probe SQL for `batch_id` and return the plan text.
+///
+/// The probe's `NOT EXISTS (...)` inner query is EXPLAINed. EXPLAIN's output column is
+/// literally named `QUERY PLAN` (a space diesel cannot bind by name), so the statement
+/// is wrapped in a temp plpgsql function whose SETOF-text result we alias to `plan` and
+/// aggregate into one string.
+///
+/// With `disable_seqscan = true` the planner is forced to prefer any usable index. On a
+/// tiny test table a seqscan is otherwise cheapest, so WITHOUT this the plan is a seqscan
+/// — that is the planner behaving correctly for a small relation, NOT a failure of the
+/// index (documented limit; the control assertion below relies on it).
+async fn b3_explain_probe_plan(
+    pool: &arcrun::DbPool,
+    batch_id: uuid::Uuid,
+    disable_seqscan: bool,
+) -> String {
+    use diesel_async::RunQueryDsl;
+    let mut conn = pool.get().await.unwrap();
+
+    diesel::sql_query(if disable_seqscan {
+        "SET enable_seqscan = off"
+    } else {
+        "SET enable_seqscan = on"
+    })
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // The dynamic SQL is the byte-for-byte inner probe of `maybe_enqueue_batch_complete`
+    // (same status literals, same predicate) so the partial index qualifies identically.
+    diesel::sql_query(
+        "CREATE OR REPLACE FUNCTION pg_temp.b3_explain_probe(bid uuid)
+         RETURNS SETOF text AS $$
+         BEGIN
+             RETURN QUERY EXECUTE
+               'EXPLAIN (FORMAT TEXT) SELECT NOT EXISTS (
+                    SELECT 1 FROM task t
+                    WHERE t.batch_id = ' || quote_literal(bid) || '::uuid
+                      AND t.status NOT IN (''success'', ''failure'', ''canceled'')
+                ) AS ready';
+         END
+         $$ LANGUAGE plpgsql;",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let rows: Vec<B3PlanText> = diesel::sql_query(
+        "SELECT string_agg(line, E'\n') AS plan FROM pg_temp.b3_explain_probe($1) AS t(line)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(batch_id)
+    .get_results(&mut conn)
+    .await
+    .unwrap();
+
+    let _ = diesel::sql_query("RESET enable_seqscan")
+        .execute(&mut conn)
+        .await;
+
+    rows.into_iter().next().map(|r| r.plan).unwrap_or_default()
+}
+
+/// B3 — the batch-complete probe's plan qualifies the partial index `idx_task_batch_active`.
+///
+/// Seeds a batch with a mix of terminal and active tasks (so the partial index holds
+/// entries), then EXPLAINs the exact probe with seqscan disabled and asserts the plan
+/// references `idx_task_batch_active`. Reverting the migration (no such index) makes the
+/// plan fall back to `idx_task_batch_id` / a seqscan and this assertion fails.
+#[tokio::test]
+async fn test_audit2_b3_probe_uses_partial_index() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // A batch of independent tasks; succeed some (terminal), leave some Pending
+    // (active) so `idx_task_batch_active` has live entries for this batch.
+    let created = create_tasks_ok(
+        &app,
+        &[
+            task_json("b3-idx-1", "B3 idx 1", "b3"),
+            task_json("b3-idx-2", "B3 idx 2", "b3"),
+            task_json("b3-idx-3", "B3 idx 3", "b3"),
+        ],
+    )
+    .await;
+    let batch_id = created[0].batch_id.expect("tasks should share a batch_id");
+    succeed_task(&state, created[0].id).await;
+
+    // ANALYZE so the planner has stats (still tiny — hence enable_seqscan=off).
+    {
+        use diesel_async::RunQueryDsl;
+        let mut conn = state.pool.get().await.unwrap();
+        diesel::sql_query("ANALYZE task")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    let plan = b3_explain_probe_plan(&state.pool, batch_id, true).await;
+    assert!(
+        plan.contains("idx_task_batch_active"),
+        "the batch-complete probe must be served by the partial index \
+         idx_task_batch_active (seqscan disabled); plan was:\n{plan}"
+    );
+
+    // Documented limit: without disabling seqscan, a tiny relation is cheapest to
+    // seqscan. We do NOT assert index use here — a seqscan is the planner behaving
+    // correctly for a small table, not an index failure. (Left as an observation.)
+    let plan_default = b3_explain_probe_plan(&state.pool, batch_id, false).await;
+    let _ = plan_default; // recorded for local inspection; intentionally not asserted.
+}
+
+/// B3 — a scope-only batch (`on_complete = '[]'`) reaches full termination WITHOUT
+/// enqueuing a `batch_complete` outbox row.
+///
+/// Since #601 a scope/metadata-only batch has a `batch` row but an empty `on_complete`.
+/// The B3 fix pushes `on_complete <> '[]'::jsonb` into the locking statement so such a
+/// batch is neither locked nor signalled. This asserts the observable half: after the
+/// only task becomes terminal, no `batch_complete` outbox row exists for the batch
+/// (behaviour unchanged; the lock is simply not taken).
+#[tokio::test]
+async fn test_audit2_b3_scope_only_batch_no_batch_complete_enqueue() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let body = json!({
+        "tasks": [task_json("b3-scope-1", "B3 scope only", "b3")],
+        "scope": "b3-scope-only",
+        "metadata": {"env": "test"}
+    });
+    let batch_id = b3_create_batch(&app, &body).await;
+
+    // Precondition: the batch row exists with an EMPTY on_complete (scope-only).
+    assert_eq!(
+        b3_batch_on_complete(&state.pool, batch_id).await,
+        json!([]),
+        "a scope-only batch must store on_complete = '[]'"
+    );
+
+    let created = get_task_ok(&app, uuid_of_only_task(&state, batch_id).await).await;
+    succeed_task(&state, created.id).await;
+
+    assert_eq!(
+        b3_batch_complete_total(&state.pool, batch_id).await,
+        0,
+        "a scope-only batch (empty on_complete) must NOT enqueue a batch_complete row"
+    );
+}
+
+/// Resolve the single task id of a batch (test helper for the scope-only batch, whose
+/// POST body returns tasks but we re-fetch to stay independent of body shape).
+async fn uuid_of_only_task(state: &arcrun::handlers::AppState, batch_id: uuid::Uuid) -> uuid::Uuid {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
+    let mut conn = state.pool.get().await.unwrap();
+    let r: Row = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query("SELECT id FROM task WHERE batch_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(batch_id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    r.id
+}
+
+/// B3 — a webhook batch still fires `on_batch_complete` exactly once, on the last
+/// task's terminal transition (non-regression of the modified locking path).
+#[tokio::test]
+async fn test_audit2_b3_webhook_batch_fires_once_on_last_terminal() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits.clone());
+
+    let body = json!({
+        "tasks": [
+            task_json("b3-wh-1", "B3 wh 1", "b3"),
+            task_json("b3-wh-2", "B3 wh 2", "b3"),
+        ],
+        "on_batch_complete": [
+            {"kind": "Webhook", "params": {"url": webhook_url, "verb": "Post"}}
+        ]
+    });
+    let batch_id = b3_create_batch(&app, &body).await;
+
+    // Collect the two task ids (order-independent).
+    let ids = {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Uuid)]
+            id: uuid::Uuid,
+        }
+        let mut conn = state.pool.get().await.unwrap();
+        let rows: Vec<Row> = diesel_async::RunQueryDsl::get_results(
+            diesel::sql_query("SELECT id FROM task WHERE batch_id = $1 ORDER BY name")
+                .bind::<diesel::sql_types::Uuid, _>(batch_id),
+            &mut *conn,
+        )
+        .await
+        .unwrap();
+        rows.into_iter().map(|r| r.id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids.len(), 2, "batch should have two tasks");
+
+    // First task terminal: batch not yet complete -> no signal.
+    succeed_task(&state, ids[0]).await;
+    assert_eq!(
+        b3_batch_complete_total(&state.pool, batch_id).await,
+        0,
+        "batch_complete must NOT fire before the last task is terminal"
+    );
+
+    // Last task terminal: exactly one batch_complete row is enqueued.
+    succeed_task(&state, ids[1]).await;
+    assert_eq!(
+        b3_batch_complete_total(&state.pool, batch_id).await,
+        1,
+        "exactly one batch_complete row on the last terminal transition"
+    );
+
+    // Delivery fires the webhook exactly once.
+    drain_outbox(&state).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "on_batch_complete webhook must be delivered exactly once"
+    );
+
+    let _ = shutdown_server.send(());
+}
