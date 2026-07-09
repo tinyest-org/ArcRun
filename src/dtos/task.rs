@@ -207,7 +207,9 @@ pub struct BasicTaskDto {
 /// The `status` field is ignored.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateTaskDto {
-    /// Updated metadata (merged with existing). Only used by PATCH.
+    /// Updated metadata. **Full replace, not a merge** — the value REPLACES the stored
+    /// metadata entirely, so send the complete object to preserve existing fields.
+    /// Only used by PATCH.
     pub metadata: Option<serde_json::Value>,
     /// New status. Only `Success` and `Failure` are accepted via the API. Only used by PATCH.
     pub status: Option<StatusKind>,

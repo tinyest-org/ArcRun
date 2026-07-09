@@ -10,10 +10,11 @@ use super::response::validation_error_response;
     get,
     path = "/task",
     summary = "List tasks",
-    description = "Returns a paginated list of tasks. Supports filtering by name, kind, status, batch_id, and metadata substring. Default page_size is 50, maximum is 100. Results are returned as lightweight BasicTaskDto (no actions/rules).",
+    description = "Returns a paginated list of tasks. Supports filtering by name, kind, status, batch_id, and metadata (JSONB containment). Default page_size is 50, maximum is 100. Results are returned as lightweight BasicTaskDto (no actions/rules).",
     params(dtos::PaginationDto, dtos::FilterDto),
     responses(
         (status = 200, description = "Paginated array of tasks matching the filters", body = Vec<dtos::BasicTaskDto>),
+        (status = 400, description = "A filter value is invalid (e.g. `metadata` is not valid JSON)"),
     ),
     tag = "tasks"
 )]
@@ -25,7 +26,8 @@ pub async fn list_task(
 ) -> actix_web::Result<HttpResponse> {
     let mut conn = state.conn().await?;
     let pagination = pagination.0.resolve(&state.config);
-    let filter = filter.0.resolve();
+    // A10: a malformed `metadata` filter is a 400, not a silent "return everything".
+    let filter = filter.0.resolve().map_err(ApiError::BadRequest)?;
 
     let tasks = db_operation::list_task_filtered_paged(&mut conn, pagination, filter)
         .await
@@ -43,14 +45,18 @@ pub async fn list_task(
 
 This endpoint is synchronous: it immediately triggers `on_success`/`on_failure` webhooks and propagates status to dependent children. For high-throughput counter updates, use `PUT /task/{task_id}` instead.
 
+**Idempotent & retry-safe:** re-sending the same terminal status a task already holds returns `200` as a no-op (no duplicate webhooks or propagation), so a client whose response was lost can safely retry. A request for a *different* status on an already-terminal task returns `409` with the current status in the body; an unknown id returns `404`.
+
+**`metadata` is a full replace, not a merge:** the value you send REPLACES the stored metadata entirely. To keep existing fields, send the complete object (partial updates drop omitted keys, including any used by dedupe/concurrency matchers).
+
 The `task_id` is the UUID returned by `POST /task`, also available from the `?handle=` query parameter passed to your webhook.",
     params(("task_id" = Uuid, Path, description = "The UUID of the task to update (returned by POST /task or from the ?handle= webhook query param)")),
-    request_body(content = dtos::UpdateTaskDto, description = "Fields to update. Set `status` to `Success` or `Failure`. When setting `Failure`, `failure_reason` is required."),
+    request_body(content = dtos::UpdateTaskDto, description = "Fields to update. Set `status` to `Success` or `Failure`. When setting `Failure`, `failure_reason` is required. `metadata` fully replaces the stored value (not merged)."),
     responses(
-        (status = 200, description = "Task updated successfully. Webhooks and propagation triggered."),
+        (status = 200, description = "Task updated, OR an idempotent no-op because the task already holds the requested status. Webhooks/propagation run only on a real transition."),
         (status = 400, description = "Validation failed (invalid status transition, missing failure_reason, etc.)"),
         (status = 404, description = "Task not found"),
-        (status = 409, description = "Task exists but is not in Running state"),
+        (status = 409, description = "Task exists but is not Running (and not already the requested status); body includes `current_status`"),
     ),
     tag = "tasks"
 )]
@@ -79,9 +85,22 @@ pub async fn update_task(
         db_operation::UpdateTaskResult::Updated => {
             HttpResponse::Ok().body("Task updated successfully")
         }
+        // A10: idempotent retry — the task already sits in the requested terminal
+        // status, so answer 200 without re-running propagation/outbox.
+        db_operation::UpdateTaskResult::AlreadyInRequestedState => {
+            HttpResponse::Ok().body("Task already in the requested state (idempotent no-op)")
+        }
         db_operation::UpdateTaskResult::NotFound => {
             HttpResponse::NotFound().json(serde_json::json!({
-                "error": "Task not found or not in Running state"
+                "error": "Task not found"
+            }))
+        }
+        // A10: the task exists but is not updatable to the requested status; surface
+        // the current status so a client can tell "already applied" from "wrong id".
+        db_operation::UpdateTaskResult::Conflict(current) => {
+            HttpResponse::Conflict().json(serde_json::json!({
+                "error": "Task is not in a Running state",
+                "current_status": current
             }))
         }
     })
@@ -336,11 +355,13 @@ pub async fn add_task(
 
 If the task has a registered `Cancel` action (returned by the `on_start` webhook response), that webhook is called.
 
-Only tasks in `Pending`, `Waiting`, or `Running` status can be canceled.",
+Only tasks in `Pending`, `Waiting`, `Paused`, `Claimed`, or `Running` status can be canceled. Terminal tasks (`Success`/`Failure`/`Canceled`) cannot.",
     params(("task_id" = Uuid, Path, description = "The UUID of the task to cancel")),
     responses(
         (status = 200, description = "Task canceled and propagation completed"),
-        (status = 400, description = "Task could not be canceled (already finished or invalid state)"),
+        (status = 400, description = "Task exists but is in a non-cancelable (terminal) state; the message names the current state"),
+        (status = 404, description = "No task found with this ID"),
+        (status = 500, description = "Internal error (e.g. database failure) while canceling"),
     ),
     tag = "tasks"
 )]
@@ -351,16 +372,16 @@ pub async fn cancel_task(
 ) -> actix_web::Result<HttpResponse> {
     let mut conn = state.conn().await?;
 
-    match workers::cancel_task(
+    // A10: map the worker error precisely — 404 (absent), 400 (non-cancelable
+    // state), 500 (DB failure) — instead of collapsing every failure to a bare 400.
+    workers::cancel_task(
         &task_id,
         state.config.worker.dead_end_cancel_enabled,
         &mut conn,
     )
     .await
-    {
-        Ok(_) => Ok(HttpResponse::Ok().finish()),
-        Err(_) => Ok(HttpResponse::BadRequest().finish()),
-    }
+    .map_err(ApiError::from)?;
+    Ok(HttpResponse::Ok().finish())
 }
 
 #[utoipa::path(

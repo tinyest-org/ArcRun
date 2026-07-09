@@ -107,10 +107,10 @@ All HTTP handler functions and route configuration:
 - `health_check` / `readiness_check` - Health and readiness probes
 - `add_task` - POST /task (batch create)
 - `get_task` - GET /task/{task_id}
-- `list_task` - GET /task (filtered, paginated)
-- `update_task` - PATCH /task/{task_id}
+- `list_task` - GET /task (filtered, paginated). A malformed `?metadata=` filter is a **400** (A10) — not silently ignored (which used to return every task).
+- `update_task` - PATCH /task/{task_id}. **Idempotent & precise status codes (A10):** a real transition → 200; re-PATCHing the status the task already holds → **200 no-op** (no duplicate propagation/outbox); the task exists but is not Running/Claimed (and not already the requested status) → **409** with `current_status` in the body; unknown id → 404. `metadata` is a **full replace, not a merge** — send the complete object (a partial update drops omitted keys, including any used by dedupe/concurrency matchers).
 - `batch_task_updater` - PUT /task/{task_id} (high-throughput counter updates)
-- `cancel_task` - DELETE /task/{task_id}
+- `cancel_task` - DELETE /task/{task_id}. Cancelable from `Pending`, **`Waiting`** (A10 — lets an operator prune a not-yet-eligible DAG branch), `Paused`, `Claimed`, or `Running`; terminal tasks are refused. Error mapping (A10): unknown id → **404**, non-cancelable state → **400** (message names the state), DB failure → **500**. A canceled `Waiting`/`Pending` task never ran on_start, so no `cancel` outbox row is enqueued for it — but its children still cascade (Canceled == Failed).
 - `pause_task` - PATCH /task/pause/{task_id} (Pending/Waiting only)
 - `resume_task` - PATCH /task/resume/{task_id} (Paused only; → Waiting or Pending by remaining deps)
 - `list_webhook_deliveries` - GET /webhook-deliveries (outbox observability; `?status=exhausted`, paginated)

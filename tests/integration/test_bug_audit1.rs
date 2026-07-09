@@ -107,10 +107,13 @@ async fn test_bug2_double_update_no_negative_counters() {
     let res2 = arcrun::db_operation::update_running_task(&mut conn, parent_id, success_dto(), true)
         .await
         .unwrap();
+    // A10: a re-PATCH of the same terminal status is now an idempotent no-op
+    // (AlreadyInRequestedState) rather than a blanket NotFound — but it STILL skips
+    // propagation, so the anti-double-propagation guarantee this test checks holds.
     assert_eq!(
         res2,
-        arcrun::db_operation::UpdateTaskResult::NotFound,
-        "Second update should be NotFound (task no longer Running, prevents double propagation)"
+        arcrun::db_operation::UpdateTaskResult::AlreadyInRequestedState,
+        "Second update should be an idempotent no-op (task already Success; no double propagation)"
     );
 
     assert_task_status(
@@ -167,10 +170,12 @@ async fn test_bug3_double_success_update_returns_zero_second_time() {
     let res2 = arcrun::db_operation::update_running_task(&mut conn, task_id, success_dto(), true)
         .await
         .unwrap();
+    // A10: re-PATCH of the same terminal status is now an idempotent no-op — no
+    // duplicate webhook execution (the outbox row is not re-enqueued).
     assert_eq!(
         res2,
-        arcrun::db_operation::UpdateTaskResult::NotFound,
-        "Second update should be NotFound (task no longer Running) — prevents duplicate webhook execution"
+        arcrun::db_operation::UpdateTaskResult::AlreadyInRequestedState,
+        "Second update should be an idempotent no-op — prevents duplicate webhook execution"
     );
 
     assert_task_status(
@@ -182,9 +187,13 @@ async fn test_bug3_double_success_update_returns_zero_second_time() {
     .await;
 }
 
-/// Bug #3 (variant): Double update via HTTP API returns 404 for the second call.
+/// Bug #3 (variant): a double update via the HTTP API must not double-deliver.
+///
+/// A10 update: the second identical PATCH is now an **idempotent 200** (was 404),
+/// but the anti-double-delivery guarantee this test protects still holds — the
+/// second call re-runs no propagation and enqueues no second end outbox row.
 #[tokio::test]
-async fn test_bug3_double_update_via_api_second_call_not_200() {
+async fn test_bug3_double_update_via_api_second_call_idempotent() {
     let (_g, state) = setup_test_app().await;
     let app = test_service!(state);
 
@@ -216,16 +225,36 @@ async fn test_bug3_double_update_via_api_second_call_not_200() {
         "First update should return 200"
     );
 
-    // Second PATCH: should NOT succeed
+    // Second PATCH with the SAME status: idempotent no-op → 200 (A10).
     let patch2 = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
         .set_json(&json!({"status": "Success"}))
         .to_request();
     let resp2 = actix_web::test::call_service(&app, patch2).await;
-    assert_ne!(
+    assert_eq!(
         resp2.status(),
         actix_web::http::StatusCode::OK,
-        "Second update should NOT return 200 — task is no longer Running"
+        "Second identical update should be an idempotent 200 (A10)"
+    );
+
+    // The idempotent no-op must NOT enqueue a second end outbox row.
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        c: i64,
+    }
+    let cnt: Cnt = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query(
+            "SELECT count(*) AS c FROM webhook_execution WHERE task_id = $1 AND trigger = 'end'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cnt.c, 1,
+        "an idempotent re-PATCH must NOT create a second end outbox row"
     );
 }
 
@@ -384,16 +413,18 @@ async fn test_bug8_update_nonexistent_task_returns_404() {
     );
 }
 
-/// Bug: A task that exists but is in Pending state should return 404 (not in Running state).
+/// Bug: A task that exists but is not Running must be distinguishable from an
+/// unknown id. A10 update: it is now a **409 Conflict** carrying the current status
+/// (was a generic 404) — the caller can tell "wrong state" from "wrong id".
 #[tokio::test]
-async fn test_bug8_update_non_running_task_returns_404() {
+async fn test_bug8_update_non_running_task_returns_409() {
     let (_g, state) = setup_test_app().await;
     let app = test_service!(state);
 
     let created = create_tasks_ok(&app, &[task_json("pending-task", "Pending Task", "test")]).await;
     let task_id = created[0].id;
 
-    // Attempt to update a Pending task — should get 404 (not Running)
+    // Attempt to update a Pending task — the task exists but is not Running, so 409.
     let update_req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
         .set_json(&json!({"status": "Success"}))
@@ -402,7 +433,13 @@ async fn test_bug8_update_non_running_task_returns_404() {
 
     assert_eq!(
         update_resp.status(),
-        actix_web::http::StatusCode::NOT_FOUND,
-        "Updating a Pending (non-Running) task should return 404"
+        actix_web::http::StatusCode::CONFLICT,
+        "Updating a Pending (non-Running) task should return 409 with the current status"
+    );
+    let body: serde_json::Value = actix_web::test::read_body_json(update_resp).await;
+    assert_eq!(
+        body["current_status"], "Pending",
+        "409 body must carry the current status, got: {}",
+        body
     );
 }

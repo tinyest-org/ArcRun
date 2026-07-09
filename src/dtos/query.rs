@@ -62,7 +62,9 @@ pub struct FilterDto {
     pub status: Option<StatusKind>,
     /// Filter by timeout value (exact match).
     pub timeout: Option<i32>,
-    /// Filter by metadata substring match (searches within the JSON metadata).
+    /// Filter by metadata JSONB containment (`@>`). Must be a valid JSON object,
+    /// e.g. `?metadata={"env":"prod"}`; matches tasks whose metadata contains it.
+    /// A malformed value is rejected with 400 (not silently ignored).
     pub metadata: Option<String>,
     /// Filter by batch UUID. Use this to get all tasks from a specific batch/DAG.
     pub batch_id: Option<uuid::Uuid>,
@@ -108,14 +110,27 @@ impl WebhookDeliveryFilterDto {
 
 impl FilterDto {
     /// Resolve raw query params into escaped/parsed values ready for DB queries.
-    pub fn resolve(self) -> Filter {
-        Filter {
+    ///
+    /// A10: a malformed `metadata` filter is now a hard error (`Err`) instead of being
+    /// silently dropped. Previously `serde_json::from_str(..).ok()` swallowed the parse
+    /// error, turning `?metadata={bad}` into "no metadata filter" — so the request
+    /// returned ALL tasks instead of rejecting the bad input. This mirrors how an
+    /// invalid `status` is rejected (serde fails the query extraction → 400).
+    pub fn resolve(self) -> Result<Filter, String> {
+        let metadata =
+            match self.metadata {
+                None => None,
+                Some(f) => Some(serde_json::from_str(&f).map_err(|e| {
+                    format!("invalid `metadata` filter: expected valid JSON ({})", e)
+                })?),
+            };
+        Ok(Filter {
             name: super::escape_like_pattern(&self.name.unwrap_or_default()),
             kind: super::escape_like_pattern(&self.kind.unwrap_or_default()),
-            metadata: self.metadata.and_then(|f| serde_json::from_str(&f).ok()),
+            metadata,
             status: self.status,
             timeout: self.timeout,
             batch_id: self.batch_id,
-        }
+        })
     }
 }

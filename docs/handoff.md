@@ -4,6 +4,13 @@ Contexte de reprise pour la prochaine session.
 
 ## Campagne en cours : fixes Audit 2 (depuis 2026-07-08)
 
+**Avancement au 2026-07-09** : Lot 4 — 4.1 (c7cfe58), 4.2 (e0c6867), 4.3 (3648456),
+4.4 (95ee8b4), 4.5 (3887fab), 4.6 (1f58c49) faits ; 4.7 (A10 grab-bag) en cours,
+puis 4.8 (optionnel) et Lots 5-6. Détail et notes de relecture par item dans
+`docs/audits/AUDIT_2_FIXES.md`. Décisions utilisateur actées : pause = Pending+Waiting,
+Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7). Renversement
+assumé du commit 2e50620 en 4.4 (compteurs terminaux gelés).
+
 - **Référence d'analyse** : `docs/audits/AUDIT_2_CLAUDE.md` — audit complet perf,
   correctness et architecture (post Lots 0-3). Chaque finding : fichier:ligne, scénario
   d'échec, fix suggéré, sévérité. Findings majeurs contre-vérifiés à la main.

@@ -13,12 +13,24 @@ use super::webhook_execution::{
 use super::{DbError, run_in_transaction, task_crud::insert_actions};
 
 /// Result of attempting to update a running task.
+///
+/// A10: the outcome is now precise enough for an idempotent, retry-safe PATCH. When
+/// the guarded UPDATE matches 0 rows, a follow-up SELECT classifies the task so the
+/// handler can answer 404 / 200 (idempotent) / 409 instead of one blanket 404.
 #[derive(Debug, PartialEq)]
 pub enum UpdateTaskResult {
-    /// Task was successfully updated (transitioned from Running).
+    /// Task was successfully updated (transitioned from Running/Claimed).
     Updated,
-    /// Task does not exist or was not in Running state.
+    /// Task does not exist.
     NotFound,
+    /// Task already sits in the requested terminal status — an idempotent no-op.
+    /// No propagation is re-run and no outbox row is (re-)enqueued. Lets a client
+    /// safely retry a PATCH whose response was lost.
+    AlreadyInRequestedState,
+    /// Task exists but is in a state that cannot be updated to the requested status
+    /// (neither Running/Claimed nor already the requested status). Carries the
+    /// current status so the caller can surface it in a 409.
+    Conflict(StatusKind),
 }
 
 #[tracing::instrument(name = "update_running_task", level = "debug", skip(conn, dto), fields(task_id = %task_id))]
@@ -156,10 +168,30 @@ pub async fn update_running_task<'a>(
     }
 
     if res == 1 {
-        Ok(UpdateTaskResult::Updated)
-    } else {
-        Ok(UpdateTaskResult::NotFound)
+        return Ok(UpdateTaskResult::Updated);
     }
+
+    // 0 rows matched the guarded UPDATE. For a status-changing PATCH, run a
+    // follow-up SELECT to classify the miss (A10): absent → NotFound; already the
+    // requested status → idempotent no-op; any other state → Conflict. The tx above
+    // committed nothing, so this autocommit read only shapes the diagnostic — it does
+    // NOT re-run propagation or re-enqueue the outbox (the guarded UPDATE never fired).
+    if let Some(requested) = final_status_clone {
+        let current: Option<StatusKind> = task
+            .filter(id.eq(task_id))
+            .select(status)
+            .first::<StatusKind>(conn)
+            .await
+            .optional()?;
+        return Ok(match current {
+            None => UpdateTaskResult::NotFound,
+            Some(s) if s == requested => UpdateTaskResult::AlreadyInRequestedState,
+            Some(s) => UpdateTaskResult::Conflict(s),
+        });
+    }
+
+    // Counter-only update that matched nothing (task absent or not Running/Claimed).
+    Ok(UpdateTaskResult::NotFound)
 }
 
 /// Persist the cancel actions a task's on_start webhook returned, validating each

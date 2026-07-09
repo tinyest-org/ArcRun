@@ -306,20 +306,42 @@ pub async fn cancel_task<'a>(
     // here (no reqwest in the call path); the delivery loop sends them async.
     db_operation::run_in_transaction(conn, |conn| {
         Box::pin(async move {
-            let t = task
+            // A10: distinguish "task absent" (→ 404) from "wrong state" (→ 400).
+            // A bare `.first()?` would surface a missing task as a diesel NotFound
+            // that maps to a 500 Database error, so use `.optional()` and raise a
+            // typed `NotFound` instead.
+            let t = match task
                 .filter(id.eq(task_id))
                 .for_update()
                 .first::<Task>(conn)
-                .await?;
+                .await
+                .optional()?
+            {
+                Some(t) => t,
+                None => {
+                    return Err(crate::error::ArcRunError::NotFound {
+                        message: format!("Task {} not found", task_id),
+                    });
+                }
+            };
 
             match t.status {
+                // A10: `Waiting` is now cancelable too — it lets an operator prune a
+                // not-yet-eligible DAG branch. A Waiting task never received on_start,
+                // so (like Pending) no cancel webhook is enqueued below; its children
+                // still cascade via `propagate_to_children` (Canceled == Failed).
                 StatusKind::Pending
+                | StatusKind::Waiting
                 | StatusKind::Paused
                 | StatusKind::Claimed
                 | StatusKind::Running => {}
-                _ => {
+                other => {
                     return Err(crate::error::ArcRunError::InvalidState {
-                        message: "Invalid operation: cannot cancel task in this state".into(),
+                        message: format!(
+                            "Cannot cancel task in {:?} state (only Pending, Waiting, Paused, \
+                             Claimed, or Running tasks can be canceled)",
+                            other
+                        ),
                     });
                 }
             }

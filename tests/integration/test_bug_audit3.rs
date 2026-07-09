@@ -1823,3 +1823,330 @@ async fn test_audit2_a8_concurrent_distinct_keys_all_created() {
         "all {N} distinct-key tasks must be created (lock must not over-serialize)"
     );
 }
+
+// =============================================================================
+// Audit 2, A10 — grab-bag: cancel a Waiting task, precise DELETE/PATCH status
+//                codes (404/400/409), idempotent PATCH, 400 on bad metadata filter
+// =============================================================================
+//
+// # Original bugs
+//   * `cancel_task` rejected a `Waiting` task even though the DELETE endpoint doc
+//     advertised it — an operator could not prune a not-yet-eligible DAG branch.
+//   * The DELETE handler collapsed every worker error to an empty `400`: a missing
+//     id and a DB failure were indistinguishable from a genuine "wrong state".
+//   * PATCH was non-idempotent: a 0-row guarded UPDATE always answered `404`, so a
+//     client retrying after a lost response could not tell "already applied" from
+//     "wrong id", and a wrong-state PATCH never surfaced the current status.
+//   * A malformed `?metadata=` filter was parsed with `serde_json::from_str(..).ok()`
+//     and silently dropped — the request then returned ALL tasks instead of a 400.
+//
+// # Fix
+//   * `cancel_task` accepts `Waiting` (Canceled == Failed for propagation, so its
+//     children still cascade), maps a missing task to `NotFound` (404) and a
+//     non-cancelable state to a contextual `InvalidState` (400); the handler now
+//     `map_err(ApiError::from)?` so DB failures surface as 500.
+//   * `update_running_task` runs a follow-up SELECT on a 0-row UPDATE and returns
+//     `NotFound` / `AlreadyInRequestedState` / `Conflict(status)`, which the handler
+//     maps to 404 / 200 (idempotent) / 409.
+//   * `FilterDto::resolve` returns `Err` on a malformed `metadata`, handled as 400.
+
+/// Count outbox (`webhook_execution`) rows for a task with the given trigger,
+/// regardless of status. Used to prove no cancel row is enqueued for a Waiting
+/// cancel, and that an idempotent re-PATCH does not duplicate the end row.
+async fn outbox_count_by_trigger(pool: &arcrun::DbPool, task_id: uuid::Uuid, trigger: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        c: i64,
+    }
+    let mut conn = pool.get().await.unwrap();
+    let r: Cnt = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query(
+            "SELECT count(*) AS c FROM webhook_execution \
+             WHERE task_id = $1 AND trigger = $2::trigger_kind",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(trigger),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    r.c
+}
+
+/// A10 — cancelling a `Waiting` task prunes its DAG branch: the task becomes
+/// `Canceled`, its `requires_success` child cascade-fails, and (like a Pending
+/// cancel) NO cancel outbox row is enqueued because the task never ran on_start.
+/// Later succeeding the parent does not resurrect the pruned branch.
+#[tokio::test]
+async fn test_audit2_a10_cancel_waiting_prunes_branch() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // parent (Pending) -> child (Waiting) -> grandchild (Waiting), all requires_success.
+    // A `sibling` also depends on the parent: it keeps the parent alive after the
+    // child is canceled (otherwise dead-end detection would cancel the now-childless
+    // parent) so we can later succeed the parent and prove the pruned branch stays dead.
+    let tasks = vec![
+        task_json("a10-parent", "A10 Parent", "a10-cancel-waiting"),
+        task_with_deps(
+            "a10-child",
+            "A10 Child",
+            "a10-cancel-waiting",
+            vec![("a10-parent", true)],
+        ),
+        task_with_deps(
+            "a10-grandchild",
+            "A10 Grandchild",
+            "a10-cancel-waiting",
+            vec![("a10-child", true)],
+        ),
+        task_with_deps(
+            "a10-sibling",
+            "A10 Sibling",
+            "a10-cancel-waiting",
+            vec![("a10-parent", true)],
+        ),
+    ];
+    let created = create_tasks_ok(&app, &tasks).await;
+    let parent_id = created[0].id;
+    let child_id = created[1].id;
+    let grandchild_id = created[2].id;
+    let sibling_id = created[3].id;
+
+    assert_eq!(created[0].status, StatusKind::Pending);
+    assert_eq!(created[1].status, StatusKind::Waiting);
+    assert_eq!(created[2].status, StatusKind::Waiting);
+    assert_eq!(created[3].status, StatusKind::Waiting);
+
+    // DELETE the Waiting middle task.
+    let del = actix_web::test::TestRequest::delete()
+        .uri(&format!("/task/{}", child_id))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, del).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "cancelling a Waiting task must return 200"
+    );
+
+    assert_task_status(
+        &app,
+        child_id,
+        StatusKind::Canceled,
+        "child must be Canceled",
+    )
+    .await;
+    assert_task_status(
+        &app,
+        grandchild_id,
+        StatusKind::Failure,
+        "grandchild must cascade-fail (Canceled == Failed for propagation)",
+    )
+    .await;
+
+    // No cancel outbox row for the Waiting task — it never received on_start (same
+    // contract as a Pending cancel).
+    assert_eq!(
+        outbox_count_by_trigger(&state.pool, child_id, "cancel").await,
+        0,
+        "a Waiting cancel must NOT enqueue a cancel webhook (on_start never ran)"
+    );
+
+    // Succeeding the parent afterwards must not resurrect the pruned branch, while the
+    // healthy sibling proceeds to Pending.
+    succeed_task(&state, parent_id).await;
+    assert_task_status(
+        &app,
+        child_id,
+        StatusKind::Canceled,
+        "child stays Canceled after parent success",
+    )
+    .await;
+    assert_task_status(
+        &app,
+        grandchild_id,
+        StatusKind::Failure,
+        "grandchild stays Failure after parent success",
+    )
+    .await;
+    assert_task_status(
+        &app,
+        sibling_id,
+        StatusKind::Pending,
+        "healthy sibling proceeds to Pending after parent success",
+    )
+    .await;
+}
+
+/// A10 — DELETE precise status codes: a missing id → 404, a terminal task → 400
+/// with a message naming the current state (not a bare/empty 400).
+#[tokio::test]
+async fn test_audit2_a10_delete_status_codes() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // Unknown id → 404.
+    let missing = uuid::Uuid::new_v4();
+    let del_missing = actix_web::test::TestRequest::delete()
+        .uri(&format!("/task/{}", missing))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, del_missing).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "DELETE of an unknown id must return 404"
+    );
+
+    // Drive a task to a terminal (Success) state, then DELETE it → 400 + message.
+    let created = create_tasks_ok(&app, &[task_json("a10-term", "A10 Terminal", "a10-del")]).await;
+    let task_id = created[0].id;
+    succeed_task(&state, task_id).await;
+    assert_task_status(&app, task_id, StatusKind::Success, "task should be Success").await;
+
+    let del_term = actix_web::test::TestRequest::delete()
+        .uri(&format!("/task/{}", task_id))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, del_term).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "DELETE of a terminal task must return 400"
+    );
+    let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+    let msg = body["error"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        msg.contains("cannot cancel") && msg.contains("success"),
+        "400 body must name the non-cancelable state, got: {}",
+        body["error"]
+    );
+}
+
+/// A10 — a malformed `?metadata=` filter is a hard 400, not a silent "return
+/// everything". A valid JSON-object metadata filter still returns 200.
+#[tokio::test]
+async fn test_audit2_a10_invalid_metadata_filter_is_400() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // Seed a task so an "ignored filter" would visibly leak rows.
+    let _ = create_tasks_ok(
+        &app,
+        &[task_with_metadata(
+            "a10-meta",
+            "A10 Meta",
+            "a10-meta",
+            json!({"env": "prod"}),
+        )],
+    )
+    .await;
+
+    // Malformed JSON (`{bad`) → 400.
+    let bad = actix_web::test::TestRequest::get()
+        .uri("/task?metadata=%7Bbad")
+        .to_request();
+    let resp = actix_web::test::call_service(&app, bad).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a malformed metadata filter must return 400"
+    );
+
+    // Valid JSON object → 200.
+    let good = actix_web::test::TestRequest::get()
+        .uri("/task?metadata=%7B%22env%22%3A%22prod%22%7D")
+        .to_request();
+    let resp = actix_web::test::call_service(&app, good).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a valid metadata filter must still return 200"
+    );
+}
+
+/// A10 — PATCH is idempotent and retry-safe: PATCH Success → 200; re-PATCH Success
+/// → 200 no-op (exactly one end outbox row, no duplicate); PATCH Failure on the
+/// now-terminal task → 409 with the current status; PATCH on an unknown id → 404.
+#[tokio::test]
+async fn test_audit2_a10_patch_idempotent_and_conflict() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let created = create_tasks_ok(&app, &[task_json("a10-patch", "A10 Patch", "a10-patch")]).await;
+    let task_id = created[0].id;
+
+    // Bring the task to Running so the first PATCH transitions it.
+    {
+        let mut conn = state.pool.get().await.unwrap();
+        assert!(
+            arcrun::db_operation::claim_task(&mut conn, &task_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            arcrun::db_operation::mark_task_running(&mut conn, &task_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    // First PATCH Success → 200 (real transition).
+    let patch_success = || {
+        actix_web::test::TestRequest::patch()
+            .uri(&format!("/task/{}", task_id))
+            .set_json(json!({"status": "Success"}))
+            .to_request()
+    };
+    let resp = actix_web::test::call_service(&app, patch_success()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "first PATCH Success must be 200"
+    );
+
+    // Re-PATCH Success → 200 idempotent no-op.
+    let resp = actix_web::test::call_service(&app, patch_success()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "re-PATCH of the same status must be an idempotent 200"
+    );
+
+    // Exactly ONE end outbox row — the no-op did not re-enqueue.
+    assert_eq!(
+        outbox_count_by_trigger(&state.pool, task_id, "end").await,
+        1,
+        "an idempotent re-PATCH must NOT duplicate the end outbox row"
+    );
+
+    // PATCH Failure on the now-Success task → 409 with the current status.
+    let patch_fail = actix_web::test::TestRequest::patch()
+        .uri(&format!("/task/{}", task_id))
+        .set_json(json!({"status": "Failure", "failure_reason": "late"}))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, patch_fail).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "PATCH to a different status on a terminal task must be 409"
+    );
+    let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+    assert_eq!(
+        body["current_status"], "Success",
+        "409 body must carry the current status, got: {}",
+        body
+    );
+
+    // PATCH on an unknown id → 404.
+    let missing = uuid::Uuid::new_v4();
+    let patch_missing = actix_web::test::TestRequest::patch()
+        .uri(&format!("/task/{}", missing))
+        .set_json(json!({"status": "Success"}))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, patch_missing).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "PATCH on an unknown id must be 404"
+    );
+}
