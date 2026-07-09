@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, ToSocketAddrs};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
+    config::SecurityConfig,
     dtos::NewActionDto,
     metrics,
     models::{Action, ActionKindEnum, Task, TriggerCondition, TriggerKind},
@@ -156,13 +158,80 @@ pub struct ActionExecutor {
     pub client: reqwest::Client,
 }
 
+/// DNS resolver that refuses to hand reqwest any address in an internal/reserved
+/// range (Audit 2, A5 — anti-DNS-rebinding).
+///
+/// Creation-time SSRF validation ([`crate::validation::validate_webhook_url`])
+/// only sees the *name* a webhook was registered with; reqwest resolves that name
+/// again at delivery time — possibly hours later, across retries. A rebinding
+/// attacker registers `evil.example` → a public IP, passes validation, then flips
+/// the record to `169.254.169.254` (cloud metadata) before delivery. This resolver
+/// closes that window by re-checking every resolved IP at the moment of the request:
+/// if any is internal, resolution fails, the delivery errors, and the outbox retries
+/// it later (the existing at-least-once behaviour).
+///
+/// Scope / non-goals:
+/// - **IP-literal URLs never reach this resolver.** reqwest's connector handles a
+///   literal host directly without DNS, so `http://169.254.169.254/` is caught only
+///   by the creation-time check (which now also handles IPv6 literals, A5 fix 1).
+/// - **Blocked hostnames / suffixes stay a creation-time concern.** This resolver
+///   filters purely on the resolved IP, never on the name.
+#[derive(Debug, Clone, Copy)]
+struct SsrfGuardResolver;
+
+impl reqwest::dns::Resolve for SsrfGuardResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            // getaddrinfo blocks — run it on the blocking pool. Port 0: reqwest
+            // overrides the port from the URL afterwards.
+            let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
+                (host.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|it| it.collect::<Vec<_>>())
+            })
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+            let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+            if let Err(bad) = crate::validation::check_resolved_ips(&ips) {
+                return Err(format!(
+                    "SSRF: '{}' resolved to internal/reserved IP {} — refusing to connect",
+                    name.as_str(),
+                    bad
+                )
+                .into());
+            }
+
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 impl ActionExecutor {
+    /// Build an executor honouring the process-global security config
+    /// ([`crate::validation`]). Used by the running server.
     pub fn new(ctx: ActionContext) -> Self {
-        let client = reqwest::Client::builder()
+        Self::with_security_config(ctx, &crate::validation::get_security_config())
+    }
+
+    /// Build an executor with an explicit [`SecurityConfig`].
+    ///
+    /// When `skip_ssrf_validation` is set (the debug/test default) the client uses
+    /// reqwest's stock resolver — identical to the historical behaviour, so tests
+    /// that webhook to `127.0.0.1` keep working. Otherwise the client installs
+    /// [`SsrfGuardResolver`], which rejects delivery to any name resolving to an
+    /// internal IP (anti-DNS-rebinding). This is also the test seam for building a
+    /// strict executor without mutating the global `OnceLock`.
+    pub fn with_security_config(ctx: ActionContext, security: &SecurityConfig) -> Self {
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("Failed to build HTTP client");
+            .redirect(reqwest::redirect::Policy::none());
+        if !security.skip_ssrf_validation {
+            builder = builder.dns_resolver(SsrfGuardResolver);
+        }
+        let client = builder.build().expect("Failed to build HTTP client");
         Self { ctx, client }
     }
 

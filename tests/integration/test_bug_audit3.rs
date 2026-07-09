@@ -2410,3 +2410,146 @@ async fn test_audit2_a9_concurrent_diamond_mixed_fail_success_no_deadlock() {
         }
     }
 }
+
+// ============================================================================
+// Audit 2, A5 — SSRF: IPv6-literal bypass + DNS-rebinding
+// ============================================================================
+//
+// # Original bug
+// 1. IPv6 literals bypassed creation-time validation entirely: `url.host_str()`
+//    returns the *bracketed* form (`"[::1]"`), so `host.parse::<IpAddr>()` always
+//    failed and `is_internal_ip` was never consulted. In release, `http://[::1]/`,
+//    `http://[fd00::1]/`, `http://[::ffff:10.0.0.1]/` all passed.
+// 2. DNS rebinding: validation only ever saw the *name*; reqwest re-resolved it at
+//    delivery time (possibly across retries hours later). Register a domain -> a
+//    public IP to pass validation, then flip it to `169.254.169.254` before delivery.
+//
+// # Fix
+// 1. `validate_webhook_url_with_config` now matches on `url.host()` (parsed
+//    `Host::Ipv6`) and `is_internal_ip` unwraps IPv4-mapped v6 (`::ffff:a.b.c.d`).
+// 2. `ActionExecutor`, when SSRF validation is active, installs a custom reqwest
+//    DNS resolver (`SsrfGuardResolver`) that re-checks every resolved IP at request
+//    time and refuses to connect if any is internal — closing the rebinding window.
+//
+// # What these tests assert
+// * `test_audit2_a5_ipv6_literal_rejected_by_validation` — the creation-time gate
+//   (the exact function `POST /task` runs) rejects IPv6 loopback / ULA / link-local
+//   / IPv4-mapped-private literals under a strict config, and still accepts a public
+//   IPv6. We call the config-injected validator directly because the integration
+//   binary shares ONE process-global SSRF `OnceLock` across ~50 tests that webhook
+//   to 127.0.0.1; flipping the global to strict would break all of them. This is the
+//   same code path `add_task` invokes via `validate_action_params`.
+// * `test_audit2_a5_resolver_blocks_rebinding_to_internal` — a REAL local mock
+//   webhook server is reached via the hostname `localhost` (which resolves to a
+//   loopback IP): the strict executor must fail the delivery WITHOUT ever hitting
+//   the server (hits stays 0 — proves the block happened at resolution, not at
+//   connect), while a skip-SSRF executor delivers the very same URL successfully
+//   (hits == 1 — the control proving the resolver is the only difference). This
+//   exercises the anti-rebinding resolver without any external network/DNS, and
+//   goes red if the resolver is not installed (the strict delivery would succeed).
+
+#[test]
+fn test_audit2_a5_ipv6_literal_rejected_by_validation() {
+    use arcrun::config::SecurityConfig;
+    use arcrun::validation::validate_webhook_url_with_config;
+
+    let strict = SecurityConfig {
+        skip_ssrf_validation: false,
+        ..SecurityConfig::default()
+    };
+
+    // Rejected: IPv6 internal/reserved literals that used to slip through in release.
+    for url in [
+        "http://[::1]:8085/hook",
+        "http://[fd00::1]/hook",
+        "http://[fe80::1]/hook",
+        "http://[::ffff:10.0.0.1]/hook",
+        "http://[::ffff:169.254.169.254]/hook",
+    ] {
+        assert!(
+            validate_webhook_url_with_config(url, &strict).is_err(),
+            "IPv6 literal must be rejected under strict SSRF: {url}"
+        );
+    }
+
+    // Accepted: a genuine public IPv6 (Cloudflare DNS).
+    assert!(
+        validate_webhook_url_with_config("https://[2606:4700:4700::1111]/hook", &strict).is_ok(),
+        "public IPv6 literal must pass strict SSRF"
+    );
+
+    // Control: with SSRF skipped, the literal parses fine and is allowed (the
+    // historical debug/test behaviour every other integration test relies on).
+    let skip = SecurityConfig {
+        skip_ssrf_validation: true,
+        ..SecurityConfig::default()
+    };
+    assert!(validate_webhook_url_with_config("http://[::1]:8085/hook", &skip).is_ok());
+}
+
+#[tokio::test]
+async fn test_audit2_a5_resolver_blocks_rebinding_to_internal() {
+    use arcrun::action::{ActionContext, ActionExecutor};
+    use arcrun::config::SecurityConfig;
+    use arcrun::dtos::NewActionDto;
+    use arcrun::models::ActionKindEnum;
+
+    let ctx = || ActionContext {
+        host_address: "http://localhost:8080".to_string(),
+        webhook_idempotency_timeout: std::time::Duration::from_secs(30),
+    };
+
+    // A real mock webhook server on 127.0.0.1, reached via the *hostname*
+    // `localhost` (which the system resolver maps to a loopback IP). Using a
+    // name — not an IP literal — is what routes the request through the DNS
+    // resolver under test; the live server is what makes the assertions sharp:
+    // a plain connection failure (e.g. a closed port) would be indistinguishable
+    // from the resolver block.
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (url, _shutdown) = spawn_webhook_server(hits.clone());
+    let url_by_name = url.replace("127.0.0.1", "localhost");
+    let action = NewActionDto {
+        kind: ActionKindEnum::Webhook,
+        params: serde_json::json!({ "url": url_by_name, "verb": "Post" }),
+    };
+
+    // Strict executor: the resolver sees `localhost` resolve to an internal IP
+    // and refuses — the delivery errors and the server is NEVER contacted.
+    let strict = SecurityConfig {
+        skip_ssrf_validation: false,
+        ..SecurityConfig::default()
+    };
+    let strict_exec = ActionExecutor::with_security_config(ctx(), &strict);
+    let res = strict_exec
+        .execute_batch_action(&action, None, serde_json::json!({}))
+        .await;
+    assert!(
+        res.is_err(),
+        "strict resolver must refuse delivery to a name resolving to an internal IP"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the block must happen at resolution time — the server must never be hit"
+    );
+
+    // Control: a skip-SSRF executor (stock resolver) delivers the very same URL
+    // successfully — proving the resolver is the only thing blocking above.
+    let skip = SecurityConfig {
+        skip_ssrf_validation: true,
+        ..SecurityConfig::default()
+    };
+    let relaxed_exec = ActionExecutor::with_security_config(ctx(), &skip);
+    let res = relaxed_exec
+        .execute_batch_action(&action, None, serde_json::json!({}))
+        .await;
+    assert!(
+        res.is_ok(),
+        "skip-SSRF executor must deliver to the same URL (control): {res:?}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the control delivery must actually reach the mock server"
+    );
+}

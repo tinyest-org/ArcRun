@@ -160,6 +160,7 @@ All HTTP handler functions and route configuration:
 **`src/action.rs`**:
 - `ActionExecutor` - Executes webhook actions, passes `?handle=<host>/task/<id>` query param
 - `WebhookParams` - URL, HTTP verb, optional body and headers
+- **Delivery-time SSRF resolver (Audit 2, A5)**: when SSRF validation is active (release / `SKIP_SSRF_VALIDATION=0`), `ActionExecutor` installs a custom reqwest DNS resolver (`SsrfGuardResolver`) that re-checks every resolved IP at request time and **refuses to connect if any is internal/reserved** (`is_internal_ip`, incl. IPv4-mapped v6) — closing the DNS-rebinding window (creation-time validation only saw the name; reqwest re-resolves at delivery, possibly across retries). A blocked resolution fails the delivery, which the outbox retries (at-least-once). **IP-literal URLs bypass this resolver** (reqwest connects to literals without DNS) — they are covered by the creation-time check. **Blocked hostnames/suffixes stay a creation-time concern** (the resolver filters only on the resolved IP). When SSRF is skipped (debug/tests), the stock resolver is used — unchanged behaviour, so tests webhooking to `127.0.0.1` keep working. Built via `ActionExecutor::with_security_config` (also the test seam for a strict executor without touching the global config).
 
 **`src/circuit_breaker.rs`**:
 - `CircuitBreaker` - State machine (Closed -> Open -> HalfOpen) for DB pool resilience
@@ -167,7 +168,7 @@ All HTTP handler functions and route configuration:
 
 **`src/validation.rs`**:
 - `validate_task_batch` - Validates entire batch before insertion
-- SSRF protection on webhook URLs
+- SSRF protection on webhook URLs (creation-time). Matches on `url.host()` so **IPv6 literals** (`[::1]`, `[fd00::1]`, `[::ffff:10.0.0.1]`) are actually inspected — the old `host_str().parse::<IpAddr>()` failed on the bracketed form and let them through in release (Audit 2, A5). `is_internal_ip` unwraps IPv4-mapped v6. `validate_webhook_url_with_config` is `pub` (config-injected entry point; used by tests to exercise the strict path without the global `OnceLock`).
 - Circular dependency detection
 
 **`src/rule.rs`**:

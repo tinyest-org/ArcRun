@@ -142,10 +142,15 @@ fn run_migrations(database_url: &str) {
 }
 
 fn new_action_executor(config: &Config) -> ActionExecutor {
-    ActionExecutor::new(ActionContext {
-        host_address: config.host_url.clone(),
-        webhook_idempotency_timeout: config.worker.claim_timeout,
-    })
+    // Pass the security config explicitly so the delivery-time SSRF resolver
+    // (Audit 2, A5) is wired independently of global-init ordering.
+    ActionExecutor::with_security_config(
+        ActionContext {
+            host_address: config.host_url.clone(),
+            webhook_idempotency_timeout: config.worker.claim_timeout,
+        },
+        &config.security,
+    )
 }
 
 fn create_circuit_breaker(config: &Config) -> Arc<CircuitBreaker> {
