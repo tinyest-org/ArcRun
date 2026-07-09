@@ -194,6 +194,20 @@ pub struct SecurityConfig {
 
     /// List of blocked hostname suffixes (e.g., ".local", ".internal")
     pub blocked_hostname_suffixes: Vec<String>,
+
+    /// Optional static bearer token for API authentication (Audit 2, A6).
+    ///
+    /// `None`/empty (env `AUTH_TOKEN` unset or blank) ⇒ authentication is
+    /// **disabled** and every endpoint is open (the historical behavior); the
+    /// server logs a loud warning at startup in release builds because SSRF
+    /// protection alone does not secure an otherwise-open API.
+    ///
+    /// When set, every request must carry `Authorization: Bearer <token>` except
+    /// the `/health` and `/ready` probes. This also gates `/metrics`, the Swagger
+    /// UI, and the static DAG UI at `/view`. The token is only ever read from the
+    /// header — never a query string — so the browser-facing `/view` UI is only
+    /// reachable behind a reverse proxy that injects the header.
+    pub auth_token: Option<String>,
 }
 
 impl Default for PoolConfig {
@@ -296,6 +310,7 @@ impl Default for SecurityConfig {
                 ".localdomain".to_string(),
                 ".localhost".to_string(),
             ],
+            auth_token: None,
         }
     }
 }
@@ -351,6 +366,7 @@ impl Config {
     /// - `SKIP_SSRF_VALIDATION`: Skip SSRF validation (default: 1 in debug, 0 in release)
     /// - `BLOCKED_HOSTNAMES`: Comma-separated list of blocked hostnames (default: localhost,127.0.0.1,::1,0.0.0.0,local,internal)
     /// - `BLOCKED_HOSTNAME_SUFFIXES`: Comma-separated list of blocked hostname suffixes (default: .local,.internal,.localdomain,.localhost)
+    /// - `AUTH_TOKEN`: Optional static bearer token; when set, all endpoints except `/health` and `/ready` require `Authorization: Bearer <token>` (default: unset ⇒ auth disabled)
     pub fn from_env() -> Result<Self, ConfigError> {
         let database_url = std::env::var("DATABASE_URL").map_err(|_| ConfigError {
             field: "DATABASE_URL".to_string(),
@@ -439,6 +455,16 @@ impl Config {
                 }
                 suffixes
             },
+            // Trim and treat a blank value as "unset" so `AUTH_TOKEN=` disables
+            // auth rather than requiring an empty-string token.
+            auth_token: std::env::var("AUTH_TOKEN").ok().and_then(|t| {
+                let trimmed = t.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }),
         };
 
         let retention = RetentionConfig {

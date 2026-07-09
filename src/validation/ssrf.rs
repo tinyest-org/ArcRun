@@ -352,6 +352,7 @@ mod tests {
             skip_ssrf_validation: false,
             blocked_hostnames: vec!["myblocked.com".to_string()],
             blocked_hostname_suffixes: vec![".blocked".to_string()],
+            ..SecurityConfig::default()
         };
         // Custom blocked hostname
         assert!(validate_webhook_url_with_config("http://myblocked.com/api", &config).is_err());

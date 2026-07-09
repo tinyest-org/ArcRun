@@ -1,4 +1,5 @@
 pub mod action;
+pub mod auth;
 pub mod circuit_breaker;
 pub mod config;
 pub mod db;

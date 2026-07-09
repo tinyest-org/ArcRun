@@ -2553,3 +2553,193 @@ async fn test_audit2_a5_resolver_blocks_rebinding_to_internal() {
         "the control delivery must actually reach the mock server"
     );
 }
+
+// =============================================================================
+// Audit 2, A6 — static bearer-token authentication
+// =============================================================================
+//
+// # Original gap
+// The only middleware was the Prometheus recorder, so every endpoint was open:
+// anyone reachable on the network could create tasks with arbitrary outbound
+// webhooks (an SSRF/DoS launcher even with A5's delivery-time checks), cancel or
+// stop any batch, read all task metadata, and scrape /metrics and Swagger.
+//
+// # Fix
+// An optional static bearer token (`AUTH_TOKEN`). When set, an actix
+// `from_fn(auth::authorize)` middleware requires `Authorization: Bearer <token>`
+// on every request EXCEPT the `/health` and `/ready` probes, comparing the token
+// in constant time. When unset the middleware is a total pass-through (the
+// historical open behavior), so the 200+ existing tests — which build the app via
+// `test_service!` with no middleware — keep passing.
+//
+// # What these tests assert
+// * a business endpoint (GET /task) is 401 with no header and with a wrong token,
+//   and 200 with the correct token;
+// * `/health` and `/ready` stay reachable WITHOUT a token while auth is active;
+// * with auth disabled (token `None`) the same endpoint is reachable with no
+//   header (smoke test mirroring the `test_service!` path used everywhere else).
+
+/// Build an actix test service wrapped with the A6 bearer-auth middleware.
+/// `$token` is the `Option<String>` the middleware is configured with.
+macro_rules! authed_service {
+    ($state:expr, $token:expr) => {{
+        let token: Option<String> = $token;
+        actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(actix_web::web::Data::new($state.clone()))
+                .wrap(actix_web::middleware::from_fn(move |req, next| {
+                    arcrun::auth::authorize(token.clone(), req, next)
+                }))
+                .configure(arcrun::handlers::configure_routes),
+        )
+        .await
+    }};
+}
+
+#[tokio::test]
+async fn test_audit2_a6_business_endpoint_requires_token() {
+    let (_g, state) = setup_test_app().await;
+    let app = authed_service!(state, Some("secret-token".to_string()));
+
+    // No Authorization header → 401.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/task")
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "GET /task without a token must be rejected"
+    );
+    let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+    assert_eq!(body["status"], 401);
+    assert!(
+        body["error"].as_str().is_some(),
+        "401 body must carry an `error` field (consistent with ApiError)"
+    );
+
+    // Wrong token → 401.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/task")
+        .insert_header(("Authorization", "Bearer wrong-token"))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "GET /task with a wrong token must be rejected"
+    );
+
+    // Malformed scheme → 401.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/task")
+        .insert_header(("Authorization", "secret-token"))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "a non-Bearer Authorization header must be rejected"
+    );
+
+    // Correct token → 200.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/task")
+        .insert_header(("Authorization", "Bearer secret-token"))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "GET /task with the correct token must succeed"
+    );
+}
+
+#[tokio::test]
+async fn test_audit2_a6_health_and_ready_exempt_when_auth_active() {
+    let (_g, state) = setup_test_app().await;
+    let app = authed_service!(state, Some("secret-token".to_string()));
+
+    for path in ["/health", "/ready"] {
+        let req = actix_web::test::TestRequest::get().uri(path).to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert!(
+            resp.status().is_success(),
+            "{path} must remain reachable WITHOUT a token while auth is active (got {})",
+            resp.status()
+        );
+    }
+}
+
+/// The Prometheus middleware SERVES `/metrics` itself, so the auth middleware
+/// only gates it if it sits OUTSIDE prometheus. In actix the LAST registered
+/// `.wrap()` is the outermost and runs first — main.rs therefore registers
+/// `auth` after `prometheus`. This test mirrors that exact wrap order and
+/// asserts `/metrics` is 401 without the token; with the order flipped (the
+/// bug caught in review: auth registered first ⇒ prometheus answers before
+/// auth runs) it goes red.
+#[tokio::test]
+async fn test_audit2_a6_metrics_endpoint_gated_by_auth() {
+    let (_g, state) = setup_test_app().await;
+
+    // Fresh registry: the global one (metrics::REGISTRY) must not be re-registered
+    // into by parallel tests.
+    let prometheus = actix_web_prom::PrometheusMetricsBuilder::new("test_a6_auth")
+        .endpoint("/metrics")
+        .registry(prometheus::Registry::new())
+        .build()
+        .unwrap();
+
+    let token = Some("secret-token".to_string());
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(actix_web::web::Data::new(state.clone()))
+            // Same order as main.rs: prometheus first, auth LAST (⇒ outermost).
+            .wrap(prometheus)
+            .wrap(actix_web::middleware::from_fn(move |req, next| {
+                arcrun::auth::authorize(token.clone(), req, next)
+            }))
+            .configure(arcrun::handlers::configure_routes),
+    )
+    .await;
+
+    // Without a token, /metrics must be blocked BEFORE prometheus can serve it.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/metrics")
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "/metrics must be gated by auth (prometheus serves it only past the auth wrap)"
+    );
+
+    // With the token it is served normally.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/metrics")
+        .insert_header(("Authorization", "Bearer secret-token"))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/metrics must be served with the correct token"
+    );
+}
+
+#[tokio::test]
+async fn test_audit2_a6_disabled_passes_through() {
+    // Token None ⇒ middleware is a total pass-through: no header required.
+    let (_g, state) = setup_test_app().await;
+    let app = authed_service!(state, None);
+
+    let req = actix_web::test::TestRequest::get()
+        .uri("/task")
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "with auth disabled, GET /task must succeed without any token"
+    );
+}

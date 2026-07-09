@@ -397,6 +397,7 @@ All configuration is via environment variables (loaded in `src/config.rs`):
 - `SKIP_SSRF_VALIDATION` (default: 1 in debug, 0 in release) - Skip SSRF checks
 - `BLOCKED_HOSTNAMES` - Comma-separated blocked hostnames
 - `BLOCKED_HOSTNAME_SUFFIXES` - Comma-separated blocked hostname suffixes
+- `AUTH_TOKEN` (default: unset ⇒ auth disabled) - Optional static bearer token (Audit 2, A6). When set, an actix `from_fn` middleware (`src/auth.rs`) requires `Authorization: Bearer <token>` on **every** endpoint (including `/metrics`, Swagger UI, `/view`) **except** `/health` and `/ready` (k8s probes). Comparison is constant-time (manual byte XOR — `subtle` is only a transitive dep). Unset/blank ⇒ total pass-through (historical open behavior), with a loud release-build warning at startup. Token is header-only (never a query string), so `/view` needs a reverse proxy injecting the header. The `?handle=` capability URL is NOT gated here (deferred to a later breaking lot).
 - `RUST_LOG` (default: info) - Log level
 
 ## Project Structure

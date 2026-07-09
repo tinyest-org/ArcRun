@@ -9,11 +9,12 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use actix_web::{App, HttpServer, web};
+use actix_web::{App, HttpServer, middleware::from_fn, web};
 use actix_web_prom::PrometheusMetricsBuilder;
 use arcrun::{
     DbPool,
     action::{ActionContext, ActionExecutor},
+    auth,
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     config::Config,
     handlers::{self, AppState},
@@ -48,6 +49,7 @@ async fn main() -> std::io::Result<()> {
     log::info!("Using public url {}", &config.host_url);
 
     init_security(&config);
+    init_auth(&config);
 
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -86,11 +88,26 @@ async fn main() -> std::io::Result<()> {
         .unwrap();
 
     let port = config.port;
+    let auth_token = config.security.auth_token.clone();
 
     let server_result = HttpServer::new(move || {
+        // Auth middleware built per worker with the configured token. `None` ⇒
+        // total pass-through (see `auth::authorize`).
+        let auth_token = auth_token.clone();
         App::new()
             .app_data(web::Data::new(app_data.clone()))
+            // Middlewares execute in REVERSE registration order on the request
+            // path: the LAST `.wrap()` is the outermost and runs first. `auth`
+            // is therefore registered AFTER `prometheus` so it runs BEFORE it —
+            // this is deliberate: the Prometheus middleware serves the
+            // `/metrics` endpoint itself, so auth must sit outside it to gate
+            // `/metrics` and to reject unauthorized requests before they are
+            // recorded. (Regression test:
+            // `test_audit2_a6_metrics_endpoint_gated_by_auth`.)
             .wrap(prometheus.clone())
+            .wrap(from_fn(move |req, next| {
+                auth::authorize(auth_token.clone(), req, next)
+            }))
             .configure(handlers::configure_routes)
     })
     .bind(("0.0.0.0", port))?
@@ -126,6 +143,27 @@ fn init_security(config: &Config) {
     validation::init_security_config(config.security.clone());
     if config.security.skip_ssrf_validation {
         log::warn!("SSRF validation is disabled - this should only be used in development!");
+    }
+}
+
+/// Log the effective auth posture, warning loudly in release builds when the API
+/// is left open (Audit 2, A6). SSRF protection alone does not secure an open API.
+fn init_auth(config: &Config) {
+    match &config.security.auth_token {
+        Some(_) => log::info!(
+            "Bearer-token authentication ENABLED (AUTH_TOKEN set); /health and /ready remain open"
+        ),
+        None => {
+            let msg = "AUTH_TOKEN is not set: the API is UNAUTHENTICATED — every endpoint \
+                       (task create with outbound webhooks, batch cancel, metadata read, \
+                       /metrics, Swagger) is open. Set AUTH_TOKEN or restrict access at the \
+                       network layer.";
+            if cfg!(debug_assertions) {
+                log::info!("{msg}");
+            } else {
+                log::warn!("{msg}");
+            }
+        }
     }
 }
 

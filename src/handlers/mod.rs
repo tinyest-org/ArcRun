@@ -15,8 +15,34 @@ use std::sync::Arc;
 use actix_web::{error, web};
 use tokio::sync::mpsc::Sender;
 
-use utoipa::OpenApi;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
+
+/// Registers the optional static bearer-token scheme (Audit 2, A6) on the
+/// generated OpenAPI document. The scheme is only enforced at runtime when
+/// `AUTH_TOKEN` is set; it is documented here unconditionally.
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi
+            .components
+            .get_or_insert_with(utoipa::openapi::Components::new);
+        components.add_security_scheme(
+            "bearer_auth",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "Optional static bearer token. When AUTH_TOKEN is configured on the \
+                         server, all endpoints except /health and /ready require this token.",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
 
 use crate::{
     DbPool, action::ActionExecutor, circuit_breaker::CircuitBreaker, config::Config, dtos, metrics,
@@ -153,6 +179,7 @@ pub async fn get_conn_with_retry<'a>(
         dag::get_dag,
         dag::view_dag_page,
     ),
+    modifiers(&SecurityAddon),
     components(schemas(
         HealthResponse,
         dtos::NewTaskDto,
