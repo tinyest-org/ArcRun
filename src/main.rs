@@ -89,6 +89,7 @@ async fn main() -> std::io::Result<()> {
 
     let port = config.port;
     let auth_token = config.security.auth_token.clone();
+    let payload_max_bytes = config.payload_max_bytes;
 
     let server_result = HttpServer::new(move || {
         // Auth middleware built per worker with the configured token. `None` ⇒
@@ -96,6 +97,10 @@ async fn main() -> std::io::Result<()> {
         let auth_token = auth_token.clone();
         App::new()
             .app_data(web::Data::new(app_data.clone()))
+            // A10: bound the JSON request body explicitly (default 2 MiB, the
+            // historical implicit actix cap). Larger payloads are rejected with 413
+            // before deserialization, backstopping the per-batch structural limits.
+            .app_data(web::JsonConfig::default().limit(payload_max_bytes))
             // Middlewares execute in REVERSE registration order on the request
             // path: the LAST `.wrap()` is the outermost and runs first. `auth`
             // is therefore registered AFTER `prometheus` so it runs BEFORE it —
@@ -141,6 +146,7 @@ fn load_config() -> Config {
 
 fn init_security(config: &Config) {
     validation::init_security_config(config.security.clone());
+    validation::init_limits_config(config.limits);
     if config.security.skip_ssrf_validation {
         log::warn!("SSRF validation is disabled - this should only be used in development!");
     }

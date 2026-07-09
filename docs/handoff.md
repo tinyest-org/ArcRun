@@ -4,14 +4,17 @@ Contexte de reprise pour la prochaine session.
 
 ## Campagne en cours : fixes Audit 2 (depuis 2026-07-08)
 
-**Avancement au 2026-07-09** : **Lot 4 terminé** (4.1 → 4.8, dernier commit
-01d034f) ; **Lot 5 en cours** — 5.1 (A5, SSRF : IPv6 littéral + anti-rebinding,
-36b6f7a) et 5.2 (A6, bearer token optionnel `AUTH_TOKEN`) faits ; reste 5.3
-(A10, limites structurelles POST /task). Détail et notes de relecture par item
-dans `docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
+**Avancement au 2026-07-09** : **Lots 4 et 5 terminés** — Lot 4 (4.1 → 4.8,
+dernier commit 01d034f) ; Lot 5 : 5.1 (A5 SSRF, 36b6f7a), 5.2 (A6 auth,
+c3bee32), 5.3 (A10 limites structurelles POST /task). Suivant : **Lot 6**
+(perf non-breaking), premier item 6.1 (B1, on_start sans connexion DB pendant
+le HTTP). Détail et notes de relecture par item dans
+`docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
 Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7) ; renversement
 assumé du commit 2e50620 en 4.4 (compteurs terminaux gelés) ; HMAC du `?handle=`
-→ Lot 7 (5.2) ; auth non-breaking (token absent ⇒ ouvert + warn release, 5.2).
+→ Lot 7 (5.2) ; auth non-breaking (token absent ⇒ ouvert + warn release, 5.2) ;
+limites 5.3 = 1000 tâches/batch, 100 deps/tâche, 20 actions/tâche, payload 2 MiB
+(env-overridables) ; DFS de cycles supprimé (forward-reference rule prouvée).
 
 - **Référence d'analyse** : `docs/audits/AUDIT_2_CLAUDE.md` — audit complet perf,
   correctness et architecture (post Lots 0-3). Chaque finding : fichier:ligne, scénario

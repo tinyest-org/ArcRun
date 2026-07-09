@@ -12,6 +12,30 @@ use uuid::Uuid;
 
 use super::{DbError, run_in_transaction};
 
+/// PostgreSQL caps a single statement at 65535 bind parameters — the wire protocol
+/// encodes the parameter count as an unsigned 16-bit integer. A grouped multi-row
+/// INSERT binds `columns_per_row * rows` parameters, so a large (or link/action-heavy)
+/// `POST /task` batch can blow past that ceiling and fail with a 500 (Audit 2, A10).
+/// We chunk each multi-row INSERT so `rows * binds_per_row` stays under this
+/// conservative budget, leaving a margin below the hard 65535 limit. All chunks run
+/// on the SAME transaction connection, so atomicity is unchanged.
+const BIND_BUDGET: usize = 60_000;
+
+/// Bind parameters per row for each grouped INSERT. These MUST match the number of
+/// columns in the corresponding `Insertable` struct — bump them if a column is added:
+///   - `models::NewTask`: 13 columns.
+///   - `models::Link`: 3 columns.
+///   - `models::NewAction`: 5 columns.
+const TASK_BINDS_PER_ROW: usize = 13;
+const LINK_BINDS_PER_ROW: usize = 3;
+const ACTION_BINDS_PER_ROW: usize = 5;
+
+/// Max rows per chunk so `rows * binds_per_row <= BIND_BUDGET` (at least 1).
+const fn chunk_rows(binds_per_row: usize) -> usize {
+    let n = BIND_BUDGET / binds_per_row;
+    if n == 0 { 1 } else { n }
+}
+
 /// Ensure we avoid creating duplicate tasks.
 ///
 /// # Concurrency (Audit 2 A8)
@@ -315,24 +339,29 @@ async fn flush_run<'a>(
 
     let prepared: Vec<PreparedTask> = std::mem::take(run);
 
-    // 1. Multi-row INSERT of task rows.
+    // 1. Multi-row INSERT of task rows, chunked to stay under the bind-param ceiling.
     let new_tasks: Vec<&models::NewTask> = prepared.iter().map(|p| &p.new_task).collect();
-    let inserted_tasks: Vec<Task> = diesel::insert_into(task_tbl)
-        .values(new_tasks)
-        .returning(Task::as_returning())
-        .get_results(conn)
-        .await?;
+    let mut task_by_id: HashMap<Uuid, Task> = HashMap::with_capacity(new_tasks.len());
+    for chunk in new_tasks.chunks(chunk_rows(TASK_BINDS_PER_ROW)) {
+        // `chunk` is `&[&NewTask]`; Diesel's `Insertable` wants `Vec<&NewTask>` (or
+        // `&NewTask`), so hand it an owned Vec of the (cheap) references.
+        let inserted_tasks: Vec<Task> = diesel::insert_into(task_tbl)
+            .values(chunk.to_vec())
+            .returning(Task::as_returning())
+            .get_results(conn)
+            .await?;
+        // Map id -> inserted Task so we can return them in input order regardless of
+        // the order the DB returns rows.
+        for t in inserted_tasks {
+            task_by_id.insert(t.id, t);
+        }
+    }
 
-    // Map id -> inserted Task so we can return them in input order regardless of the
-    // order the DB returns rows.
-    let mut task_by_id: HashMap<Uuid, Task> =
-        inserted_tasks.into_iter().map(|t| (t.id, t)).collect();
-
-    // 2. Multi-row INSERT of all links across the run.
+    // 2. Multi-row INSERT of all links across the run, chunked.
     let all_links: Vec<Link> = prepared.iter().flat_map(|p| p.links.clone()).collect();
-    if !all_links.is_empty() {
+    for chunk in all_links.chunks(chunk_rows(LINK_BINDS_PER_ROW)) {
         diesel::insert_into(link_tbl)
-            .values(&all_links)
+            .values(chunk)
             .execute(conn)
             .await?;
     }
@@ -367,16 +396,18 @@ async fn flush_run<'a>(
         }
     }
 
-    let inserted_actions: Vec<Action> = diesel::insert_into(action_tbl)
-        .values(all_new_actions)
-        .returning(Action::as_returning())
-        .get_results(conn)
-        .await?;
-
-    // Group inserted actions by task_id to assemble per-task TaskDtos.
+    // Group inserted actions by task_id to assemble per-task TaskDtos. Chunked to stay
+    // under the bind-param ceiling (actions multiply out fastest: several per task).
     let mut actions_by_task: HashMap<Uuid, Vec<Action>> = HashMap::new();
-    for a in inserted_actions {
-        actions_by_task.entry(a.task_id).or_default().push(a);
+    for chunk in all_new_actions.chunks(chunk_rows(ACTION_BINDS_PER_ROW)) {
+        let inserted_actions: Vec<Action> = diesel::insert_into(action_tbl)
+            .values(chunk)
+            .returning(Action::as_returning())
+            .get_results(conn)
+            .await?;
+        for a in inserted_actions {
+            actions_by_task.entry(a.task_id).or_default().push(a);
+        }
     }
 
     // Assemble results in input (run) order + record metrics.

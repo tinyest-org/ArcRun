@@ -7,7 +7,7 @@ pub mod constants;
 mod ssrf;
 mod task;
 
-use crate::config::SecurityConfig;
+use crate::config::{LimitsConfig, SecurityConfig};
 use std::sync::OnceLock;
 
 pub use action::validate_action_params;
@@ -39,6 +39,25 @@ pub(crate) fn get_security_config() -> SecurityConfig {
         .get()
         .cloned()
         .unwrap_or_else(SecurityConfig::default)
+}
+
+/// Global structural-limits configuration for validation (Audit 2, A10).
+/// Must be initialized before validation is used; falls back to defaults otherwise.
+static LIMITS_CONFIG: OnceLock<LimitsConfig> = OnceLock::new();
+
+/// Initialize the structural-limits configuration for validation.
+/// Should be called once at application startup.
+pub fn init_limits_config(config: LimitsConfig) {
+    LIMITS_CONFIG
+        .set(config)
+        .expect("Limits config already initialized");
+}
+
+/// Get the current structural-limits configuration.
+/// Returns the defaults if not initialized (useful for tests — the default limits
+/// are above anything the test suite constructs).
+pub(crate) fn get_limits_config() -> LimitsConfig {
+    LIMITS_CONFIG.get().copied().unwrap_or_default()
 }
 
 /// Validation error with details about what failed.

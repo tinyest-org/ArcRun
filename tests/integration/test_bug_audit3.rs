@@ -2743,3 +2743,216 @@ async fn test_audit2_a6_disabled_passes_through() {
         "with auth disabled, GET /task must succeed without any token"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A10 — structural limits on POST /task (batch size, deps/task, actions/task),
+// explicit JSON payload cap, chunked grouped INSERTs, redundant DFS removed.
+// ---------------------------------------------------------------------------
+//
+// # Original gap (Audit 2, A10)
+// POST /task had NO structural limits: neither a cap on tasks-per-batch, deps-per-task,
+// nor actions-per-task, and only actix's implicit ~2 MiB JSON cap as a backstop.
+// Consequences:
+//   * ~5 000 dedupe-free tasks (or a smaller batch that multiplied out via links/actions)
+//     exceeded PostgreSQL's 65 535 bind-parameter ceiling on the grouped INSERTs → 500.
+//   * The recursive DFS cycle-detection was a stack-overflow DoS vector on a long chain
+//     of tasks — and redundant, since the forward-reference rule ("a dependency must
+//     appear before the task in the batch") already makes cycles impossible.
+//
+// # Fix
+//   * `MAX_TASKS_PER_BATCH` (1000), `MAX_DEPS_PER_TASK` (100), `MAX_ACTIONS_PER_TASK`
+//     (20) env-configurable limits, enforced in validation → 400 with the limit and the
+//     received value in the message.
+//   * Explicit `web::JsonConfig` limit (`PAYLOAD_MAX_BYTES`, default 2 MiB) → 413.
+//   * The grouped multi-row INSERTs in `flush_run` are chunked so `rows * binds_per_row`
+//     stays under a conservative budget (in the SAME transaction — atomicity unchanged).
+//   * The recursive DFS is removed; the forward-reference check is the single guarantee
+//     that rejects unknown-id and would-be-cyclic references.
+//
+// The tests use the DEFAULT limits (the test app never calls `init_limits_config`, so
+// `get_limits_config()` returns the defaults — above anything the rest of the suite
+// constructs), building payloads just over each threshold.
+
+/// A minimal task JSON with only the mandatory fields (keeps a 1000+ task batch cheap).
+fn min_task(id: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "name": id,
+        "kind": "a10-limits",
+        "timeout": 60,
+        "on_start": webhook_action(),
+    })
+}
+
+/// POST /task with a raw body, returning the response status code.
+async fn post_task_status<S, B>(app: &S, body: &serde_json::Value) -> StatusCode
+where
+    S: ActixService<ActixRequest, Response = ActixServiceResponse<B>, Error = actix_web::Error>,
+    B: ActixMessageBody,
+{
+    let req = actix_web::test::TestRequest::post()
+        .uri("/task")
+        .set_json(body)
+        .to_request();
+    actix_web::test::call_service(app, req).await.status()
+}
+
+/// A batch of exactly `MAX_TASKS_PER_BATCH + 1` (= 1001) tasks must be rejected 400.
+/// Exactly at the limit (1000) is exercised by the bind-params test below.
+#[tokio::test]
+async fn test_audit2_a10_limits_batch_size_rejected() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let tasks: Vec<serde_json::Value> = (0..1001).map(|i| min_task(&format!("t{i}"))).collect();
+    let body = serde_json::Value::Array(tasks);
+
+    assert_eq!(
+        post_task_status(&app, &body).await,
+        StatusCode::BAD_REQUEST,
+        "a batch over MAX_TASKS_PER_BATCH (1001 > 1000) must be rejected with 400"
+    );
+}
+
+/// A single task declaring `MAX_DEPS_PER_TASK + 1` (= 101) dependencies → 400.
+#[tokio::test]
+async fn test_audit2_a10_limits_deps_per_task_rejected() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // 101 real parents defined before the child (so the ONLY violation is the deps cap,
+    // not a forward/unknown reference).
+    let mut tasks: Vec<serde_json::Value> = (0..101).map(|i| min_task(&format!("p{i}"))).collect();
+    let deps: Vec<serde_json::Value> = (0..101)
+        .map(|i| json!({"id": format!("p{i}"), "requires_success": true}))
+        .collect();
+    let mut child = min_task("child");
+    child["dependencies"] = serde_json::Value::Array(deps);
+    tasks.push(child);
+
+    assert_eq!(
+        post_task_status(&app, &serde_json::Value::Array(tasks)).await,
+        StatusCode::BAD_REQUEST,
+        "a task with 101 dependencies (> MAX_DEPS_PER_TASK = 100) must be rejected with 400"
+    );
+}
+
+/// A single task with `MAX_ACTIONS_PER_TASK + 1` total actions → 400.
+/// on_start (1) + 20 on_success = 21 > 20.
+#[tokio::test]
+async fn test_audit2_a10_limits_actions_per_task_rejected() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let on_success: Vec<serde_json::Value> = (0..20)
+        .map(|_| json!({"kind": "Webhook", "params": {"url": "https://ex.co/w", "verb": "Post"}}))
+        .collect();
+    let mut task = min_task("many-actions");
+    task["on_success"] = serde_json::Value::Array(on_success);
+
+    assert_eq!(
+        post_task_status(&app, &serde_json::Value::Array(vec![task])).await,
+        StatusCode::BAD_REQUEST,
+        "a task with 21 total actions (> MAX_ACTIONS_PER_TASK = 20) must be rejected with 400"
+    );
+}
+
+/// CRITICAL bind-params test — a dedupe-free batch of exactly 1000 tasks, each carrying
+/// on_start + 13 on_success actions = 14 actions/task = 14 000 action rows. At 5 bind
+/// params per action row that is 70 000 binds in the grouped `action` INSERT, well over
+/// PostgreSQL's 65 535 ceiling. WITHOUT chunking this INSERT fails and the request 500s;
+/// WITH chunking (the fix) the batch commits: all 1000 tasks are created and a sampled
+/// task has all 14 actions. (Task count 1000 is exactly at MAX_TASKS_PER_BATCH; 14
+/// actions is under MAX_ACTIONS_PER_TASK = 20.)
+///
+/// Reverting the chunking in `flush_run` (single `.values(all_new_actions)`) makes this
+/// test fail: the oversized INSERT errors and `create_tasks_ok`'s 201 assertion trips.
+#[tokio::test]
+async fn test_audit2_a10_limits_bind_param_ceiling_chunked_insert_succeeds() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let on_success: Vec<serde_json::Value> = (0..13)
+        .map(|_| json!({"kind": "Webhook", "params": {"url": "https://ex.co/w", "verb": "Post"}}))
+        .collect();
+    let tasks: Vec<serde_json::Value> = (0..1000)
+        .map(|i| {
+            let mut t = min_task(&format!("bind{i}"));
+            t["on_success"] = serde_json::Value::Array(on_success.clone());
+            t
+        })
+        .collect();
+
+    // create_tasks_ok asserts 201 and returns the created TaskDtos.
+    let created = create_tasks_ok(&app, &tasks).await;
+    assert_eq!(
+        created.len(),
+        1000,
+        "all 1000 tasks must be created despite > 65535 total action binds (chunked INSERT)"
+    );
+    assert_eq!(
+        created[0].actions.len(),
+        14,
+        "each task must have its 14 actions (1 on_start + 13 on_success) persisted"
+    );
+    // Spot-check the tail of the batch too (chunk boundaries fall mid-batch).
+    assert_eq!(
+        created[999].actions.len(),
+        14,
+        "the last task in the batch must also have all 14 actions"
+    );
+}
+
+/// A JSON body larger than the configured `web::JsonConfig` limit → 413.
+/// Built as an inline app with a tiny (512-byte) limit so the assertion is deterministic
+/// and cheap; production wires the same `web::JsonConfig::default().limit(...)` in main.rs.
+#[tokio::test]
+async fn test_audit2_a10_limits_oversized_payload_rejected() {
+    use actix_web::{App, web};
+
+    let (_g, state) = setup_test_app().await;
+    let app = actix_web::test::init_service(
+        App::new()
+            .app_data(web::Data::new(state.clone()))
+            .app_data(web::JsonConfig::default().limit(512))
+            .configure(arcrun::handlers::configure_routes),
+    )
+    .await;
+
+    // A single task whose serialized JSON far exceeds 512 bytes (huge name).
+    let mut task = min_task("oversized");
+    task["name"] = json!("x".repeat(4096));
+    let body = serde_json::Value::Array(vec![task]);
+
+    let req = actix_web::test::TestRequest::post()
+        .uri("/task")
+        .set_json(&body)
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a body over the JsonConfig limit must be rejected with 413"
+    );
+}
+
+/// The contract that makes cycles impossible by construction (so the recursive DFS could
+/// be removed): a dependency referencing a task defined LATER in the batch is rejected
+/// with 400. A forward reference is the only way a cycle could form, so forbidding it
+/// forbids cycles — no cycle-detection pass needed.
+#[tokio::test]
+async fn test_audit2_a10_limits_forward_reference_rejected() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    // "a" depends on "b", but "b" is defined AFTER "a" → forward reference.
+    let mut a = min_task("a");
+    a["dependencies"] = json!([{"id": "b", "requires_success": true}]);
+    let b = min_task("b");
+
+    assert_eq!(
+        post_task_status(&app, &serde_json::Value::Array(vec![a, b])).await,
+        StatusCode::BAD_REQUEST,
+        "a forward dependency reference must be rejected with 400 (this is what excludes cycles)"
+    );
+}

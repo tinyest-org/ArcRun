@@ -61,6 +61,38 @@ fn validate_rule_strategies(
 /// Validates a new task DTO before creation.
 pub fn validate_new_task(dto: &NewTaskDto) -> ValidationResult {
     let mut errors = Vec::new();
+    let limits = super::get_limits_config();
+
+    // A10: bound the number of dependencies a single task may declare (an unbounded
+    // fan-in multiplies out into the grouped `link` INSERT's bind-parameter count).
+    if let Some(ref deps) = dto.dependencies {
+        if deps.len() > limits.max_deps_per_task {
+            errors.push(ValidationError {
+                field: "dependencies".to_string(),
+                message: format!(
+                    "task cannot exceed {} dependencies (received {})",
+                    limits.max_deps_per_task,
+                    deps.len()
+                ),
+            });
+        }
+    }
+
+    // A10: bound the number of actions per task. `on_start` is always present (1);
+    // `on_failure` and `on_success` are optional lists. Together they drive the
+    // grouped `action` INSERT's bind-parameter count.
+    let action_count = 1
+        + dto.on_failure.as_ref().map(|a| a.len()).unwrap_or(0)
+        + dto.on_success.as_ref().map(|a| a.len()).unwrap_or(0);
+    if action_count > limits.max_actions_per_task {
+        errors.push(ValidationError {
+            field: "actions".to_string(),
+            message: format!(
+                "task cannot exceed {} actions (on_start + on_failure + on_success); received {}",
+                limits.max_actions_per_task, action_count
+            ),
+        });
+    }
 
     // Validate id (local reference)
     if dto.id.trim().is_empty() {
@@ -392,6 +424,22 @@ pub fn validate_task_batch(tasks: &[NewTaskDto]) -> ValidationResult {
 
     let mut errors = Vec::new();
 
+    // A10: bound the batch size FIRST and bail out immediately. A single
+    // unauthenticated request could otherwise submit an unbounded number of tasks,
+    // both blowing past PostgreSQL's 65535 bind-parameter ceiling (→ 500) and forcing
+    // O(n) validation work (dependency resolution) on an arbitrarily large payload.
+    let limits = super::get_limits_config();
+    if tasks.len() > limits.max_tasks_per_batch {
+        return Err(vec![ValidationError {
+            field: "tasks".to_string(),
+            message: format!(
+                "batch cannot exceed {} tasks (received {})",
+                limits.max_tasks_per_batch,
+                tasks.len()
+            ),
+        }]);
+    }
+
     // First validate each task individually
     for (i, task) in tasks.iter().enumerate() {
         if let Err(task_errors) = validate_new_task(task) {
@@ -442,76 +490,14 @@ pub fn validate_task_batch(tasks: &[NewTaskDto]) -> ValidationResult {
         seen.insert(task.id.as_str());
     }
 
-    // If we already have errors from duplicate IDs or unknown deps, skip cycle detection
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-
-    // Build adjacency list for cycle detection
-    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for task in tasks {
-        let deps: Vec<&str> = task
-            .dependencies
-            .as_ref()
-            .map(|d| d.iter().map(|dep| dep.id.as_str()).collect())
-            .unwrap_or_default();
-        adj.insert(task.id.as_str(), deps);
-    }
-
-    // DFS cycle detection with path tracking
-    // States: 0 = unvisited, 1 = visiting (in current path), 2 = visited (done)
-    let mut state: HashMap<&str, u8> = tasks.iter().map(|t| (t.id.as_str(), 0u8)).collect();
-    let mut path: Vec<&str> = Vec::new();
-
-    fn dfs<'a>(
-        node: &'a str,
-        adj: &HashMap<&'a str, Vec<&'a str>>,
-        state: &mut HashMap<&'a str, u8>,
-        path: &mut Vec<&'a str>,
-        cycles: &mut HashSet<String>,
-    ) {
-        state.insert(node, 1); // Mark as visiting
-        path.push(node);
-
-        if let Some(neighbors) = adj.get(node) {
-            for &neighbor in neighbors {
-                match state.get(neighbor) {
-                    Some(1) => {
-                        // Found a cycle - neighbor is in current path
-                        // Find where the cycle starts in the path
-                        if let Some(cycle_start) = path.iter().position(|&n| n == neighbor) {
-                            let cycle_path: Vec<&str> = path[cycle_start..].to_vec();
-                            let cycle_str = format!("{} -> {}", cycle_path.join(" -> "), neighbor);
-                            cycles.insert(cycle_str);
-                        }
-                    }
-                    Some(0) | None => {
-                        // Unvisited - recurse
-                        dfs(neighbor, adj, state, path, cycles);
-                    }
-                    _ => {} // Already visited (state 2), skip
-                }
-            }
-        }
-
-        path.pop();
-        state.insert(node, 2); // Mark as visited (done)
-    }
-
-    let mut cycles: HashSet<String> = HashSet::new();
-    for task in tasks {
-        if state.get(task.id.as_str()) == Some(&0) {
-            dfs(task.id.as_str(), &adj, &mut state, &mut path, &mut cycles);
-        }
-    }
-
-    // Report all detected cycles
-    for cycle in cycles {
-        errors.push(ValidationError {
-            field: "dependencies".to_string(),
-            message: format!("Circular dependency detected: {}", cycle),
-        });
-    }
+    // Cycle detection is UNNECESSARY here (Audit 2, A10): the forward-reference rule
+    // enforced just above ("a dependency must appear before the task in the batch",
+    // via the `seen` set) makes cycles impossible by construction. Every edge points
+    // from a later task to a strictly earlier one, so the dependency graph is a DAG in
+    // topological (input) order and can contain no cycle. The old recursive DFS was
+    // therefore redundant — and, being recursive, a stack-overflow DoS vector on a
+    // long chain of tasks. It has been removed; the forward-reference check is the
+    // single guarantee that rejects both unknown-id and would-be-cyclic references.
 
     if errors.is_empty() {
         Ok(())

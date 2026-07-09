@@ -58,6 +58,8 @@ pub fn test_config() -> Arc<Config> {
         },
         security: SecurityConfig::default(),
         retention: arcrun::config::RetentionConfig::default(),
+        limits: arcrun::config::LimitsConfig::default(),
+        payload_max_bytes: 2 * 1024 * 1024,
     })
 }
 

@@ -36,6 +36,42 @@ pub struct Config {
 
     /// Data retention settings
     pub retention: RetentionConfig,
+
+    /// Structural limits on request payloads (Audit 2, A10)
+    pub limits: LimitsConfig,
+
+    /// Maximum accepted JSON request body size in bytes (`web::JsonConfig` limit).
+    /// Defaults to 2 MiB — the historical implicit actix default, so this is
+    /// non-breaking. A payload larger than this is rejected with 413.
+    pub payload_max_bytes: usize,
+}
+
+/// Structural limits on `POST /task` payloads (Audit 2, A10).
+///
+/// Without these, a single unauthenticated request could submit an unbounded number
+/// of tasks / dependencies / actions, blowing past PostgreSQL's 65535 bind-parameter
+/// ceiling (→ 500) or exhausting server resources. Defaults are generous (well above
+/// any realistic DAG) so they are non-breaking. All three are `Copy`-cheap.
+#[derive(Debug, Clone, Copy)]
+pub struct LimitsConfig {
+    /// Maximum number of tasks accepted in one `POST /task` batch.
+    pub max_tasks_per_batch: usize,
+
+    /// Maximum number of dependencies a single task may declare.
+    pub max_deps_per_task: usize,
+
+    /// Maximum number of actions (on_start + on_failure + on_success) per task.
+    pub max_actions_per_task: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_tasks_per_batch: 1000,
+            max_deps_per_task: 100,
+            max_actions_per_task: 20,
+        }
+    }
 }
 
 /// Database connection pool configuration.
@@ -367,6 +403,10 @@ impl Config {
     /// - `BLOCKED_HOSTNAMES`: Comma-separated list of blocked hostnames (default: localhost,127.0.0.1,::1,0.0.0.0,local,internal)
     /// - `BLOCKED_HOSTNAME_SUFFIXES`: Comma-separated list of blocked hostname suffixes (default: .local,.internal,.localdomain,.localhost)
     /// - `AUTH_TOKEN`: Optional static bearer token; when set, all endpoints except `/health` and `/ready` require `Authorization: Bearer <token>` (default: unset ⇒ auth disabled)
+    /// - `MAX_TASKS_PER_BATCH`: Max tasks accepted in one POST /task batch (default: 1000)
+    /// - `MAX_DEPS_PER_TASK`: Max dependencies a single task may declare (default: 100)
+    /// - `MAX_ACTIONS_PER_TASK`: Max actions (on_start + on_failure + on_success) per task (default: 20)
+    /// - `PAYLOAD_MAX_BYTES`: Max accepted JSON request body size in bytes; larger bodies get 413 (default: 2 MiB)
     pub fn from_env() -> Result<Self, ConfigError> {
         let database_url = std::env::var("DATABASE_URL").map_err(|_| ConfigError {
             field: "DATABASE_URL".to_string(),
@@ -474,6 +514,14 @@ impl Config {
             batch_size: parse_env_or("RETENTION_BATCH_SIZE", 1000)?,
         };
 
+        let limits = LimitsConfig {
+            max_tasks_per_batch: parse_env_or("MAX_TASKS_PER_BATCH", 1000)?,
+            max_deps_per_task: parse_env_or("MAX_DEPS_PER_TASK", 100)?,
+            max_actions_per_task: parse_env_or("MAX_ACTIONS_PER_TASK", 20)?,
+        };
+
+        let payload_max_bytes = parse_env_or("PAYLOAD_MAX_BYTES", 2 * 1024 * 1024)?;
+
         let config = Self {
             database_url,
             host_url,
@@ -485,6 +533,8 @@ impl Config {
             observability,
             security,
             retention,
+            limits,
+            payload_max_bytes,
         };
 
         config.validate()?;
@@ -603,6 +653,36 @@ impl Config {
         if self.worker.webhook_delivery_concurrency == 0 {
             return Err(ConfigError {
                 field: "WEBHOOK_DELIVERY_CONCURRENCY".to_string(),
+                message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        // A10 structural limits: a zero limit would reject every request (or, for
+        // payload_max_bytes, every non-empty body), which is never intended.
+        if self.limits.max_tasks_per_batch == 0 {
+            return Err(ConfigError {
+                field: "MAX_TASKS_PER_BATCH".to_string(),
+                message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        if self.limits.max_deps_per_task == 0 {
+            return Err(ConfigError {
+                field: "MAX_DEPS_PER_TASK".to_string(),
+                message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        if self.limits.max_actions_per_task == 0 {
+            return Err(ConfigError {
+                field: "MAX_ACTIONS_PER_TASK".to_string(),
+                message: "Must be greater than 0".to_string(),
+            });
+        }
+
+        if self.payload_max_bytes == 0 {
+            return Err(ConfigError {
+                field: "PAYLOAD_MAX_BYTES".to_string(),
                 message: "Must be greater than 0".to_string(),
             });
         }
