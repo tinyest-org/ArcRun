@@ -14,7 +14,9 @@
 
 use crate::common::*;
 
-use arcrun::models::StatusKind;
+use arcrun::db_operation::{ClaimResult, claim_task_with_rules, mark_task_running};
+use arcrun::models::{StatusKind, Task};
+use arcrun::rule::{ConcurencyRule, Matcher, Rules, Strategy};
 use serde_json::json;
 
 /// Concurrency rule JSON with `max_concurency` on a given kind, matching on the
@@ -60,6 +62,56 @@ async fn make_running(state: &arcrun::handlers::AppState, id: uuid::Uuid) {
         .unwrap();
 }
 
+/// Move a freshly-created task to Running **while consuming its concurrency slot**
+/// (Audit 2, D1). Since 7.3a, a Concurrency limit counts only tasks that claimed WITH
+/// a rule producing the slot key — a plain `claim_task` (as `make_running` does) no
+/// longer occupies the slot. To saturate a rule as a "blocker" for the claim-loop
+/// ordering/anti-famine tests, the blocker must therefore claim through
+/// `claim_task_with_rules` carrying that rule.
+async fn make_running_consuming(
+    state: &arcrun::handlers::AppState,
+    id: uuid::Uuid,
+    kind: &str,
+    max: i32,
+) {
+    let t = Task {
+        id,
+        name: String::new(),
+        kind: kind.to_string(),
+        status: StatusKind::Pending,
+        timeout: 60,
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        last_updated: chrono::Utc::now(),
+        metadata: json!({"test": true}),
+        ended_at: None,
+        start_condition: Rules(vec![Strategy::Concurency(ConcurencyRule {
+            max_concurency: max,
+            matcher: Matcher {
+                kind: kind.to_string(),
+                status: StatusKind::Running,
+                fields: vec![],
+            },
+        })]),
+        wait_success: 0,
+        wait_finished: 0,
+        success: 0,
+        failures: 0,
+        failure_reason: None,
+        batch_id: None,
+        expected_count: None,
+        dead_end_barrier: false,
+        priority: 0,
+        claimed_slot_keys: None,
+    };
+    let mut conn = state.pool.get().await.unwrap();
+    assert_eq!(
+        claim_task_with_rules(&mut conn, &t).await.unwrap(),
+        ClaimResult::Claimed
+    );
+    mark_task_running(&mut conn, &id).await.unwrap();
+}
+
 // =============================================================================
 // 1. Head-of-line blocking regression
 // =============================================================================
@@ -74,10 +126,11 @@ async fn test_head_of_line_eligible_low_priority_claimed() {
 
     let kind = "hol-kind";
 
-    // Blocker: a Running task of the same kind/metadata that saturates max_concurency=1.
-    let blocker = task_with_priority("blocker", kind, 0, None);
+    // Blocker: a Running task that CONSUMES the concurrency slot for `kind`
+    // (max_concurency=1), so same-key candidates are blocked (Audit 2, D1).
+    let blocker = task_with_priority("blocker", kind, 0, Some(conc_rule(kind, 1)));
     let created = create_tasks_ok(&app, &[blocker]).await;
-    make_running(&state, created[0].id).await;
+    make_running_consuming(&state, created[0].id, kind, 1).await;
 
     // 5 high-priority Pending tasks, all blocked by the (now saturated) concurrency rule.
     let mut high: Vec<serde_json::Value> = (0..5)
@@ -175,10 +228,10 @@ async fn test_batch_claim_respects_order_around_rule_task() {
 
     let kind = "ord-kind";
 
-    // Saturate the concurrency rule with a Running blocker.
-    let blocker = task_with_priority("ord-blocker", kind, 0, None);
+    // Saturate the concurrency rule with a Running blocker that consumes the slot.
+    let blocker = task_with_priority("ord-blocker", kind, 0, Some(conc_rule(kind, 1)));
     let created = create_tasks_ok(&app, &[blocker]).await;
-    make_running(&state, created[0].id).await;
+    make_running_consuming(&state, created[0].id, kind, 1).await;
 
     // Priority ordering (claim order = priority DESC):
     //   free-hi (prio 300, no rule)   <- claimed

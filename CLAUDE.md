@@ -75,9 +75,10 @@ There are five background workers (spawned in `src/main.rs::spawn_workers`): `st
 
 **In-process nudges (Audit 2, B4)**: to avoid every DAG edge paying a full poll tick, handlers and workers wake the `start`/`delivery` loops immediately via a shared `WorkerNudges` (two `tokio::sync::Notify`, held in `AppState` and passed to `spawn_workers`). After a committing transition, producers `notify_one` the relevant loop (`add_task`/`resume_task` → start; `update_task`/`cancel_task`/`stop_batch`/timeout+on_start failures → delivery; a real `update_task`/`cancel` transition → both) and the loop runs one extra iteration instead of waiting the interval. `notify_one` stores a permit, so a nudge fired mid-iteration is never lost. The nudge is **best-effort — the poll (`WORKER_LOOP_INTERVAL_MS` / `WEBHOOK_DELIVERY_INTERVAL_MS`) remains the correctness/fallback** (a missed or extra nudge only costs, at worst, one empty iteration). In-process only; a multi-replica deployment would use LISTEN/NOTIFY as the same kind of optimization, never as correctness.
 
-**Start Loop** (`start_loop`, `src/workers/start_loop.rs`):
+**Start Loop** (`start_loop` / `start_loop_leased`, `src/workers/start_loop.rs`):
+0. **Leader lease (Audit 2, D7)**: production uses `start_loop_leased` — each iteration is gated by a session `pg_try_advisory_lock` (`START_LEADER_LOCK_KEY`) held on a **dedicated non-pooled connection** (`establish_direct_connection`), so in a multi-replica deployment exactly one replica schedules at a time; a standby just re-contends each tick and takes over automatically when the leader's connection drops. Single-replica is unchanged (the sole loop always wins). `start_loop` (no lease, always leader) remains the test entry point. Gauge: `start_loop_is_leader`.
 1. Finds `Pending` tasks (ordered by priority DESC, then created_at ASC) via paginated keyset scan
-2. Checks concurrency rules against running tasks
+2. Checks concurrency rules — **Concurrency rules are DB-enforced via `rule_slot` counters (Audit 2, D1)**: each rule of the candidate maps to a canonical textual key (`rule::concurrency_slot_key`); the claim transaction increments each slot with a conditional upsert (`ON CONFLICT DO UPDATE SET used = used + 1 WHERE used < max_concurency RETURNING used`, keys processed sorted + deduped — A9 discipline) and a blocked slot rolls the whole claim back (`RuleBlocked`). O(1) per claim (no COUNT over `task`), replica-safe by row locking; the concurrency advisory-lock layer is gone. **Semantic change (D1, assumed)**: a slot counts only tasks that claimed *through* the rule — a Running task that merely matches the matcher but carries no rule no longer blocks candidates. Capacity rules still use the pre-D1 mechanism (advisory lock + CTE SUM probe) until 7.3b. The consumed keys are persisted in `task.claimed_slot_keys` by the claim UPDATE and **released** (decrement + keys NULLed, `release_slots_for_tasks`) in the same transaction as EVERY exit from Claimed/Running: success/failure PATCH, on_start failure, timeout, cancel of a Claimed/Running task, stop_batch, dead-end-canceled ancestors, and requeue-stale (Claimed → Pending). Keys are never recomputed at release (metadata is mutable while Running). Empty (`used = 0`) slot rows are GC'd by the retention loop (which now always runs — the task-retention DELETE stays gated by `RETENTION_ENABLED`, the slot GC does not).
 3. Claims eligible tasks atomically (Pending → Claimed → Running). **While a Claimed task waits for the concurrency semaphore permit (B2)**, `acquire_permit_with_heartbeat` bumps its `last_updated` every `claim_timeout / 3` via `tokio::select!`, preventing `requeue_stale_claimed_tasks` from reclaiming it.
 4. Executes on_start webhooks **synchronously** (control-flow — its response can register a cancel action; its failure marks the task Failed). **The DB connection is NOT held during the HTTP call (B1):** `execute_webhook_for_task` is split into phases like the delivery loop — phase A borrows a connection to claim the `start` outbox slot + A4 re-check + load the Start actions then **drops it**, phase B runs the on_start HTTP with **no connection held**, phase C re-acquires a connection for the A2/A4 running-transition transaction. This stops a burst of slow on_start webhooks from starving the pool (handlers + the other loops). A failed phase-C re-acquire leaves the task `Claimed` with a `pending` start row — recovered by requeue-stale + the A2 freshness bound, exactly as a process crash would be.
 5. On webhook failure: marks task as Failed, propagates to children, enqueues on_failure outbox rows (in-tx)
@@ -158,7 +159,8 @@ All HTTP handler functions and route configuration:
 **`src/workers.rs`**:
 - `propagate_to_children` - Handles dependency propagation (recursive for failures)
 - `cancel_task` - Cancels task and propagates to children
-- `check_concurrency` - Evaluates concurrency rules
+- `claim_task_with_rules` (`src/db/task_crud.rs`) - Rule-checking claim: Concurrency via `rule_slot` conditional upserts (D1), Capacity via advisory lock + CTE SUM (pre-7.3b); all-or-nothing rollback via the `ClaimTxAbort` sentinel
+- `release_slots_for_tasks` (`src/db/task_crud.rs`) - Releases the concurrency slots of just-transitioned tasks (A9 ordered pre-lock, read-keys-before-NULL CTE); called in-tx by all 7 exit sites
 - `start_task_phase_a` - Connection-holding preamble of on_start (claim slot + A4 re-check + load actions); the on_start HTTP then runs with no connection held (B1)
 - `end_task` - Executes on_success/on_failure webhooks
 - `batch_updater` - Batches success/failure count updates to database (see below)
@@ -178,8 +180,10 @@ All HTTP handler functions and route configuration:
 - Cycle exclusion via the forward-reference rule (no separate cycle-detection pass — see `validate_task_batch` above)
 
 **`src/rule.rs`**:
-- `Strategy::Concurency` - Concurrency rule with matcher and max count
+- `Strategy::Concurency` - Concurrency rule with matcher and max count. **DB-enforced via `rule_slot` since D1** — only tasks that claimed through the rule occupy the slot (see Start Loop step 2)
+- `Strategy::Capacity` - Capacity rule (sum of remaining work below a threshold); still enforced by the pre-D1 advisory-lock + SUM probe until 7.3b
 - `Matcher` - Matches on status, kind, and metadata fields
+- `concurrency_slot_key` - Canonical textual `rule_slot` key (collision-free, JSON-encoded sorted fields); the i64 hash keys remain for dedupe/Capacity advisory locks
 
 ### Batch Updater Architecture
 
@@ -306,9 +310,17 @@ Key file: `src/workers.rs`, function `propagate_to_children`
 -- Core tables
 task (id, name, kind, status, metadata, timeout, batch_id, start_condition,
       wait_success, wait_finished, success, failures, failure_reason,
-      created_at, started_at, ended_at, last_updated, priority)
+      created_at, started_at, ended_at, last_updated, priority, claimed_slot_keys)
+  -- claimed_slot_keys (Audit 2, D1) = TEXT[] of the concurrency slot keys consumed at
+  --   claim time; released (decrement + NULLed) on every exit from Claimed/Running.
+  --   Never recomputed from metadata (mutable while Running). NULL = holds no slots.
 action (id, task_id, kind, trigger, condition, params, success)
 link (parent_id, child_id, requires_success)
+rule_slot (lock_key, used)
+  -- DB-enforced Concurrency rule counters (Audit 2, D1). lock_key = canonical textual
+  --   key (rule::concurrency_slot_key); used = number of live claims through the rule.
+  --   Claim: conditional upsert (used < max_concurency) in the claim tx, sorted keys (A9).
+  --   used = 0 rows are GC'd by the retention loop (always runs, even RETENTION_ENABLED=0).
 batch (id, on_complete, created_at, scope, metadata, remaining)
   -- one row per batch that registered on_batch_complete (Lot 3b) AND/OR scope/metadata (#601);
   -- on_complete = JSONB array of NewActionDto ('[]' for a scope/metadata-only batch).

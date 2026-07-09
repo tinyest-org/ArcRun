@@ -17,7 +17,7 @@ pub use metrics_sampler::metrics_sampler_loop;
 pub use propagation::cancel_task;
 pub(crate) use propagation::{cancel_dead_end_ancestors, propagate_to_children};
 pub use retention::retention_cleanup_loop;
-pub use start_loop::start_loop;
+pub use start_loop::{start_loop, start_loop_leased};
 // Exposed for integration tests of the paginated claim loop (Lot 1).
 pub use start_loop::run_claim_loop;
 pub use timeout_loop::timeout_loop;

@@ -7,6 +7,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use uuid::Uuid;
 
+use super::task_crud::release_slots_for_tasks;
 use super::webhook_execution::{
     decrement_batch_remaining_for_tasks, zero_batch_remaining_and_complete,
 };
@@ -126,6 +127,14 @@ pub async fn update_running_task<'a>(
                             "update_running_task",
                         )
                         .await?;
+
+                        // Slot release (Audit 2, D1): the PATCHed task was Running/Claimed
+                        // (held its slots); dead-end-canceled ancestors that were
+                        // Running/Claimed held theirs too. Cascade-failed children were
+                        // Waiting/Paused (never claimed ⇒ NULL keys ⇒ no-op). The
+                        // `claimed_slot_keys IS NOT NULL` gate releases only real holders,
+                        // so passing the whole terminal set is correct.
+                        release_slots_for_tasks(conn, &terminal_ids).await?;
                     }
                 }
 
@@ -323,6 +332,11 @@ pub(crate) async fn fail_task_and_propagate<'a>(
                 terminal_ids.extend(ancestors.iter().map(|a| a.id));
                 decrement_batch_remaining_for_tasks(conn, &terminal_ids, "fail_task_and_propagate")
                     .await?;
+
+                // Slot release (Audit 2, D1): the failed task was Running/Claimed (held
+                // its slots); dead-end ancestors that were active held theirs. Cascade
+                // children were Waiting/Paused ⇒ NULL keys ⇒ no-op.
+                release_slots_for_tasks(conn, &terminal_ids).await?;
             }
             Ok(updated)
         })
@@ -489,6 +503,13 @@ pub(crate) async fn stop_batch<'a>(
             // being decremented task-by-task). This fires the batch_complete webhook
             // if one was registered.
             zero_batch_remaining_and_complete(conn, batch_id, "stop_batch").await?;
+
+            // Slot release (Audit 2, D1): only the formerly-Running and formerly-Claimed
+            // tasks could have consumed concurrency slots (Waiting/Pending/Paused never
+            // claimed). The `claimed_slot_keys IS NOT NULL` gate makes this exact.
+            let mut released_ids = canceled_running_ids.clone();
+            released_ids.extend_from_slice(&canceled_claimed_ids);
+            release_slots_for_tasks(conn, &released_ids).await?;
 
             Ok(StopBatchResult {
                 canceled_waiting,

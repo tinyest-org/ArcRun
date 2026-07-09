@@ -159,6 +159,32 @@ pub fn concurrency_lock_key(rule: &ConcurencyRule, task_metadata: &serde_json::V
     compute_lock_key(None, &rule.matcher, task_metadata)
 }
 
+/// Compute the **canonical, collision-free textual** slot key (Audit 2, D1) for a
+/// Concurrency rule + task metadata. Unlike the i64 [`concurrency_lock_key`] (which
+/// only serializes an advisory lock and tolerates hash collisions), this key
+/// *identifies a shared counter row* in the `rule_slot` table — a collision would
+/// merge two unrelated rules onto one counter and corrupt the count, so the key must
+/// be exact, injective, and deterministic.
+///
+/// It is a JSON-encoded tuple `conc:{"fields":<matched-fields>,"kind":<kind>,"status":<status>}`.
+/// The matched-fields object is [`Matcher::extract_metadata_fields`] (serde_json's Map
+/// is a `BTreeMap`, so its keys serialize in sorted order — canonical), and JSON
+/// escaping makes the encoding injective even when `kind` or a field value contains a
+/// delimiter character. `Err(field)` when a required metadata field is missing — the
+/// caller then blocks the claim, exactly as the advisory path did.
+pub fn concurrency_slot_key(
+    rule: &ConcurencyRule,
+    task_metadata: &serde_json::Value,
+) -> Result<String, String> {
+    let matched = rule.matcher.extract_metadata_fields(task_metadata)?;
+    let payload = json!({
+        "kind": rule.matcher.kind,
+        "status": rule.matcher.status,
+        "fields": matched,
+    });
+    Ok(format!("conc:{payload}"))
+}
+
 /// Compute a deterministic i64 advisory lock key for a capacity rule and task metadata.
 /// Uses a "capacity" prefix to avoid collisions with concurrency lock keys.
 pub fn capacity_lock_key(rule: &CapacityRule, task_metadata: &serde_json::Value) -> i64 {

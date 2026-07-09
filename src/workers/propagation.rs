@@ -632,6 +632,13 @@ pub async fn cancel_task<'a>(
             )
             .await?;
 
+            // Slot release (Audit 2, D1): if the canceled task was Claimed/Running it
+            // held its slots; dead-end ancestors that were active held theirs. A cancel
+            // of a Pending/Waiting/Paused task released nothing (NULL keys) — the
+            // `claimed_slot_keys IS NOT NULL` gate encodes exactly the "only if it was
+            // Claimed/Running" rule, so passing the whole terminal set is correct.
+            db_operation::release_slots_for_tasks(&mut *conn, &terminal_ids).await?;
+
             Ok(())
         })
     })

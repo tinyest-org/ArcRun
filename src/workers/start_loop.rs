@@ -11,6 +11,7 @@ use crate::{
 use actix_web::rt;
 use diesel::BelongingToDsl;
 use diesel::prelude::*;
+use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -42,6 +43,10 @@ enum StartPhaseA {
     },
 }
 
+/// Single-replica / test entry point (no leader lease): this loop is ALWAYS the
+/// leader and runs every tick. Behavior is identical to before the D7 lease was
+/// added — the existing tests drive this directly. Production uses
+/// [`start_loop_leased`] instead.
 pub async fn start_loop(
     evaluator: &ActionExecutor,
     pool: DbPool,
@@ -58,29 +63,19 @@ pub async fn start_loop(
     // has its `last_updated` refreshed at least twice before requeue-stale would
     // consider it stale.
     let heartbeat_interval = claim_timeout / 3;
+    metrics::set_start_loop_leader(true);
 
     loop {
-        let loop_start = std::time::Instant::now();
-
-        // Phase 1: Claim (sequential, single connection)
-        let claimed_tasks = claim_phase(&pool, start_batch_size).await;
-
-        // Phase 2: Webhooks (parallel, JoinSet + Semaphore)
-        let tasks_processed = webhook_phase(
-            claimed_tasks,
+        run_start_iteration(
             evaluator,
             &pool,
-            &semaphore,
             dead_end_enabled,
+            start_batch_size,
+            &semaphore,
             &nudges,
             heartbeat_interval,
         )
         .await;
-
-        // Record worker loop metrics
-        let loop_duration = loop_start.elapsed().as_secs_f64();
-        metrics::record_worker_loop_iteration("start", loop_duration);
-        metrics::record_tasks_processed_per_loop(tasks_processed);
 
         // B4: wake immediately on an in-process nudge (a POST /task, an unblocked
         // child, or a resume) instead of always waiting a full tick. `notify_one`
@@ -94,6 +89,188 @@ pub async fn start_loop(
             }
             _ = nudges.start.notified() => {}
             _ = rt::time::sleep(interval) => {}
+        }
+    }
+}
+
+/// Multi-replica entry point (Audit 2, D7): a leader lease gates scheduling so only
+/// ONE replica claims/starts tasks at a time. Leadership is a session-scoped
+/// `pg_try_advisory_lock` on a DEDICATED connection this loop owns for its whole
+/// lifetime (a pooled connection would leak the session lock on return). The leader
+/// runs a normal iteration each tick; a standby just re-contends and skips. Failover
+/// is automatic: when the leader's process dies its connection drops and the lock is
+/// released, so a standby wins the lock on its next tick.
+///
+/// Single-replica (the common case) is unchanged: the sole loop wins the lock at
+/// startup and runs every tick, exactly like [`start_loop`].
+#[allow(clippy::too_many_arguments)]
+pub async fn start_loop_leased(
+    database_url: String,
+    evaluator: &ActionExecutor,
+    pool: DbPool,
+    interval: std::time::Duration,
+    dead_end_enabled: bool,
+    start_batch_size: i64,
+    webhook_concurrency: usize,
+    mut shutdown: watch::Receiver<bool>,
+    nudges: WorkerNudges,
+    claim_timeout: std::time::Duration,
+) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(webhook_concurrency));
+    let heartbeat_interval = claim_timeout / 3;
+    let mut lease = LeaderLease::new();
+
+    loop {
+        // Acquire / verify leadership on the dedicated lease connection.
+        let is_leader = lease.ensure(&database_url).await;
+        metrics::set_start_loop_leader(is_leader);
+
+        if is_leader {
+            run_start_iteration(
+                evaluator,
+                &pool,
+                dead_end_enabled,
+                start_batch_size,
+                &semaphore,
+                &nudges,
+                heartbeat_interval,
+            )
+            .await;
+        }
+
+        tokio::select! {
+            _ = shutdown.changed() => {
+                log::info!("Start worker: shutdown signal received, exiting");
+                // `lease` (and its dedicated connection) drops here, releasing the
+                // advisory lock so a standby can take over.
+                return;
+            }
+            _ = nudges.start.notified() => {}
+            _ = rt::time::sleep(interval) => {}
+        }
+    }
+}
+
+/// Run ONE scheduling iteration: claim a batch of Pending tasks, then execute their
+/// on_start webhooks (parallel, bounded by the semaphore). Shared by [`start_loop`]
+/// and [`start_loop_leased`].
+async fn run_start_iteration(
+    evaluator: &ActionExecutor,
+    pool: &DbPool,
+    dead_end_enabled: bool,
+    start_batch_size: i64,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    nudges: &WorkerNudges,
+    heartbeat_interval: std::time::Duration,
+) {
+    let loop_start = std::time::Instant::now();
+
+    // Phase 1: Claim (sequential, single connection)
+    let claimed_tasks = claim_phase(pool, start_batch_size).await;
+
+    // Phase 2: Webhooks (parallel, JoinSet + Semaphore)
+    let tasks_processed = webhook_phase(
+        claimed_tasks,
+        evaluator,
+        pool,
+        semaphore,
+        dead_end_enabled,
+        nudges,
+        heartbeat_interval,
+    )
+    .await;
+
+    // Record worker loop metrics
+    let loop_duration = loop_start.elapsed().as_secs_f64();
+    metrics::record_worker_loop_iteration("start", loop_duration);
+    metrics::record_tasks_processed_per_loop(tasks_processed);
+}
+
+/// Advisory-lock key for the start_loop leader lease (Audit 2, D7). An arbitrary but
+/// FIXED 64-bit constant shared by every replica; `pg_try_advisory_lock` on it grants
+/// leadership to exactly one session cluster-wide. Value derived from ASCII "ARCRUN".
+const START_LEADER_LOCK_KEY: i64 = 0x4152_4352_554E_0001;
+
+/// Owns the dedicated connection + advisory lock backing the start_loop leader lease.
+/// On drop the connection closes and Postgres releases the session lock (failover).
+struct LeaderLease {
+    conn: Option<AsyncPgConnection>,
+    is_leader: bool,
+}
+
+impl LeaderLease {
+    fn new() -> Self {
+        LeaderLease {
+            conn: None,
+            is_leader: false,
+        }
+    }
+
+    /// Return true iff this process currently holds leadership. (Re)connects the
+    /// dedicated lease connection if needed; verifies the connection is still alive
+    /// while leader (so a dropped connection relinquishes leadership); otherwise
+    /// contends for the lock with a single `pg_try_advisory_lock`. Never double-locks
+    /// (the lock is only acquired on the `!is_leader` path).
+    async fn ensure(&mut self, database_url: &str) -> bool {
+        if self.conn.is_none() {
+            match crate::establish_direct_connection(database_url).await {
+                Ok(c) => {
+                    self.conn = Some(c);
+                    self.is_leader = false;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "start_loop leader-lease: could not open dedicated lease connection: {}",
+                        e
+                    );
+                    return false;
+                }
+            }
+        }
+
+        // Already leader: confirm the connection (hence the session lock) is alive.
+        if self.is_leader {
+            let conn = self.conn.as_mut().expect("connection just ensured");
+            match diesel::sql_query("SELECT 1").execute(conn).await {
+                Ok(_) => return true,
+                Err(e) => {
+                    log::warn!(
+                        "start_loop leader-lease: lost the leader connection ({}); re-contending",
+                        e
+                    );
+                    self.conn = None;
+                    self.is_leader = false;
+                    return false;
+                }
+            }
+        }
+
+        // Standby: try to acquire the lock.
+        #[derive(diesel::QueryableByName)]
+        struct Locked {
+            #[diesel(sql_type = diesel::sql_types::Bool)]
+            locked: bool,
+        }
+        let conn = self.conn.as_mut().expect("connection just ensured");
+        match diesel::sql_query("SELECT pg_try_advisory_lock($1) AS locked")
+            .bind::<diesel::sql_types::BigInt, _>(START_LEADER_LOCK_KEY)
+            .get_result::<Locked>(conn)
+            .await
+        {
+            Ok(r) if r.locked => {
+                log::info!("start_loop leader-lease: acquired leadership");
+                self.is_leader = true;
+                true
+            }
+            Ok(_) => false, // another replica holds the lease
+            Err(e) => {
+                log::warn!(
+                    "start_loop leader-lease: try-lock failed ({}); dropping lease connection",
+                    e
+                );
+                self.conn = None;
+                false
+            }
         }
     }
 }

@@ -6,11 +6,11 @@ use crate::{
     rule::{self, Matcher, Strategy},
 };
 use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::{DbError, run_in_transaction};
+use super::DbError;
 
 /// PostgreSQL caps a single statement at 65535 bind parameters — the wire protocol
 /// encodes the parameter count as an unsigned 16-bit integer. A grouped multi-row
@@ -527,21 +527,24 @@ pub enum ClaimResult {
     AlreadyClaimed,
 }
 
-pub(crate) use rule::capacity_lock_key;
 /// Re-export lock key functions from rule module for use by other crates/modules.
-pub(crate) use rule::concurrency_lock_key;
+pub(crate) use rule::capacity_lock_key;
+pub(crate) use rule::concurrency_slot_key;
 
-/// Pre-computed parameters for the rule-check-and-claim SQL query.
+/// Pre-computed parameters for the rule-check-and-claim transaction.
 /// Built from a task's rules and metadata before entering the transaction,
 /// so no references to the Task are needed inside the closure.
 struct RuleQueryParams {
-    lock_keys: Vec<i64>,
-    // Concurrency rule arrays (parallel arrays, one entry per rule)
-    conc_kinds: Vec<String>,
-    conc_meta_texts: Vec<String>,
-    conc_statuses: Vec<StatusKind>,
-    conc_include_claimed: Vec<bool>,
-    conc_thresholds: Vec<i64>,
+    /// Concurrency slots (Audit 2, D1): `(canonical_key, threshold)` where the
+    /// threshold is the candidate rule's own `max_concurency`. Sorted by key and
+    /// deduped (BTreeMap): two rules of the same candidate producing the SAME key are
+    /// a single increment (keeping the MOST restrictive / lowest threshold), and the
+    /// sorted order gives every worker one canonical slot-lock acquisition order
+    /// (A9 deadlock discipline).
+    conc_slots: Vec<(String, i32)>,
+    /// Capacity advisory-lock keys (sorted, deduped). Capacity still uses the
+    /// advisory-lock + CTE-SUM mechanism (unchanged; 7.3b will revisit it).
+    cap_lock_keys: Vec<i64>,
     // Capacity rule arrays (parallel arrays, one entry per rule)
     cap_kinds: Vec<String>,
     cap_meta_texts: Vec<String>,
@@ -556,26 +559,21 @@ impl RuleQueryParams {
         let rules = &t.start_condition.0;
         let task_id = t.id;
 
-        let mut params = RuleQueryParams {
-            lock_keys: Vec::new(),
-            conc_kinds: Vec::new(),
-            conc_meta_texts: Vec::new(),
-            conc_statuses: Vec::new(),
-            conc_include_claimed: Vec::new(),
-            conc_thresholds: Vec::new(),
-            cap_kinds: Vec::new(),
-            cap_meta_texts: Vec::new(),
-            cap_max_capacities: Vec::new(),
-        };
+        // BTreeMap: dedup by canonical key + deterministic (sorted) iteration order.
+        let mut conc_map: std::collections::BTreeMap<String, i32> =
+            std::collections::BTreeMap::new();
+        let mut cap_lock_keys: Vec<i64> = Vec::new();
+        let mut cap_kinds: Vec<String> = Vec::new();
+        let mut cap_meta_texts: Vec<String> = Vec::new();
+        let mut cap_max_capacities: Vec<i64> = Vec::new();
 
         for strategy in rules {
             match strategy {
                 Strategy::Concurency(concurrency_rule) => {
-                    let m = match concurrency_rule
-                        .matcher
-                        .extract_metadata_fields(&t.metadata)
-                    {
-                        Ok(m) => m,
+                    // Canonical, collision-free slot key. A missing required metadata
+                    // field blocks the claim (same as the pre-slot advisory path).
+                    let key = match concurrency_slot_key(concurrency_rule, &t.metadata) {
+                        Ok(k) => k,
                         Err(field) => {
                             log::warn!(
                                 "Task {} missing metadata field '{}' required by concurrency rule, blocking",
@@ -586,27 +584,19 @@ impl RuleQueryParams {
                         }
                     };
 
-                    let lock_key = concurrency_lock_key(concurrency_rule, &t.metadata);
-                    let is_same_kind = concurrency_rule.matcher.kind == t.kind;
-                    let include_claimed = concurrency_rule.matcher.status == StatusKind::Running;
-
-                    // Pre-compute threshold for the SQL check (`count >= threshold` means blocked):
-                    // is_same_kind  → count < max  → blocked when count >= max
-                    // !is_same_kind → count <= max → blocked when count >= max + 1
-                    let threshold = if is_same_kind {
-                        concurrency_rule.max_concurency as i64
-                    } else {
-                        (concurrency_rule.max_concurency + 1) as i64
-                    };
-
-                    params.lock_keys.push(lock_key);
-                    params
-                        .conc_kinds
-                        .push(concurrency_rule.matcher.kind.clone());
-                    params.conc_meta_texts.push(m.to_string());
-                    params.conc_statuses.push(concurrency_rule.matcher.status);
-                    params.conc_include_claimed.push(include_claimed);
-                    params.conc_thresholds.push(threshold);
+                    // NEW SEMANTICS (Audit 2, D1 / §7): the slot counts only tasks that
+                    // consumed it (claimed WITH a rule producing this key), and the
+                    // candidate ALWAYS consumes it — so the candidate counts itself and
+                    // the threshold is simply its own `max_concurency` (allow while
+                    // `used < max`). This replaces the old cross-kind `is_same_kind`
+                    // `+1` fudge, which existed only because the old COUNT(*) also
+                    // counted tasks that merely matched the matcher without carrying the
+                    // rule. See the module note on the semantic change.
+                    let threshold = concurrency_rule.max_concurency;
+                    conc_map
+                        .entry(key)
+                        .and_modify(|e| *e = (*e).min(threshold))
+                        .or_insert(threshold);
                 }
                 Strategy::Capacity(capacity_rule) => {
                     let m = match capacity_rule.matcher.extract_metadata_fields(&t.metadata) {
@@ -631,42 +621,78 @@ impl RuleQueryParams {
                     }
 
                     let lock_key = capacity_lock_key(capacity_rule, &t.metadata);
-                    params.lock_keys.push(lock_key);
-                    params.cap_kinds.push(capacity_rule.matcher.kind.clone());
-                    params.cap_meta_texts.push(m.to_string());
-                    params
-                        .cap_max_capacities
-                        .push(capacity_rule.max_capacity as i64);
+                    cap_lock_keys.push(lock_key);
+                    cap_kinds.push(capacity_rule.matcher.kind.clone());
+                    cap_meta_texts.push(m.to_string());
+                    cap_max_capacities.push(capacity_rule.max_capacity as i64);
                 }
             }
         }
 
-        // Sort and deduplicate lock keys to acquire them in consistent order (prevents deadlocks)
-        params.lock_keys.sort();
-        params.lock_keys.dedup();
+        // Sort + dedup capacity advisory keys for a consistent acquisition order.
+        cap_lock_keys.sort();
+        cap_lock_keys.dedup();
 
-        Ok(params)
+        Ok(RuleQueryParams {
+            // BTreeMap iterates in ascending key order → already sorted + deduped.
+            conc_slots: conc_map.into_iter().collect(),
+            cap_lock_keys,
+            cap_kinds,
+            cap_meta_texts,
+            cap_max_capacities,
+        })
     }
 }
 
-/// Atomically check concurrency rules and claim a task within a single transaction,
-/// using `pg_advisory_xact_lock` to serialize workers checking the same rule/metadata combo.
+/// Non-error outcomes of the claim transaction that must ROLLBACK. diesel-async's
+/// `transaction` only rolls back on `Err`, so a blocked rule / already-claimed task
+/// (which must undo any slot increments already applied in the tx) is encoded as an
+/// `Err` here and translated back to an `Ok(ClaimResult)` after the tx returns.
+enum ClaimTxAbort {
+    /// A concurrency slot was at its limit, or capacity was blocked.
+    RuleBlocked,
+    /// The task left `pending` before the claim UPDATE (another worker won).
+    AlreadyClaimed,
+    /// A genuine DB error — surfaces to the caller as `Err`.
+    Db(DbError),
+}
+
+impl From<diesel::result::Error> for ClaimTxAbort {
+    fn from(e: diesel::result::Error) -> Self {
+        ClaimTxAbort::Db(DbError::from(e))
+    }
+}
+impl From<DbError> for ClaimTxAbort {
+    fn from(e: DbError) -> Self {
+        ClaimTxAbort::Db(e)
+    }
+}
+
+/// Atomically evaluate a task's rules and claim it (Pending -> Claimed) in ONE
+/// transaction.
 ///
-/// This prevents the TOCTOU race where two workers both see count < max and both claim,
-/// exceeding the concurrency limit.
+/// **Concurrency (Audit 2, D1):** each of the candidate's Concurrency rules maps to a
+/// `rule_slot` row. In sorted key order (A9 deadlock discipline) the claim increments
+/// each slot with a conditional upsert
+/// (`ON CONFLICT DO UPDATE SET used = used + 1 WHERE used < threshold RETURNING used`).
+/// A slot that returns no row is at its limit ⇒ the whole transaction rolls back
+/// (undoing earlier increments) ⇒ `RuleBlocked`. The row lock taken by the upsert (and
+/// the unique-index insert lock for a brand-new key) serializes concurrent claimers of
+/// the same slot, so the advisory-lock layer that Concurrency used before is gone. The
+/// consumed keys are persisted into `task.claimed_slot_keys` by the same claim UPDATE,
+/// so they can be released precisely later.
 ///
-/// Uses a two-query approach within the transaction:
-/// 1. Acquire all advisory locks in one round-trip (via unnest)
-/// 2. Check all concurrency + capacity rules and conditionally claim in a single CTE
+/// **Capacity:** unchanged — a `pg_advisory_xact_lock` per capacity key serializes the
+/// check-then-claim, then a CTE-SUM `cap_blocked` probe decides admission. (7.3b will
+/// migrate Capacity to a counter too.)
 ///
-/// This reduces the number of SQL round-trips from N+M+K+1 (N locks + M concurrency
-/// checks + K capacity checks + 1 claim) to exactly 2, minimizing time spent holding
-/// advisory locks and reducing contention between workers.
+/// The final claim `UPDATE ... WHERE id = $ AND status = 'pending'` matching 0 rows
+/// (task already claimed) also rolls back ⇒ `AlreadyClaimed` (no slot consumed).
 pub async fn claim_task_with_rules<'a>(
     conn: &mut Conn<'a>,
     t: &Task,
 ) -> Result<ClaimResult, DbError> {
-    // No rules — just do a plain claim (no advisory lock needed)
+    // No rules — just do a plain claim (no slot, no advisory lock needed)
     if t.start_condition.0.is_empty() {
         return match claim_task(conn, &t.id).await? {
             true => Ok(ClaimResult::Claimed),
@@ -682,127 +708,201 @@ pub async fn claim_task_with_rules<'a>(
     };
 
     let RuleQueryParams {
-        lock_keys,
-        conc_kinds,
-        conc_meta_texts,
-        conc_statuses,
-        conc_include_claimed,
-        conc_thresholds,
+        conc_slots,
+        cap_lock_keys,
         cap_kinds,
         cap_meta_texts,
         cap_max_capacities,
     } = params;
 
-    run_in_transaction(conn, |conn| {
-        Box::pin(async move {
-            // Query 1: Acquire all advisory locks in one round-trip.
-            // Locks are released automatically on COMMIT/ROLLBACK.
-            diesel::sql_query(
-                "SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k",
-            )
-            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&lock_keys)
-            .execute(&mut *conn)
-            .await?;
+    let tx: Result<(), ClaimTxAbort> = conn
+        .transaction(async move |conn: &mut Conn<'a>| {
+            // 1. Capacity (unchanged mechanism): advisory-lock the capacity keys, then
+            //    run the CTE-SUM `cap_blocked` probe. Concurrency does NOT advisory-lock
+            //    anymore (the slot row lock replaces it).
+            if !cap_lock_keys.is_empty() {
+                diesel::sql_query("SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k")
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&cap_lock_keys)
+                    .execute(&mut *conn)
+                    .await?;
 
-            // Query 2: Check all concurrency + capacity rules and conditionally claim
-            // the task, all in a single CTE. Rule parameters are passed as parallel
-            // arrays and unpacked via unnest.
-            //
-            // - conc_rules: one row per concurrency rule
-            // - conc_blocked: rows where the concurrency count >= threshold
-            // - cap_rules: one row per capacity rule
-            // - cap_blocked: rows where the capacity sum >= max
-            // - rules_check: single boolean — true iff no rule is blocked
-            // - claim_result: conditional UPDATE, only executes if rules_check.ok is true
-            #[derive(diesel::QueryableByName)]
-            struct ClaimCheckRow {
-                #[diesel(sql_type = diesel::sql_types::Bool)]
-                rules_passed: bool,
-                #[diesel(sql_type = diesel::sql_types::Bool)]
-                claimed: bool,
-            }
-
-            // Note: meta_text values are produced by serde_json::Value::to_string(), which
-            // always emits valid JSON. The SQL casts them back via `::jsonb`. This is safe but
-            // less type-safe than the old code which passed metadata as Diesel's Jsonb type
-            // directly — Diesel's sql_query bind API does not support binding Jsonb arrays, so
-            // we pass them as text and cast in SQL.
-            let row: ClaimCheckRow = diesel::sql_query(
-                r#"
-                WITH conc_rules AS (
-                    SELECT ord, kind, meta_text, status_val, include_claimed, threshold
-                    FROM unnest($1::text[], $2::text[], $3::status_kind[], $4::bool[], $5::bigint[])
-                    WITH ORDINALITY AS r(kind, meta_text, status_val, include_claimed, threshold, ord)
-                ),
-                conc_blocked AS (
-                    SELECT r.ord
-                    FROM conc_rules r
-                    WHERE (
-                        SELECT COUNT(*)
-                        FROM task t
-                        WHERE t.kind = r.kind
-                          AND t.metadata @> r.meta_text::jsonb
-                          AND (
-                              t.status = r.status_val
-                              OR (r.include_claimed AND t.status = 'claimed')
-                          )
-                    ) >= r.threshold
-                ),
-                cap_rules AS (
-                    SELECT ord, kind, meta_text, max_cap
-                    FROM unnest($6::text[], $7::text[], $8::bigint[])
-                    WITH ORDINALITY AS r(kind, meta_text, max_cap, ord)
-                ),
-                cap_blocked AS (
-                    SELECT r.ord
-                    FROM cap_rules r
-                    WHERE (
-                        SELECT COALESCE(SUM(GREATEST(COALESCE(t.expected_count, 0) - t.success - t.failures, 0)), 0)
-                        FROM task t
-                        WHERE t.kind = r.kind
-                          AND (t.status = 'running' OR t.status = 'claimed')
-                          AND t.metadata @> r.meta_text::jsonb
-                    ) >= r.max_cap
-                ),
-                rules_check AS (
-                    SELECT
-                        NOT EXISTS (SELECT 1 FROM conc_blocked)
-                        AND NOT EXISTS (SELECT 1 FROM cap_blocked) AS ok
-                ),
-                claim_result AS (
-                    UPDATE task SET status = 'claimed', last_updated = now()
-                    WHERE id = $9 AND status = 'pending'
-                      AND (SELECT ok FROM rules_check)
-                    RETURNING id
+                #[derive(diesel::QueryableByName)]
+                struct OkRow {
+                    #[diesel(sql_type = diesel::sql_types::Bool)]
+                    ok: bool,
+                }
+                let row: OkRow = diesel::sql_query(
+                    r#"
+                    WITH cap_rules AS (
+                        SELECT ord, kind, meta_text, max_cap
+                        FROM unnest($1::text[], $2::text[], $3::bigint[])
+                        WITH ORDINALITY AS r(kind, meta_text, max_cap, ord)
+                    ),
+                    cap_blocked AS (
+                        SELECT r.ord
+                        FROM cap_rules r
+                        WHERE (
+                            SELECT COALESCE(SUM(GREATEST(COALESCE(t.expected_count, 0) - t.success - t.failures, 0)), 0)
+                            FROM task t
+                            WHERE t.kind = r.kind
+                              AND (t.status = 'running' OR t.status = 'claimed')
+                              AND t.metadata @> r.meta_text::jsonb
+                        ) >= r.max_cap
+                    )
+                    SELECT NOT EXISTS (SELECT 1 FROM cap_blocked) AS ok
+                    "#,
                 )
-                SELECT
-                    (SELECT ok FROM rules_check) AS rules_passed,
-                    EXISTS (SELECT 1 FROM claim_result) AS claimed
-                "#,
-            )
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&conc_kinds)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&conc_meta_texts)
-            .bind::<diesel::sql_types::Array<crate::schema::sql_types::StatusKind>, _>(&conc_statuses)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Bool>, _>(&conc_include_claimed)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&conc_thresholds)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&cap_kinds)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&cap_meta_texts)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&cap_max_capacities)
-            .bind::<diesel::sql_types::Uuid, _>(task_id)
-            // INVARIANT: The final SELECT (no FROM/WHERE) always produces exactly 1 row,
-            // so get_result is safe. If this query is ever modified to add filtering on the
-            // outer SELECT, it must switch to get_results + handle the empty case.
-            .get_result(&mut *conn)
-            .await?;
-
-            if row.claimed {
-                Ok(ClaimResult::Claimed)
-            } else if !row.rules_passed {
-                Ok(ClaimResult::RuleBlocked)
-            } else {
-                Ok(ClaimResult::AlreadyClaimed)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&cap_kinds)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&cap_meta_texts)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&cap_max_capacities)
+                .get_result(&mut *conn)
+                .await?;
+                if !row.ok {
+                    return Err(ClaimTxAbort::RuleBlocked);
+                }
             }
+
+            // 2. Concurrency slots: conditional upsert per key, in sorted order.
+            //    No row returned ⇒ at limit ⇒ abort (rollback undoes earlier increments).
+            #[derive(diesel::QueryableByName)]
+            struct SlotUsed {
+                #[diesel(sql_type = diesel::sql_types::Integer)]
+                #[allow(dead_code)]
+                used: i32,
+            }
+            for (key, threshold) in &conc_slots {
+                let row: Option<SlotUsed> = diesel::sql_query(
+                    "INSERT INTO rule_slot AS rs (lock_key, used) VALUES ($1, 1)
+                     ON CONFLICT (lock_key) DO UPDATE SET used = rs.used + 1
+                     WHERE rs.used < $2
+                     RETURNING used",
+                )
+                .bind::<diesel::sql_types::Text, _>(key)
+                .bind::<diesel::sql_types::Integer, _>(*threshold)
+                .get_result::<SlotUsed>(&mut *conn)
+                .await
+                .optional()?;
+                if row.is_none() {
+                    return Err(ClaimTxAbort::RuleBlocked);
+                }
+            }
+
+            // 3. Claim UPDATE, persisting the consumed slot keys.
+            let keys: Vec<String> = conc_slots.iter().map(|(k, _)| k.clone()).collect();
+            let claimed_rows = if keys.is_empty() {
+                // Capacity-only task: no slots to persist (claimed_slot_keys stays NULL).
+                use crate::schema::task::dsl::*;
+                use diesel::dsl::now;
+                diesel::update(task.filter(id.eq(task_id).and(status.eq(StatusKind::Pending))))
+                    .set((status.eq(StatusKind::Claimed), last_updated.eq(now)))
+                    .execute(&mut *conn)
+                    .await?
+            } else {
+                diesel::sql_query(
+                    "UPDATE task
+                     SET status = 'claimed', last_updated = now(), claimed_slot_keys = $2
+                     WHERE id = $1 AND status = 'pending'",
+                )
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&keys)
+                .execute(&mut *conn)
+                .await?
+            };
+            if claimed_rows == 0 {
+                return Err(ClaimTxAbort::AlreadyClaimed);
+            }
+
+            Ok::<(), ClaimTxAbort>(())
         })
-    })
-    .await
+        .await;
+
+    match tx {
+        Ok(()) => Ok(ClaimResult::Claimed),
+        Err(ClaimTxAbort::RuleBlocked) => Ok(ClaimResult::RuleBlocked),
+        Err(ClaimTxAbort::AlreadyClaimed) => Ok(ClaimResult::AlreadyClaimed),
+        Err(ClaimTxAbort::Db(e)) => Err(e),
+    }
+}
+
+/// Release the concurrency slots (Audit 2, D1) held by the given tasks. For every id
+/// in `task_ids` whose `claimed_slot_keys` is non-NULL, decrement `rule_slot.used`
+/// (clamped at 0) once per key it holds, then NULL its `claimed_slot_keys`.
+///
+/// **Exactly-once / no double-release.** Callers pass the ids they just terminalized
+/// (or requeued). The `claimed_slot_keys IS NOT NULL` gate is what encodes "only a task
+/// that actually consumed a slot releases one": a task that was Pending/Waiting/Paused
+/// (never claimed with a rule) has NULL keys, so passing it is a harmless no-op — which
+/// is why the terminal sites can pass their whole `terminal_ids` slice without a
+/// per-id status check. Setting the column to NULL in the same statement makes a second
+/// release call (should one ever reach the same id) a no-op, and each release is
+/// coupled to the SUCCESS of a status-guarded transition (like the D2 batch decrement),
+/// so a task can only be released once. Keys are read back from the column and NEVER
+/// recomputed (metadata is mutable while Running).
+///
+/// Must run inside the same transaction as the terminal/requeue transition. One
+/// statement: a CTE NULLs + returns the released key arrays, aggregates per-key counts
+/// (a slot shared by two released tasks decrements by 2), and decrements `rule_slot`.
+pub async fn release_slots_for_tasks<'a>(
+    conn: &mut Conn<'a>,
+    task_ids: &[uuid::Uuid],
+) -> Result<(), DbError> {
+    if task_ids.is_empty() {
+        return Ok(());
+    }
+    // A9: pre-lock the affected `rule_slot` rows in one globally-ordered statement
+    // BEFORE the join-driven decrement below. The claim side acquires slot row locks
+    // one key at a time in sorted order; without this, `slot_dec`'s `UPDATE … FROM`
+    // acquires them in join order, and a multi-key release racing a multi-key claim
+    // (or another release) could take the same two slots in opposite orders and
+    // deadlock. Locking here in `ORDER BY lock_key` makes every slot-lock acquisition
+    // in the system sorted. Held until COMMIT (caller-invariant: in-tx).
+    diesel::sql_query(
+        "SELECT lock_key FROM rule_slot
+         WHERE lock_key IN (
+             SELECT DISTINCT unnest(claimed_slot_keys)
+             FROM task
+             WHERE id = ANY($1) AND claimed_slot_keys IS NOT NULL
+         )
+         ORDER BY lock_key
+         FOR UPDATE",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(task_ids)
+    .execute(&mut *conn)
+    .await?;
+
+    // NOTE: the keys are READ (and row-locked) in `to_release` BEFORE `cleared` NULLs
+    // the column — a single `UPDATE ... SET keys = NULL RETURNING keys` would RETURN the
+    // just-NULLed value and release nothing. All CTEs share one snapshot, so `key_counts`
+    // aggregates the pre-NULL keys while `cleared` clears them and `slot_dec` decrements.
+    diesel::sql_query(
+        "WITH to_release AS (
+            SELECT id, claimed_slot_keys
+            FROM task
+            WHERE id = ANY($1) AND claimed_slot_keys IS NOT NULL
+            FOR UPDATE
+         ),
+         key_counts AS (
+            SELECT k AS lock_key, COUNT(*)::int AS cnt
+            FROM to_release, unnest(claimed_slot_keys) AS k
+            GROUP BY k
+         ),
+         slot_dec AS (
+            UPDATE rule_slot rs
+            SET used = GREATEST(rs.used - kc.cnt, 0)
+            FROM key_counts kc
+            WHERE rs.lock_key = kc.lock_key
+            RETURNING rs.lock_key
+         ),
+         cleared AS (
+            UPDATE task
+            SET claimed_slot_keys = NULL
+            WHERE id IN (SELECT id FROM to_release)
+            RETURNING id
+         )
+         SELECT 1",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(task_ids)
+    .execute(conn)
+    .await?;
+    Ok(())
 }

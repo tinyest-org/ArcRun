@@ -59,6 +59,13 @@ diesel::table! {
 }
 
 diesel::table! {
+    rule_slot (lock_key) {
+        lock_key -> Text,
+        used -> Int4,
+    }
+}
+
+diesel::table! {
     use diesel::sql_types::*;
     use super::sql_types::StatusKind;
 
@@ -83,6 +90,7 @@ diesel::table! {
         expected_count -> Nullable<Int4>,
         dead_end_barrier -> Bool,
         priority -> Int4,
+        claimed_slot_keys -> Nullable<Array<Text>>,
     }
 }
 
@@ -112,4 +120,11 @@ diesel::joinable!(action -> task (task_id));
 diesel::joinable!(webhook_execution -> task (task_id));
 diesel::joinable!(webhook_execution -> batch (batch_id));
 
-diesel::allow_tables_to_appear_in_same_query!(action, batch, link, task, webhook_execution,);
+diesel::allow_tables_to_appear_in_same_query!(
+    action,
+    batch,
+    link,
+    rule_slot,
+    task,
+    webhook_execution,
+);

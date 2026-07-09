@@ -226,7 +226,9 @@ impl ActionExecutor {
     /// strict executor without mutating the global `OnceLock`.
     pub fn with_security_config(ctx: ActionContext, security: &SecurityConfig) -> Self {
         let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(
+                crate::config::WEBHOOK_HTTP_TIMEOUT_SECS,
+            ))
             .redirect(reqwest::redirect::Policy::none());
         if !security.skip_ssrf_validation {
             builder = builder.dns_resolver(SsrfGuardResolver);

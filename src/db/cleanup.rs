@@ -114,3 +114,17 @@ pub async fn cleanup_old_terminal_tasks<'a>(
     })
     .await
 }
+
+/// Garbage-collect empty concurrency slot rows (Audit 2, D1). Slot keys are derived
+/// from task metadata and are therefore unbounded, so without periodic GC the
+/// `rule_slot` table grows forever. Deleting a `used = 0` row is safe under concurrency:
+/// the DELETE takes a row lock, and Postgres re-checks `used = 0` after acquiring it —
+/// so a row a concurrent claim just incremented (to >= 1) is NOT deleted. If a key is
+/// needed again after deletion, the claim's `INSERT ... ON CONFLICT` recreates it.
+/// Returns the number of rows deleted.
+pub async fn gc_empty_rule_slots<'a>(conn: &mut Conn<'a>) -> Result<usize, DbError> {
+    let deleted = diesel::sql_query("DELETE FROM rule_slot WHERE used = 0")
+        .execute(conn)
+        .await?;
+    Ok(deleted)
+}

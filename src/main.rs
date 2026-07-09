@@ -303,10 +303,14 @@ fn spawn_workers(
         let start_batch_size = config.worker.start_batch_size;
         let webhook_concurrency = config.worker.webhook_concurrency;
         let claim_timeout = config.worker.claim_timeout;
+        // D7 leader lease: the scheduler runs only on the elected leader (single-replica
+        // always wins). The dedicated lease connection is opened from DATABASE_URL.
+        let database_url = config.database_url.clone();
         let shutdown = shutdown_rx.clone();
         let nudges = nudges.clone();
         actix_web::rt::spawn(async move {
-            arcrun::workers::start_loop(
+            arcrun::workers::start_loop_leased(
+                database_url,
                 executor.as_ref(),
                 pool,
                 interval,

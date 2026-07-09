@@ -50,6 +50,22 @@ pub async fn initialize_db_pool(pool_config: &config::PoolConfig) -> DbPool {
         .expect("failed to get pool")
 }
 
+/// Establish a **dedicated** (non-pooled) async connection to `database_url`.
+///
+/// Used by the start_loop leader-lease (Audit 2, D7): a session-scoped
+/// `pg_try_advisory_lock` must live on a connection the loop owns for its whole
+/// lifetime — a pooled connection would leak the lock when returned to the pool.
+pub async fn establish_direct_connection(
+    database_url: &str,
+) -> ConnectionResult<AsyncPgConnection> {
+    // `establish_connection` builds a rustls TLS config, which needs a process-level
+    // CryptoProvider. `main` installs `ring` at startup, but a direct caller (e.g. an
+    // integration test) may not have — install it idempotently (the second install
+    // returns Err, which we ignore).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    establish_connection(database_url).await
+}
+
 fn establish_connection(config: &'_ str) -> BoxFuture<'_, ConnectionResult<AsyncPgConnection>> {
     let fut = async {
         // We first set up the way we want rustls to work.

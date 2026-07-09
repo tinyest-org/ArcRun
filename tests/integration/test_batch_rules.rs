@@ -325,6 +325,7 @@ async fn test_capacity_rule_with_no_expected_count() {
         expected_count: None,
         dead_end_barrier: false,
         priority: 0,
+        claimed_slot_keys: None,
     };
 
     let mut conn = state.pool.get().await.unwrap();

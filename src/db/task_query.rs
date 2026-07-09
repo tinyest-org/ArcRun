@@ -162,6 +162,11 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
             )
             .await?;
 
+            // Slot release (Audit 2, D1): the timed-out task was Running (held its
+            // slots); dead-end ancestors that were active held theirs. Cascade children
+            // were Waiting/Paused ⇒ NULL keys ⇒ no-op.
+            crate::db_operation::release_slots_for_tasks(conn, &terminal_ids).await?;
+
             Ok(Some((t, cascade_failed, canceled_ancestors)))
         })
     })
@@ -171,34 +176,65 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
 /// Requeue Claimed tasks that never started within the claim timeout.
 /// Returns the ids of the tasks moved back to Pending.
 ///
-/// Targeted RETURNING (Audit 2, B7): the only caller (`timeout_loop`) consumes
-/// just the count and the ids for logging/metrics, so we RETURN `id` alone
-/// instead of the full (JSONB-carrying) row.
+/// Slot release (Audit 2, D1): a stale Claimed task holds its concurrency slots (it
+/// consumed them at claim time). Requeuing it to Pending MUST release those slots and
+/// NULL its `claimed_slot_keys` — otherwise the slot leaks (the task re-claims later
+/// and re-increments). This is the 7th release site.
+///
+/// All three steps run in ONE transaction so a crash cannot leave a task Pending with
+/// its slot still held: (1) lock + capture the stale Claimed rows (`FOR UPDATE SKIP
+/// LOCKED`), (2) flip them to Pending, (3) `release_slots_for_tasks` — which reads their
+/// still-set `claimed_slot_keys`, decrements `rule_slot`, and NULLs the keys. Capturing
+/// the ids BEFORE the release is why we can't do it all in one `UPDATE ... RETURNING`
+/// (that would RETURN the just-NULLed keys).
 pub(crate) async fn requeue_stale_claimed_tasks<'a>(
     conn: &mut Conn<'a>,
     claim_timeout: std::time::Duration,
 ) -> Result<Vec<uuid::Uuid>, DbError> {
-    use {
-        crate::schema::task::dsl::*,
-        diesel::{dsl::now, pg::data_types::PgInterval},
-    };
-
+    use super::run_in_transaction;
     let micros = i64::try_from(claim_timeout.as_micros()).unwrap_or(i64::MAX);
-    let interval = PgInterval::from_microseconds(micros).into_sql::<sql_types::Interval>();
 
-    let updated = diesel::update(
-        task.filter(
-            status
-                .eq(models::StatusKind::Claimed)
-                .and(last_updated.lt(now.into_sql::<sql_types::Timestamptz>() - interval)),
-        ),
-    )
-    .set((status.eq(models::StatusKind::Pending), last_updated.eq(now)))
-    .returning(id)
-    .get_results::<uuid::Uuid>(conn)
-    .await?;
+    #[derive(diesel::QueryableByName)]
+    struct StaleId {
+        #[diesel(sql_type = sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
 
-    Ok(updated)
+    run_in_transaction(conn, |conn| {
+        Box::pin(async move {
+            use crate::schema::task::dsl::*;
+            use diesel::dsl::now;
+
+            // 1. Lock + capture stale Claimed ids (SKIP LOCKED so we never block on a
+            //    row another worker is mid-transitioning). Interval built from micros.
+            let stale: Vec<StaleId> = diesel::sql_query(
+                "SELECT id FROM task
+                 WHERE status = 'claimed'
+                   AND last_updated < now() - make_interval(secs => $1::double precision / 1000000.0)
+                 FOR UPDATE SKIP LOCKED",
+            )
+            .bind::<sql_types::BigInt, _>(micros)
+            .get_results::<StaleId>(&mut *conn)
+            .await?;
+
+            if stale.is_empty() {
+                return Ok(Vec::new());
+            }
+            let ids: Vec<uuid::Uuid> = stale.into_iter().map(|s| s.id).collect();
+
+            // 2. Flip to Pending (leaves claimed_slot_keys set for the release read).
+            diesel::update(task.filter(id.eq_any(&ids)))
+                .set((status.eq(models::StatusKind::Pending), last_updated.eq(now)))
+                .execute(&mut *conn)
+                .await?;
+
+            // 3. Release their slots (reads the still-set keys, decrements, NULLs them).
+            crate::db_operation::release_slots_for_tasks(&mut *conn, &ids).await?;
+
+            Ok(ids)
+        })
+    })
+    .await
 }
 
 /// Keyset cursor for paginating Pending tasks in the start_loop claim phase.

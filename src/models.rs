@@ -30,6 +30,11 @@ pub struct Task {
     pub expected_count: Option<i32>,
     pub dead_end_barrier: bool,
     pub priority: i32,
+    /// Concurrency slot keys (Audit 2, D1) this task consumed when it was claimed,
+    /// persisted so they can be released precisely on any exit from Claimed/Running.
+    /// `None` = the task holds no concurrency slots. NEVER recomputed from `metadata`
+    /// (which is mutable while Running) — always read back from this column.
+    pub claimed_slot_keys: Option<Vec<String>>,
 }
 
 #[derive(Identifiable, Queryable, Associations, Selectable, PartialEq)]

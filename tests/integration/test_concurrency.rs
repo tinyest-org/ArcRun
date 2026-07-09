@@ -34,6 +34,7 @@ fn make_task_for_claim(
         expected_count: None,
         dead_end_barrier: false,
         priority: 0,
+        claimed_slot_keys: None,
     }
 }
 
@@ -409,6 +410,7 @@ fn make_task_for_claim_with_expected(
         expected_count,
         dead_end_barrier: false,
         priority: 0,
+        claimed_slot_keys: None,
     }
 }
 

@@ -13,13 +13,17 @@ ciblés + timeout_loop borné + probes 2 s + circuit breaker opérant).
 **La campagne non-breaking (Lots 4/5/6) est CLOSE.** Le **Lot 7 (breaking)
 est partiellement ouvert** sur décision utilisateur du 2026-07-09 : périmètre
 = **7.2 puis 7.3 uniquement** (7.1 API v1/HMAC, 7.4 GET /work, 7.5 split
-outbox restent non décidés). **7.2 (D2, `batch.remaining`) : FAIT** —
+outbox restent non décidés). **7.2 (D2, `batch.remaining`) : FAIT** (525fd9a) —
 compteur dénormalisé remplaçant le FOR UPDATE + NOT EXISTS (et l'index
 partiel B3, droppé), décrément groupé en-tx à chaque site terminal,
-`remaining` exposé dans GET /batches. **Suivant : 7.3** (D1/D7, `rule_slot`
-+ bundle multi-réplica) avec décisions actées : Concurrency + **Capacity
-d'emblée** (deltas poussés depuis le flush du batch_updater), coordination
-start_loop par **leader-lease advisory** (`pg_try_advisory_lock`).
+`remaining` exposé dans GET /batches. **7.3a (D1/D7 Concurrency) : FAIT** —
+`rule_slot` + `task.claimed_slot_keys` (libération aux 7 sites de sortie de
+Claimed/Running, dont requeue-stale), leader-lease advisory sur la
+start_loop (connexion dédiée, failover). Sémantique assumée : seuls les
+porteurs de la règle comptent dans le slot. **Suivant : 7.3b** (D1
+Capacity) : basculer les règles Capacity sur `rule_slot` — deltas de
+`remaining` poussés depuis le flush du batch_updater (décision actée
+Concurrency + Capacity d'emblée).
 Détail et notes de relecture par item dans
 `docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
 Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7) ; renversement

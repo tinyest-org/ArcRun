@@ -4,6 +4,12 @@
 
 use std::time::Duration;
 
+/// Per-request HTTP timeout applied to every webhook call (on_start, end/cancel
+/// delivery). Defined here (rather than only in `action.rs`) so `Config::validate`
+/// can compare it against `WORKER_CLAIM_TIMEOUT_SECS` for the D7 `stale_after`
+/// guardrail. `ActionExecutor` reads the same constant when building its client.
+pub const WEBHOOK_HTTP_TIMEOUT_SECS: u64 = 10;
+
 /// Application configuration loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -701,6 +707,25 @@ impl Config {
                 field: "PAYLOAD_MAX_BYTES".to_string(),
                 message: "Must be greater than 0".to_string(),
             });
+        }
+
+        // D7 `stale_after` guardrail (multi-replica): a `Claimed` task waiting on the
+        // start_loop's on_start sequence must not be reclaimed by requeue-stale before
+        // that sequence can finish. A single on_start webhook can take up to
+        // `WEBHOOK_HTTP_TIMEOUT_SECS`; if the claim timeout is shorter, a slow (but
+        // healthy) on_start would be requeued mid-flight and re-run — and its slot,
+        // released on requeue, re-incremented. Warn (don't reject: legitimate for
+        // fast/no on_start) so the operator raises WORKER_CLAIM_TIMEOUT_SECS.
+        if self.worker.claim_timeout.as_secs() < WEBHOOK_HTTP_TIMEOUT_SECS {
+            log::warn!(
+                "WORKER_CLAIM_TIMEOUT_SECS ({}) is below the per-call webhook HTTP timeout \
+                 ({}s): a slow-but-healthy on_start sequence can be requeued mid-flight by \
+                 requeue-stale (and its concurrency slot released then re-acquired). Set \
+                 WORKER_CLAIM_TIMEOUT_SECS at or above the max on_start sequence duration \
+                 (>= WEBHOOK_HTTP_TIMEOUT_SECS, times the number of on_start actions)",
+                self.worker.claim_timeout.as_secs(),
+                WEBHOOK_HTTP_TIMEOUT_SECS
+            );
         }
 
         if self.worker.webhook_concurrency >= self.pool.max_size as usize {

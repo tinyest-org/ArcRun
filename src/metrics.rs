@@ -310,6 +310,11 @@ register_int_gauge!(
 // Concurrency Metrics
 // ============================================================================
 
+register_int_gauge!(
+    START_LOOP_IS_LEADER,
+    "start_loop_is_leader",
+    "1 when this process holds the start_loop leader lease (Audit 2, D7), else 0"
+);
 register_int_counter!(
     TASKS_BLOCKED_BY_CONCURRENCY,
     "tasks_blocked_by_concurrency_total",
@@ -622,6 +627,12 @@ pub fn record_task_duration(kind: &str, outcome: &str, duration_secs: f64) {
         .observe(duration_secs);
 }
 
+/// Set the start_loop leader-lease gauge (Audit 2, D7): 1 when this process holds the
+/// lease and runs the scheduler, 0 when it is a standby waiting to take over.
+pub fn set_start_loop_leader(is_leader: bool) {
+    START_LOOP_IS_LEADER.set(if is_leader { 1 } else { 0 });
+}
+
 pub fn record_task_blocked_by_concurrency() {
     TASKS_BLOCKED_BY_CONCURRENCY.inc();
 }
@@ -814,6 +825,7 @@ pub fn init_metrics() {
     let _ = &*WEBHOOK_OUTBOX_PENDING;
     let _ = &*WEBHOOK_OUTBOX_OLDEST_PENDING_AGE_SECONDS;
     let _ = &*WEBHOOK_MARK_FAILURES;
+    let _ = &*START_LOOP_IS_LEADER;
     let _ = &*TASKS_BLOCKED_BY_CONCURRENCY;
     let _ = &*CONCURRENCY_KO_CACHE_HITS_TOTAL;
     let _ = &*TASKS_DEDUPED_TOTAL;
