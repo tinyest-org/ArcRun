@@ -3,6 +3,44 @@ use crate::common::*;
 use arcrun::dtos::TaskDto;
 use serde_json::json;
 
+/// Poll GET /task/{id} until both counters reach the expected values, or panic
+/// after a generous deadline. The batch updater flushes asynchronously (100 ms
+/// interval in the test config), so a fixed sleep is flaky under a loaded
+/// parallel suite — the flush tick + pool acquisition can easily exceed it.
+/// Polling asserts the same contract (the counts eventually land) without
+/// depending on scheduler timing.
+async fn wait_for_counters<S, B>(
+    app: &S,
+    task_id: uuid::Uuid,
+    expected_success: i32,
+    expected_failures: i32,
+    what: &str,
+) -> TaskDto
+where
+    S: actix_web::dev::Service<
+            actix_http::Request,
+            Response = actix_web::dev::ServiceResponse<B>,
+            Error = actix_web::Error,
+        >,
+    B: actix_web::body::MessageBody,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let task: TaskDto = get_task_ok(app, task_id).await;
+        if task.success == expected_success && task.failures == expected_failures {
+            return task;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: counters did not reach ({expected_success}, {expected_failures}) \
+             within 10s — last seen ({}, {})",
+            task.success,
+            task.failures
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_batch_update_increments_counters() {
     let (_g, test_state) = setup_test_app_with_batch_updater().await;
@@ -28,18 +66,9 @@ async fn test_batch_update_increments_counters() {
         "Batch update should be accepted"
     );
 
-    // Wait for batch updater to process (runs every 100ms)
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-
-    let updated: TaskDto = get_task_ok(&app, task_id).await;
-    assert_eq!(
-        updated.success, 5,
-        "Success counter should be incremented to 5"
-    );
-    assert_eq!(
-        updated.failures, 2,
-        "Failures counter should be incremented to 2"
-    );
+    // Wait (poll, not a fixed sleep — the async flush is timing-sensitive under a
+    // loaded suite) for the batch updater to persist the counts.
+    wait_for_counters(&app, task_id, 5, 2, "increments_counters").await;
 }
 
 #[tokio::test]
@@ -61,14 +90,8 @@ async fn test_batch_update_accumulates_multiple_updates() {
         actix_web::test::call_service(&app, update_req).await;
     }
 
-    // Wait for batch updater to process
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-
-    let updated: TaskDto = get_task_ok(&app, task_id).await;
-    assert_eq!(
-        updated.success, 10,
-        "Success counter should accumulate to 10 from 10 updates of +1 each"
-    );
+    // Wait (poll) for the batch updater to persist the accumulated counts.
+    wait_for_counters(&app, task_id, 10, 0, "accumulates_multiple_updates").await;
 }
 
 #[tokio::test]
