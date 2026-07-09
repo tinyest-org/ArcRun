@@ -187,6 +187,7 @@ async fn test_requeued_task_picked_up_by_start_loop() {
             10,
             shutdown_rx2,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });

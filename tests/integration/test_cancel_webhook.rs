@@ -122,6 +122,7 @@ async fn test_cancel_webhook_fires_after_on_start_registers_cancel_action() {
             10,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });

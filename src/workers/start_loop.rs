@@ -51,8 +51,13 @@ pub async fn start_loop(
     webhook_concurrency: usize,
     mut shutdown: watch::Receiver<bool>,
     nudges: WorkerNudges,
+    claim_timeout: std::time::Duration,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(webhook_concurrency));
+    // B2: heartbeat interval = claim_timeout / 3, so a task waiting for a permit
+    // has its `last_updated` refreshed at least twice before requeue-stale would
+    // consider it stale.
+    let heartbeat_interval = claim_timeout / 3;
 
     loop {
         let loop_start = std::time::Instant::now();
@@ -68,6 +73,7 @@ pub async fn start_loop(
             &semaphore,
             dead_end_enabled,
             &nudges,
+            heartbeat_interval,
         )
         .await;
 
@@ -303,6 +309,7 @@ async fn webhook_phase(
     semaphore: &Arc<tokio::sync::Semaphore>,
     dead_end_enabled: bool,
     nudges: &WorkerNudges,
+    heartbeat_interval: std::time::Duration,
 ) -> usize {
     if claimed_tasks.is_empty() {
         return 0;
@@ -311,13 +318,9 @@ async fn webhook_phase(
     let mut join_set = JoinSet::new();
 
     for t in claimed_tasks {
-        // Acquire permit BEFORE spawning: bounds live spawned tasks to
-        // semaphore capacity, preventing unbounded memory growth from
-        // eagerly-spawned futures sitting in the JoinSet.
-        let permit = Arc::clone(semaphore)
-            .acquire_owned()
-            .await
-            .expect("semaphore should not be closed");
+        // B2: heartbeat `last_updated` while waiting for a permit, so
+        // requeue-stale does not reclaim the task during long semaphore waits.
+        let permit = acquire_permit_with_heartbeat(semaphore, pool, t.id, heartbeat_interval).await;
 
         let pool = pool.clone();
         let evaluator = evaluator.clone();
@@ -342,6 +345,52 @@ async fn webhook_phase(
     }
 
     tasks_processed
+}
+
+/// Acquire a semaphore permit while heartbeating `last_updated` on the task so
+/// requeue-stale does not reclaim it during long waits (B2).
+///
+/// Every `heartbeat_interval` the task's `last_updated` is bumped via a cheap
+/// autocommit UPDATE. On DB error the heartbeat is logged and skipped — it is a
+/// best-effort optimization, not correctness (requeue-stale would reclaim and the
+/// next iteration retries).
+async fn acquire_permit_with_heartbeat(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    heartbeat_interval: std::time::Duration,
+) -> tokio::sync::OwnedSemaphorePermit {
+    use crate::schema::task::dsl;
+
+    let acquire_fut = Arc::clone(semaphore).acquire_owned();
+    tokio::pin!(acquire_fut);
+
+    loop {
+        tokio::select! {
+            permit = &mut acquire_fut => {
+                return permit.expect("semaphore should not be closed");
+            }
+            _ = rt::time::sleep(heartbeat_interval) => {
+                if let Ok(mut conn) = pool.get().await {
+                    let res = diesel::update(
+                        dsl::task.filter(
+                            dsl::id.eq(task_id)
+                                .and(dsl::status.eq(crate::models::StatusKind::Claimed)),
+                        ),
+                    )
+                    .set(dsl::last_updated.eq(diesel::dsl::now))
+                    .execute(&mut conn)
+                    .await;
+                    if let Err(e) = res {
+                        log::warn!(
+                            "B2 heartbeat: failed to bump last_updated for task {}: {:?}",
+                            task_id, e
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Execute the full on_start lifecycle for a single claimed task, split into three

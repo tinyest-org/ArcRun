@@ -328,6 +328,7 @@ async fn test_webhook_includes_idempotency_headers() {
             10,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });
@@ -390,6 +391,7 @@ async fn test_requeue_claimed_skips_on_start_when_idempotent() {
             10,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });
@@ -448,6 +450,7 @@ async fn test_requeue_claimed_skips_on_start_when_idempotent() {
             10,
             shutdown_rx2,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });

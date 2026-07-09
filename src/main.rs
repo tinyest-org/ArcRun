@@ -280,6 +280,7 @@ fn spawn_workers(
         let dead_end_enabled = config.worker.dead_end_cancel_enabled;
         let start_batch_size = config.worker.start_batch_size;
         let webhook_concurrency = config.worker.webhook_concurrency;
+        let claim_timeout = config.worker.claim_timeout;
         let shutdown = shutdown_rx.clone();
         let nudges = nudges.clone();
         actix_web::rt::spawn(async move {
@@ -292,6 +293,7 @@ fn spawn_workers(
                 webhook_concurrency,
                 shutdown,
                 nudges,
+                claim_timeout,
             )
             .await;
         })

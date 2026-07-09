@@ -491,6 +491,7 @@ async fn test_audit2_a2_start_row_completed_atomically_with_running() {
             10,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });
@@ -725,6 +726,7 @@ async fn test_audit2_a4_cancel_action_saved_when_task_left_claimed_during_on_sta
             10,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });
@@ -1016,6 +1018,7 @@ async fn test_audit2_a4_cancel_during_permit_wait_skips_on_start() {
             1,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });
@@ -3022,6 +3025,7 @@ async fn test_audit2_b1_on_start_http_does_not_hold_db_connection() {
             10,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });
@@ -3128,6 +3132,7 @@ async fn test_audit2_b1_flow_unchanged_after_phase_split() {
             10,
             shutdown_rx,
             arcrun::workers::WorkerNudges::new(),
+            std::time::Duration::from_secs(30),
         )
         .await;
     });
@@ -3828,8 +3833,18 @@ async fn test_audit2_b4_post_task_nudges_start_loop() {
     let pool = state.pool.clone();
     let nudges = state.nudges.clone();
     let handle = tokio::spawn(async move {
-        arcrun::workers::start_loop(&evaluator, pool, LONG, true, 50, 10, shutdown_rx, nudges)
-            .await;
+        arcrun::workers::start_loop(
+            &evaluator,
+            pool,
+            LONG,
+            true,
+            50,
+            10,
+            shutdown_rx,
+            nudges,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
     });
 
     // Let the loop run its immediate first iteration (no Pending work) and park asleep
@@ -3911,6 +3926,7 @@ async fn test_audit2_b4_patch_nudges_delivery_loop() {
                 10,
                 start_shutdown_rx,
                 nudges,
+                std::time::Duration::from_secs(30),
             )
             .await;
         });
@@ -3994,5 +4010,95 @@ async fn test_audit2_b4_patch_nudges_delivery_loop() {
         elapsed < Duration::from_secs(3),
         "on_success delivered in {:?}, expected < 3s via the delivery nudge",
         elapsed
+    );
+}
+
+// =============================================================================
+// B2 — heartbeat `last_updated` while waiting for the semaphore permit
+// =============================================================================
+
+/// B2 — a claimed task waiting for a permit is heartbeated and not requeued.
+///
+/// # Setup
+/// `webhook_concurrency = 1`, `claim_timeout = 3 s`, heartbeat interval = 1 s.
+/// Two tasks are created. The first task's on_start webhook takes ~4 s (slow server),
+/// saturating the single permit. The second task is claimed and parked on the
+/// semaphore. Without the heartbeat, its `last_updated` goes stale after 3 s and
+/// requeue-stale would reclaim it (Claimed → Pending churn). With the heartbeat,
+/// `last_updated` is bumped every 1 s and the task stays Claimed until the permit
+/// becomes available.
+///
+/// # Assertion
+/// After the slow on_start finishes (~4 s), both tasks reach Running — the second
+/// one was NOT requeued. Both on_start webhooks fire exactly once (no churn).
+#[tokio::test]
+async fn test_audit2_b2_heartbeat_prevents_requeue_during_permit_wait() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) =
+        spawn_slow_200_webhook_server(hits.clone(), Duration::from_secs(4));
+
+    // Short claim_timeout (3s) + concurrency=1 → the second task blocks on the permit.
+    let claim_timeout = Duration::from_secs(3);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let evaluator = state.action_executor.clone();
+    let pool = state.pool.clone();
+    let handle = tokio::spawn(async move {
+        arcrun::workers::start_loop(
+            &evaluator,
+            pool,
+            Duration::from_millis(200),
+            false,
+            50,
+            1, // concurrency = 1
+            shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
+            claim_timeout,
+        )
+        .await;
+    });
+
+    // Create two tasks with on_start webhooks.
+    let t1 = json!({
+        "id": "b2-t1", "name": "b2-t1", "kind": "b2-kind", "timeout": 60,
+        "on_start": { "kind": "Webhook", "params": { "url": webhook_url, "verb": "Post" } }
+    });
+    let t2 = json!({
+        "id": "b2-t2", "name": "b2-t2", "kind": "b2-kind", "timeout": 60,
+        "on_start": { "kind": "Webhook", "params": { "url": webhook_url, "verb": "Post" } }
+    });
+    let created = create_tasks_ok(&app, &[t1, t2]).await;
+    let id1 = created.iter().find(|t| t.name == "b2-t1").unwrap().id;
+    let id2 = created.iter().find(|t| t.name == "b2-t2").unwrap().id;
+
+    // Wait for both to reach Running (deadline 12s — each slow webhook takes ~4s
+    // sequentially with concurrency=1, so the second should be Running by ~8-9s).
+    let mut both_running = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while std::time::Instant::now() < deadline {
+        let s1 = get_task_ok(&app, id1).await.status;
+        let s2 = get_task_ok(&app, id2).await.status;
+        if s1 == StatusKind::Running && s2 == StatusKind::Running {
+            both_running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+    let _ = shutdown_server.send(());
+
+    assert!(
+        both_running,
+        "both tasks must reach Running — the heartbeat should prevent requeue of the second \
+         task while it waits for the permit (claim_timeout=3s, slow webhook=4s)"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "both on_start webhooks must have fired (no requeue churn)"
     );
 }
