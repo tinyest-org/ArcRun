@@ -420,6 +420,7 @@ async fn test_batch_complete_via_timeout() {
             std::time::Duration::from_secs(30),
             true,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });

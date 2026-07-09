@@ -143,6 +143,7 @@ async fn test_start_loop_e2e_happy_path() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -262,6 +263,7 @@ async fn test_webhook_500_triggers_failure() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -326,6 +328,7 @@ async fn test_webhook_receives_handle_query_param() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -415,6 +418,7 @@ async fn test_webhook_custom_headers_and_body() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -500,6 +504,7 @@ async fn test_webhook_redirect_rejected() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });

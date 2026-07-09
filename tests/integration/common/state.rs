@@ -86,6 +86,7 @@ pub fn create_test_state(pool: DbPool) -> AppState {
         }),
         config,
         circuit_breaker: test_circuit_breaker(),
+        nudges: arcrun::workers::WorkerNudges::new(),
     }
 }
 
@@ -118,6 +119,7 @@ pub fn create_test_state_with_batch_updater(pool: DbPool) -> TestStateWithBatchU
             }),
             config,
             circuit_breaker: test_circuit_breaker(),
+            nudges: arcrun::workers::WorkerNudges::new(),
         },
         _shutdown_tx: shutdown_tx,
     }

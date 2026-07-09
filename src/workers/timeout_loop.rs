@@ -1,4 +1,4 @@
-use crate::{DbPool, db_operation, metrics};
+use crate::{DbPool, db_operation, metrics, workers::WorkerNudges};
 use actix_web::rt;
 use tokio::sync::watch;
 
@@ -14,6 +14,7 @@ pub async fn timeout_loop(
     claim_timeout: std::time::Duration,
     dead_end_enabled: bool,
     mut shutdown: watch::Receiver<bool>,
+    nudges: WorkerNudges,
 ) {
     loop {
         let loop_start = std::time::Instant::now();
@@ -65,6 +66,7 @@ pub async fn timeout_loop(
             }
 
             // Step 2: for each, atomically mark failed + propagate (in tx), then fire webhooks
+            let mut enqueued_outbox = false;
             for task_id in timed_out_ids {
                 let result =
                     db_operation::timeout_task_and_propagate(&mut conn, task_id, dead_end_enabled)
@@ -77,6 +79,7 @@ pub async fn timeout_loop(
                         // on_failure notifications (task + cascade + dead-end
                         // ancestors) were enqueued into the outbox inside the
                         // transaction; the delivery loop sends them async.
+                        enqueued_outbox = true;
                     }
                     Ok(None) => {
                         // Task already transitioned concurrently, nothing to do
@@ -93,6 +96,13 @@ pub async fn timeout_loop(
                         );
                     }
                 }
+            }
+
+            // B4: wake the delivery loop for the on_failure outbox rows just enqueued,
+            // rather than letting them wait a full delivery tick. Best-effort — the
+            // delivery poll is the fallback.
+            if enqueued_outbox {
+                nudges.nudge_delivery();
             }
         }
         metrics::record_worker_loop_iteration("timeout", loop_start.elapsed().as_secs_f64());

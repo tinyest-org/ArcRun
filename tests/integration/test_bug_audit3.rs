@@ -490,6 +490,7 @@ async fn test_audit2_a2_start_row_completed_atomically_with_running() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -723,6 +724,7 @@ async fn test_audit2_a4_cancel_action_saved_when_task_left_claimed_during_on_sta
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -1013,6 +1015,7 @@ async fn test_audit2_a4_cancel_during_permit_wait_skips_on_start() {
             50,
             1,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -3018,6 +3021,7 @@ async fn test_audit2_b1_on_start_http_does_not_hold_db_connection() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -3123,6 +3127,7 @@ async fn test_audit2_b1_flow_unchanged_after_phase_split() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -3779,4 +3784,215 @@ async fn test_audit2_b5_multi_failed_parents_decrement_multiplicity() {
         "D unblocks to Pending — both its (non-required) deps are terminal",
     )
     .await;
+}
+
+// ============================================================================
+// B4 — polling-floor latency: in-process worker nudges (WorkerNudges)
+// ============================================================================
+//
+// The start/delivery loops poll on a fixed interval. Before B4 every DAG edge of
+// instantaneous tasks paid up to one full tick of scheduling latency. `WorkerNudges`
+// (a pair of `tokio::sync::Notify` shared between the handlers and the loops) lets a
+// committing transition wake the relevant loop immediately; the poll stays as the
+// correctness/fallback path.
+//
+// Both tests spawn the REAL loop with a deliberately LONG poll interval (8 s) sharing
+// the AppState's nudges, let the loop park in its `select!`, then drive the HTTP path
+// and assert the effect lands in < 3 s — impossible via the 8 s poll alone, so the
+// nudge is what is being measured.
+
+/// B4 — `POST /task` nudges the start loop.
+///
+/// # Setup
+/// `start_loop` runs with an 8 s interval but shares `state.nudges`. We let it finish
+/// its immediate first (empty) iteration and park asleep, THEN POST a dependency-free
+/// task through the handler, which calls `nudges.nudge_start()` after commit.
+///
+/// # Assertion
+/// The task reaches `Running` in < 3 s (timed from the POST). Contre-épreuve: with the
+/// `state.nudges.nudge_start()` call removed from `add_task`, the loop stays asleep for
+/// the rest of the 8 s interval and the task is still `Pending` at the 3 s deadline —
+/// the test then panics (RED), confirming it exercises the nudge and not the poll.
+#[tokio::test]
+async fn test_audit2_b4_post_task_nudges_start_loop() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits.clone());
+
+    // Long poll interval: only a nudge can produce sub-3s latency.
+    const LONG: Duration = Duration::from_secs(8);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let evaluator = state.action_executor.clone();
+    let pool = state.pool.clone();
+    let nudges = state.nudges.clone();
+    let handle = tokio::spawn(async move {
+        arcrun::workers::start_loop(&evaluator, pool, LONG, true, 50, 10, shutdown_rx, nudges)
+            .await;
+    });
+
+    // Let the loop run its immediate first iteration (no Pending work) and park asleep
+    // in its `select!` — so, absent a nudge, the next scan is ~8 s away.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let task_payload = json!({
+        "id": "b4-start",
+        "name": "B4 start latency",
+        "kind": "b4-start-kind",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": { "kind": "Webhook", "params": { "url": webhook_url, "verb": "Post" } }
+    });
+
+    let t0 = std::time::Instant::now();
+    let created = create_tasks_ok(&app, &[task_payload]).await;
+    let task_id = created[0].id;
+    assert_eq!(created[0].status, StatusKind::Pending);
+
+    // Poll until Running with a 3 s deadline.
+    let mut became_running: Option<Duration> = None;
+    while t0.elapsed() < Duration::from_secs(3) {
+        if get_task_ok(&app, task_id).await.status == StatusKind::Running {
+            became_running = Some(t0.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+    let _ = shutdown_server.send(());
+
+    let elapsed = became_running.expect(
+        "task did not reach Running within 3s — the poll interval is 8s, so only the \
+         start-loop nudge from add_task can explain sub-3s latency (nudge missing/broken?)",
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "task reached Running in {:?}, expected < 3s via the start nudge",
+        elapsed
+    );
+}
+
+/// B4 — a status `PATCH` nudges the delivery loop.
+///
+/// # Setup
+/// A short-interval start loop brings the task to `Running` (its `start` outbox row is
+/// completed in the same tx, so the start-before-end gate is already open). The REAL
+/// `delivery_loop` runs with an 8 s interval sharing `state.nudges`, and is given time
+/// to park asleep. We then `PATCH` the task `Success` through the handler, which
+/// enqueues the `end/success` outbox row and calls `nudges.nudge_delivery()`.
+///
+/// # Assertion
+/// The `on_success` webhook is received in < 3 s (timed from the PATCH). Absent the
+/// nudge the delivery loop would sleep out the ~8 s interval before draining the row.
+#[tokio::test]
+async fn test_audit2_b4_patch_nudges_delivery_loop() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits.clone());
+
+    // Start loop: short interval (we only measure delivery latency here).
+    let (start_shutdown_tx, start_shutdown_rx) = tokio::sync::watch::channel(false);
+    {
+        let evaluator = state.action_executor.clone();
+        let pool = state.pool.clone();
+        let nudges = state.nudges.clone();
+        tokio::spawn(async move {
+            arcrun::workers::start_loop(
+                &evaluator,
+                pool,
+                Duration::from_millis(50),
+                true,
+                50,
+                10,
+                start_shutdown_rx,
+                nudges,
+            )
+            .await;
+        });
+    }
+
+    // Delivery loop: LONG interval so only a nudge yields sub-3s delivery.
+    const LONG: Duration = Duration::from_secs(8);
+    let (del_shutdown_tx, del_shutdown_rx) = tokio::sync::watch::channel(false);
+    {
+        let evaluator = Arc::new(state.action_executor.clone());
+        let pool = state.pool.clone();
+        let nudges = state.nudges.clone();
+        let cfg = default_delivery_cfg();
+        tokio::spawn(async move {
+            arcrun::workers::delivery_loop(evaluator, pool, LONG, cfg, del_shutdown_rx, nudges)
+                .await;
+        });
+    }
+
+    let task_payload = json!({
+        "id": "b4-del",
+        "name": "B4 delivery latency",
+        "kind": "b4-del-kind",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": { "kind": "Webhook", "params": { "url": webhook_url, "verb": "Post" } },
+        "on_success": [{ "kind": "Webhook", "params": { "url": webhook_url, "verb": "Post" } }]
+    });
+    let created = create_tasks_ok(&app, &[task_payload]).await;
+    let task_id = created[0].id;
+
+    // Wait for the start loop to bring it to Running (on_start delivered => hits >= 1).
+    let mut running = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if get_task_ok(&app, task_id).await.status == StatusKind::Running {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(running, "task should reach Running via the start loop");
+
+    // Stop the start loop so it no longer contends for pool connections; the delivery
+    // measurement below is then clean.
+    let _ = start_shutdown_tx.send(true);
+
+    // Let the delivery loop finish its immediate (empty — no mature end rows yet) first
+    // iteration and park asleep.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let hits_before = hits.load(Ordering::SeqCst);
+
+    // PATCH Success via the HTTP handler → enqueues the end/success outbox row AND
+    // calls nudges.nudge_delivery().
+    let t0 = std::time::Instant::now();
+    let patch = actix_web::test::TestRequest::patch()
+        .uri(&format!("/task/{}", task_id))
+        .set_json(&json!({"status": "Success"}))
+        .to_request();
+    let resp = actix_web::test::call_service(&app, patch).await;
+    assert!(resp.status().is_success(), "PATCH Success should succeed");
+
+    // Poll until the on_success webhook fires (hits increments) with a 3 s deadline.
+    let mut delivered: Option<Duration> = None;
+    while t0.elapsed() < Duration::from_secs(3) {
+        if hits.load(Ordering::SeqCst) > hits_before {
+            delivered = Some(t0.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let _ = del_shutdown_tx.send(true);
+    let _ = shutdown_server.send(());
+
+    let elapsed = delivered.expect(
+        "on_success webhook was not delivered within 3s — the delivery interval is 8s, so \
+         only the delivery-loop nudge from update_task can explain sub-3s delivery",
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "on_success delivered in {:?}, expected < 3s via the delivery nudge",
+        elapsed
+    );
 }

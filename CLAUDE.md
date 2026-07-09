@@ -73,6 +73,8 @@ When a task completes, `propagate_to_children` in `src/workers.rs` handles:
 ### Worker Loops
 There are five background workers (spawned in `src/main.rs::spawn_workers`): `start_loop`, `timeout_loop`, `batch_updater`, `retention_cleanup_loop`, and `delivery_loop`. All share the same `watch::Receiver<bool>` shutdown channel.
 
+**In-process nudges (Audit 2, B4)**: to avoid every DAG edge paying a full poll tick, handlers and workers wake the `start`/`delivery` loops immediately via a shared `WorkerNudges` (two `tokio::sync::Notify`, held in `AppState` and passed to `spawn_workers`). After a committing transition, producers `notify_one` the relevant loop (`add_task`/`resume_task` → start; `update_task`/`cancel_task`/`stop_batch`/timeout+on_start failures → delivery; a real `update_task`/`cancel` transition → both) and the loop runs one extra iteration instead of waiting the interval. `notify_one` stores a permit, so a nudge fired mid-iteration is never lost. The nudge is **best-effort — the poll (`WORKER_LOOP_INTERVAL_MS` / `WEBHOOK_DELIVERY_INTERVAL_MS`) remains the correctness/fallback** (a missed or extra nudge only costs, at worst, one empty iteration). In-process only; a multi-replica deployment would use LISTEN/NOTIFY as the same kind of optimization, never as correctness.
+
 **Start Loop** (`start_loop`, `src/workers/start_loop.rs`):
 1. Finds `Pending` tasks (ordered by priority DESC, then created_at ASC) via paginated keyset scan
 2. Checks concurrency rules against running tasks

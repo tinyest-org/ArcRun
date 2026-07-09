@@ -43,6 +43,7 @@ async fn test_start_loop_marks_task_failed_on_start_webhook_error() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -125,6 +126,7 @@ async fn test_timeout_loop_fires_on_failure_webhook() {
             std::time::Duration::from_secs(30),
             true,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -225,6 +227,7 @@ async fn test_recent_batch_update_prevents_timeout() {
             std::time::Duration::from_secs(30),
             true,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -296,6 +299,7 @@ async fn test_timeout_propagates_failure_to_children() {
             std::time::Duration::from_secs(30),
             true,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });

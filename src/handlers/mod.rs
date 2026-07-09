@@ -45,8 +45,12 @@ impl Modify for SecurityAddon {
 }
 
 use crate::{
-    DbPool, action::ActionExecutor, circuit_breaker::CircuitBreaker, config::Config, dtos, metrics,
-    workers::UpdateEvent,
+    DbPool,
+    action::ActionExecutor,
+    circuit_breaker::CircuitBreaker,
+    config::Config,
+    dtos, metrics,
+    workers::{UpdateEvent, WorkerNudges},
 };
 
 // Re-export handlers for route configuration
@@ -67,6 +71,11 @@ pub struct AppState {
     pub sender: Sender<UpdateEvent>,
     pub config: Arc<Config>,
     pub circuit_breaker: Arc<CircuitBreaker>,
+    /// In-process wakeups for the start/delivery worker loops (Audit 2, B4). Handlers
+    /// nudge the relevant loop after a committing transaction so DAG edges don't each
+    /// pay a full poll tick. Best-effort: the poll is the correctness (see
+    /// `WorkerNudges`).
+    pub nudges: WorkerNudges,
 }
 
 impl AppState {

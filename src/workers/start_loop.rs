@@ -6,6 +6,7 @@ use crate::{
     metrics,
     models::{Action, Task, TriggerCondition, TriggerKind},
     rule::Strategy,
+    workers::WorkerNudges,
 };
 use actix_web::rt;
 use diesel::BelongingToDsl;
@@ -49,6 +50,7 @@ pub async fn start_loop(
     start_batch_size: i64,
     webhook_concurrency: usize,
     mut shutdown: watch::Receiver<bool>,
+    nudges: WorkerNudges,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(webhook_concurrency));
 
@@ -65,6 +67,7 @@ pub async fn start_loop(
             &pool,
             &semaphore,
             dead_end_enabled,
+            &nudges,
         )
         .await;
 
@@ -73,11 +76,17 @@ pub async fn start_loop(
         metrics::record_worker_loop_iteration("start", loop_duration);
         metrics::record_tasks_processed_per_loop(tasks_processed);
 
+        // B4: wake immediately on an in-process nudge (a POST /task, an unblocked
+        // child, or a resume) instead of always waiting a full tick. `notify_one`
+        // stores a permit, so a nudge that arrived while this iteration was running
+        // still fires the next one — see `WorkerNudges`. The poll remains the
+        // correctness/fallback path.
         tokio::select! {
             _ = shutdown.changed() => {
                 log::info!("Start worker: shutdown signal received, exiting");
                 return;
             }
+            _ = nudges.start.notified() => {}
             _ = rt::time::sleep(interval) => {}
         }
     }
@@ -293,6 +302,7 @@ async fn webhook_phase(
     pool: &DbPool,
     semaphore: &Arc<tokio::sync::Semaphore>,
     dead_end_enabled: bool,
+    nudges: &WorkerNudges,
 ) -> usize {
     if claimed_tasks.is_empty() {
         return 0;
@@ -311,11 +321,12 @@ async fn webhook_phase(
 
         let pool = pool.clone();
         let evaluator = evaluator.clone();
+        let nudges = nudges.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // released on drop
             let _guard = metrics::WebhooksInFlightGuard::new("start");
-            execute_webhook_for_task(&evaluator, t, &pool, dead_end_enabled).await
+            execute_webhook_for_task(&evaluator, t, &pool, dead_end_enabled, &nudges).await
         });
     }
 
@@ -359,6 +370,7 @@ async fn execute_webhook_for_task(
     task: Task,
     pool: &DbPool,
     dead_end_enabled: bool,
+    nudges: &WorkerNudges,
 ) -> bool {
     // ---- Phase A: connection-holding preamble. The connection is dropped at the
     // end of this block, BEFORE the phase-B HTTP — the core of the B1 fix. ----
@@ -397,6 +409,7 @@ async fn execute_webhook_for_task(
                 dead_end_enabled,
                 "on_start webhook failed",
                 None,
+                nudges,
             )
             .await;
             return false;
@@ -437,6 +450,7 @@ async fn execute_webhook_for_task(
                 dead_end_enabled,
                 "on_start webhook failed",
                 Some(&idempotency_key),
+                nudges,
             )
             .await;
             return false;
@@ -547,6 +561,7 @@ async fn fail_started_task(
     dead_end_enabled: bool,
     reason: &str,
     complete_start_false: Option<&str>,
+    nudges: &WorkerNudges,
 ) {
     let Ok(mut conn) = pool.get().await else {
         log::error!(
@@ -572,6 +587,10 @@ async fn fail_started_task(
             task.id,
             e2
         );
+    } else {
+        // B4: the failure + cascade enqueued on_failure outbox rows in the tx above;
+        // wake the delivery loop so they don't wait a full delivery tick.
+        nudges.nudge_delivery();
     }
 }
 

@@ -83,6 +83,12 @@ pub async fn update_task(
     .map_err(ApiError::from)?;
     Ok(match result {
         db_operation::UpdateTaskResult::Updated => {
+            // B4: a real transition just committed — its end/failure outbox rows are
+            // pending (nudge delivery) and its propagation may have moved children to
+            // Pending (nudge start). Only on a genuine transition, never on the
+            // idempotent no-op below (which enqueues/propagates nothing).
+            state.nudges.nudge_start();
+            state.nudges.nudge_delivery();
             HttpResponse::Ok().body("Task updated successfully")
         }
         // A10: idempotent retry — the task already sits in the requested terminal
@@ -337,10 +343,16 @@ pub async fn add_task(
     );
 
     if result.is_empty() {
+        // Nothing schedulable was created (empty / all-dedupe-skipped batch), but the
+        // transaction may have enqueued an immediate batch_complete outbox row for a
+        // vacuously-complete batch — nudge the delivery loop so it fires promptly (B4).
+        state.nudges.nudge_delivery();
         Ok(HttpResponse::NoContent()
             .insert_header(("X-Batch-ID", batch_id.to_string()))
             .finish())
     } else {
+        // Fresh Pending tasks exist — wake the start loop instead of waiting a tick (B4).
+        state.nudges.nudge_start();
         Ok(HttpResponse::Created()
             .insert_header(("X-Batch-ID", batch_id.to_string()))
             .json(result))
@@ -381,6 +393,11 @@ pub async fn cancel_task(
     )
     .await
     .map_err(ApiError::from)?;
+    // B4: the cancel + cascade committed — its cancel outbox row (if the task was
+    // Running/Claimed) matures now (nudge delivery), and cascade-failed children may
+    // free descendants to Pending (nudge start).
+    state.nudges.nudge_start();
+    state.nudges.nudge_delivery();
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -439,5 +456,7 @@ pub async fn resume_task(
     db_operation::resume_task(&task_id, &mut conn)
         .await
         .map_err(ApiError::from)?;
+    // B4: resume may have moved the task straight to Pending — wake the start loop.
+    state.nudges.nudge_start();
     Ok(HttpResponse::Ok().finish())
 }

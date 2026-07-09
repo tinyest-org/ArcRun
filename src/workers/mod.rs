@@ -1,6 +1,7 @@
 mod batch_updater;
 pub(crate) mod delivery_loop;
 mod metrics_sampler;
+mod nudge;
 pub(crate) mod propagation;
 mod retention;
 mod start_loop;
@@ -9,6 +10,7 @@ pub(crate) mod webhooks;
 
 pub use batch_updater::{UpdateEvent, batch_updater};
 pub use delivery_loop::{DeliveryConfig, delivery_loop};
+pub use nudge::WorkerNudges;
 // Exposed for integration tests to drive outbox delivery deterministically (Lot 2).
 pub use delivery_loop::run_delivery_once;
 pub use metrics_sampler::metrics_sampler_loop;

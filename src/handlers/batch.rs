@@ -59,6 +59,12 @@ pub async fn stop_batch(
         result.already_terminal,
     );
 
+    // B4: cancel outbox rows for formerly-Running/Claimed tasks (and any batch_complete
+    // signal) were enqueued in the stop_batch tx — nudge the delivery loop. Also nudge
+    // start (harmless): the batch's tasks are all terminal now, so nothing new is
+    // schedulable, but the delivery wake is the point.
+    state.nudges.nudge_delivery();
+
     Ok(HttpResponse::Ok().json(dtos::StopBatchResponseDto {
         batch_id,
         canceled_waiting: result.canceled_waiting,

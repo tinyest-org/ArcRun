@@ -21,7 +21,7 @@ use arcrun::{
     initialize_db_pool, metrics,
     tracing::{TracingConfig, init_tracing, shutdown_tracing},
     validation,
-    workers::UpdateEvent,
+    workers::{UpdateEvent, WorkerNudges},
 };
 use diesel::{Connection, PgConnection};
 use tokio::sync::{mpsc, watch};
@@ -70,15 +70,28 @@ async fn main() -> std::io::Result<()> {
     let action_executor = new_action_executor(&config);
     let action_context = Arc::new(action_executor.clone());
 
+    // In-process worker nudges (B4): shared between the handlers (producers) and the
+    // start/delivery loops (consumers) so a committed transition wakes the relevant
+    // loop immediately instead of waiting a full poll tick.
+    let nudges = WorkerNudges::new();
+
     let app_data = AppState {
         pool: pool.clone(),
         sender,
         action_executor,
         config: config.clone(),
         circuit_breaker,
+        nudges: nudges.clone(),
     };
 
-    let workers = spawn_workers(&pool, &action_context, &config, receiver, &shutdown_rx);
+    let workers = spawn_workers(
+        &pool,
+        &action_context,
+        &config,
+        receiver,
+        &shutdown_rx,
+        &nudges,
+    );
 
     metrics::init_metrics();
     let prometheus = PrometheusMetricsBuilder::new("api")
@@ -258,6 +271,7 @@ fn spawn_workers(
     config: &Config,
     receiver: mpsc::Receiver<UpdateEvent>,
     shutdown_rx: &watch::Receiver<bool>,
+    nudges: &WorkerNudges,
 ) -> WorkerHandles {
     let start = {
         let pool = pool.clone();
@@ -267,6 +281,7 @@ fn spawn_workers(
         let start_batch_size = config.worker.start_batch_size;
         let webhook_concurrency = config.worker.webhook_concurrency;
         let shutdown = shutdown_rx.clone();
+        let nudges = nudges.clone();
         actix_web::rt::spawn(async move {
             arcrun::workers::start_loop(
                 executor.as_ref(),
@@ -276,6 +291,7 @@ fn spawn_workers(
                 start_batch_size,
                 webhook_concurrency,
                 shutdown,
+                nudges,
             )
             .await;
         })
@@ -287,6 +303,7 @@ fn spawn_workers(
         let claim_timeout = config.worker.claim_timeout;
         let dead_end_enabled = config.worker.dead_end_cancel_enabled;
         let shutdown = shutdown_rx.clone();
+        let nudges = nudges.clone();
         actix_web::rt::spawn(async move {
             arcrun::workers::timeout_loop(
                 pool,
@@ -294,6 +311,7 @@ fn spawn_workers(
                 claim_timeout,
                 dead_end_enabled,
                 shutdown,
+                nudges,
             )
             .await;
         })
@@ -333,8 +351,17 @@ fn spawn_workers(
             start_stale_secs: config.worker.claim_timeout.as_secs() as i64,
         };
         let shutdown = shutdown_rx.clone();
+        let nudges = nudges.clone();
         actix_web::rt::spawn(async move {
-            arcrun::workers::delivery_loop(executor, pool, interval, delivery_cfg, shutdown).await;
+            arcrun::workers::delivery_loop(
+                executor,
+                pool,
+                interval,
+                delivery_cfg,
+                shutdown,
+                nudges,
+            )
+            .await;
         })
     };
 

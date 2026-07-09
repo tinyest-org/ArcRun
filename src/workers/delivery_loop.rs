@@ -46,6 +46,7 @@ use crate::{
     action::{ActionExecutor, WebhookEnrichment},
     db_operation, metrics,
     models::{Action, StatusKind, Task, TriggerCondition, TriggerKind, WebhookExecution},
+    workers::WorkerNudges,
 };
 
 /// Tunables for the delivery loop, resolved from config once at startup.
@@ -78,6 +79,7 @@ pub async fn delivery_loop(
     interval: std::time::Duration,
     cfg: DeliveryConfig,
     mut shutdown: watch::Receiver<bool>,
+    nudges: WorkerNudges,
 ) {
     loop {
         let loop_start = std::time::Instant::now();
@@ -104,11 +106,17 @@ pub async fn delivery_loop(
         }
         metrics::record_worker_loop_iteration("delivery", loop_start.elapsed().as_secs_f64());
 
+        // B4: a transition that enqueued an outbox row (end/failure/cancel/
+        // batch_complete) nudges this loop so the delivery doesn't wait a full tick.
+        // `notify_one` keeps a nudge fired mid-iteration from being lost. The poll
+        // remains the correctness/fallback path (e.g. rows maturing off a backoff, or
+        // a lease expiring after a crash).
         tokio::select! {
             _ = shutdown.changed() => {
                 log::info!("Delivery worker: shutdown signal received, exiting");
                 return;
             }
+            _ = nudges.delivery.notified() => {}
             _ = rt::time::sleep(interval) => {}
         }
     }

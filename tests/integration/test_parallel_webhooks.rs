@@ -89,6 +89,7 @@ async fn test_parallel_webhooks_all_tasks_started() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -170,6 +171,7 @@ async fn test_parallel_webhooks_failure_isolation() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -253,6 +255,7 @@ async fn test_parallel_webhooks_slow_does_not_block_fast() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -337,6 +340,7 @@ async fn test_webhook_concurrency_one_still_works() {
             50,
             1, // concurrency = 1
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
@@ -443,6 +447,7 @@ async fn test_parallel_failure_propagation_isolation() {
             50,
             10,
             shutdown_rx,
+            arcrun::workers::WorkerNudges::new(),
         )
         .await;
     });
