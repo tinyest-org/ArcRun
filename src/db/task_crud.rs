@@ -12,19 +12,54 @@ use uuid::Uuid;
 
 use super::{DbError, run_in_transaction};
 
-/// ensure we avoid creating duplicate tasks
+/// Ensure we avoid creating duplicate tasks.
+///
+/// # Concurrency (Audit 2 A8)
+/// This is a check-then-act sequence: `COUNT(*)` on the committed snapshot, then
+/// (back in the caller) an INSERT later in the SAME transaction. Without a lock,
+/// two concurrent `POST /task` requests carrying the same dedupe key both see
+/// `count == 0` and both insert — producing duplicates despite `dedupe_strategy`.
+///
+/// To close that window, before running the counts we take a
+/// `pg_advisory_xact_lock` on a stable hash of each applicable matcher
+/// (`rule::dedupe_lock_key` = hash of kind + status + the matcher's metadata field
+/// values). The lock is **transaction-scoped**: `handle_dedupe` is invoked inside
+/// the `insert_task_batch` transaction (see `handlers::task::add_task`), so the lock
+/// is held until that transaction COMMITs/ROLLBACKs. The advisory lock is blocking:
+/// a second request with the same key parks on the lock until the first commits,
+/// then its `COUNT(*)` observes the just-inserted task (`count > 0`) and correctly
+/// dedupes. On collision (two *different* keys hashing equal) the only effect is
+/// spurious serialization — never a false dedupe, since `COUNT(*)` stays the truth.
+///
+/// # Deadlock avoidance
+/// All of this task's applicable lock keys are collected, **sorted and deduped**,
+/// then acquired in that order in a single round-trip. A consistent global key
+/// order is what prevents two requests that lock several keys from deadlocking.
+/// The realistic A8 scenario — the *same* batch submitted concurrently — locks the
+/// identical sorted key set, so it is deadlock-free. Limitation: `handle_dedupe` is
+/// called once per dedupe task in a batch and the locks accumulate on the
+/// transaction, so two *different* batches that each carry several dedupe tasks in a
+/// different relative order could, in theory, acquire cross-task keys in opposite
+/// orders and deadlock; PostgreSQL's deadlock detector then aborts one side (the
+/// request surfaces an error and can be retried). This is rare and strictly safer
+/// than the pre-fix silent duplicates.
 async fn handle_dedupe<'a>(
     conn: &mut Conn<'a>,
     rules: Vec<Matcher>,
     _metadata: &Option<serde_json::Value>,
 ) -> Result<bool, DbError> {
+    use crate::schema::task::dsl::*;
+    use diesel::PgJsonbExpressionMethods;
+
     let empty_metadata = serde_json::Value::Null;
+    let meta_ref = _metadata.as_ref().unwrap_or(&empty_metadata);
+
+    // Pass 1: resolve the matchers we can actually evaluate (applying the two
+    // "skip this rule" guards) and compute their advisory lock keys. A guard-skipped
+    // matcher contributes neither a lock nor a count.
+    let mut applicable: Vec<(&Matcher, serde_json::Value)> = Vec::with_capacity(rules.len());
+    let mut lock_keys: Vec<i64> = Vec::with_capacity(rules.len());
     for matcher in rules.iter() {
-        use crate::schema::task::dsl::*;
-        use diesel::PgJsonbExpressionMethods;
-
-        let meta_ref = _metadata.as_ref().unwrap_or(&empty_metadata);
-
         if !matcher.fields.is_empty() && _metadata.is_none() {
             // Metadata is None but the matcher requires field comparisons.
             // We can't evaluate this rule without metadata, so skip it
@@ -49,6 +84,29 @@ async fn handle_dedupe<'a>(
             }
         };
 
+        lock_keys.push(rule::dedupe_lock_key(matcher, meta_ref));
+        applicable.push((matcher, m));
+    }
+
+    // Nothing evaluable -> allow creation (no lock, no count).
+    if applicable.is_empty() {
+        return Ok(true);
+    }
+
+    // Acquire all advisory locks up front, in a stable (sorted, deduped) order and a
+    // single round-trip, BEFORE any COUNT. This serializes the check-then-act window
+    // against concurrent requests carrying the same dedupe key(s).
+    lock_keys.sort_unstable();
+    lock_keys.dedup();
+    diesel::sql_query("SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k")
+        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&lock_keys)
+        .execute(conn)
+        .await?;
+
+    // Pass 2: run the counts. Now that we hold the locks, a concurrent inserter of a
+    // matching task has either already committed (its row is visible here -> we dedupe)
+    // or is parked on the lock (it will see OUR row after we commit -> it dedupes).
+    for (matcher, m) in applicable {
         let count = task
             .filter(
                 kind.eq(&matcher.kind)

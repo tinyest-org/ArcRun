@@ -1670,3 +1670,156 @@ async fn test_audit2_a3_batch_complete_after_cascade_fail_of_paused() {
 
     let _ = shutdown_server.send(());
 }
+
+// =============================================================================
+// Audit 2, A8 — inter-request dedupe: check-then-act now guarded by an advisory lock
+// =============================================================================
+//
+// # Original bug
+// `handle_dedupe` (`src/db/task_crud.rs`) evaluates `dedupe_strategy` with a
+// `COUNT(*)` over the committed snapshot, then the caller INSERTs the task later in
+// the SAME transaction. There was no lock spanning that check-then-act window, so two
+// concurrent `POST /task` requests carrying the same dedupe key both saw `count == 0`
+// and both inserted — producing duplicates despite `dedupe_strategy`.
+//
+// # Fix
+// Before running the counts, `handle_dedupe` now takes a `pg_advisory_xact_lock` on a
+// stable hash of each applicable matcher (`rule::dedupe_lock_key` = kind + status +
+// the matcher's metadata field values). Because it runs inside the `insert_task_batch`
+// transaction, the lock is held until COMMIT/ROLLBACK, so a second concurrent request
+// with the same key parks on the lock until the first commits, then observes the
+// just-inserted row (`count > 0`) and correctly dedupes. Keys are acquired
+// sorted+deduped in one round-trip to keep a consistent global lock order.
+//
+// # What these tests assert
+// * `test_audit2_a8_concurrent_same_key_creates_exactly_one` — N concurrent identical
+//   dedupe requests create exactly ONE task total. With the fix reverted this races
+//   and usually inserts several duplicates.
+// * `test_audit2_a8_concurrent_distinct_keys_all_created` — N concurrent requests with
+//   DISTINCT dedupe keys all succeed (the lock serializes only same-key requests, it
+//   does not over-block distinct keys).
+// * The pre-existing `test_dedupe.rs` guards (bug #7) stay green — the guard branches
+//   take no lock and preserve the "allow creation" semantics.
+
+/// Count `task` rows of the given kind (the ground truth for "how many were created").
+async fn count_tasks_of_kind(pool: &arcrun::DbPool, kind: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        c: i64,
+    }
+    let mut conn = pool.get().await.unwrap();
+    let r: Cnt = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query("SELECT count(*) AS c FROM task WHERE kind = $1")
+            .bind::<diesel::sql_types::Text, _>(kind),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    r.c
+}
+
+/// Build a single-task `POST /task` body (bare array) carrying a `dedupe_strategy`
+/// that matches on `kind` + `status=Pending` + the `unique_key` metadata field.
+fn dedupe_task_body(kind: &str, unique_key: &str) -> serde_json::Value {
+    json!([{
+        "id": "dedupe-race",
+        "name": "A8 Dedupe Race",
+        "kind": kind,
+        "timeout": 60,
+        "metadata": {"unique_key": unique_key},
+        "on_start": webhook_action(),
+        "dedupe_strategy": [{
+            "kind": kind,
+            "status": "Pending",
+            "fields": ["unique_key"]
+        }]
+    }])
+}
+
+/// A8 race test — N concurrent `POST /task` with the SAME dedupe key create exactly
+/// one task. The requests are fired concurrently via `join_all` on the shared test
+/// service; a pool larger than N ensures each request holds its own connection (so the
+/// advisory lock genuinely serializes them rather than the pool doing it by accident).
+#[tokio::test]
+async fn test_audit2_a8_concurrent_same_key_creates_exactly_one() {
+    // Pool comfortably larger than the concurrency so every in-flight request holds
+    // its own connection and blocks on the advisory lock, not on connection checkout.
+    const N: usize = 16;
+    let test_app = setup_test_db_with_pool_size((N as u32) + 8).await;
+    let state = create_test_state(test_app.pool.clone());
+    let app = test_service!(state);
+
+    let kind = "a8-same-key";
+    let futs = (0..N).map(|_| {
+        let body = dedupe_task_body(kind, "same-key");
+        let app = &app;
+        async move {
+            let req = actix_web::test::TestRequest::post()
+                .uri("/task")
+                .insert_header(("requester", "test"))
+                .set_json(&body)
+                .to_request();
+            actix_web::test::call_service(app, req).await.status()
+        }
+    });
+    let statuses = futures_util::future::join_all(futs).await;
+
+    // Every request returned a well-formed response (201 for the single winner, 204
+    // No Content for the deduped losers). No 5xx / deadlock error.
+    for s in &statuses {
+        assert!(
+            *s == StatusCode::CREATED || *s == StatusCode::NO_CONTENT,
+            "each concurrent request must return 201 or 204, got {s}"
+        );
+    }
+
+    // Ground truth: exactly one task of this kind exists in the DB.
+    assert_eq!(
+        count_tasks_of_kind(&state.pool, kind).await,
+        1,
+        "exactly one task must be created despite {N} concurrent same-key requests"
+    );
+}
+
+/// A8 no-over-blocking test — N concurrent `POST /task` with DISTINCT dedupe keys all
+/// create their task. The advisory lock keyed on (kind,status,field-values) must not
+/// serialize away legitimately-distinct tasks (a hash collision may serialize two of
+/// them, but every request must still succeed and produce a row).
+#[tokio::test]
+async fn test_audit2_a8_concurrent_distinct_keys_all_created() {
+    const N: usize = 16;
+    let test_app = setup_test_db_with_pool_size((N as u32) + 8).await;
+    let state = create_test_state(test_app.pool.clone());
+    let app = test_service!(state);
+
+    let kind = "a8-distinct-keys";
+    let futs = (0..N).map(|i| {
+        let body = dedupe_task_body(kind, &format!("key-{i}"));
+        let app = &app;
+        async move {
+            let req = actix_web::test::TestRequest::post()
+                .uri("/task")
+                .insert_header(("requester", "test"))
+                .set_json(&body)
+                .to_request();
+            actix_web::test::call_service(app, req).await.status()
+        }
+    });
+    let statuses = futures_util::future::join_all(futs).await;
+
+    // Distinct keys never dedupe -> every request must be a 201 Created.
+    for s in &statuses {
+        assert_eq!(
+            *s,
+            StatusCode::CREATED,
+            "distinct-key requests must all create a task (got {s})"
+        );
+    }
+
+    assert_eq!(
+        count_tasks_of_kind(&state.pool, kind).await,
+        N as i64,
+        "all {N} distinct-key tasks must be created (lock must not over-serialize)"
+    );
+}

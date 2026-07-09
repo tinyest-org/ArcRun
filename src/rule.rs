@@ -165,6 +165,18 @@ pub fn capacity_lock_key(rule: &CapacityRule, task_metadata: &serde_json::Value)
     compute_lock_key(Some("capacity"), &rule.matcher, task_metadata)
 }
 
+/// Compute a deterministic i64 advisory lock key for a dedupe matcher and task
+/// metadata. Used by `handle_dedupe` to serialize the check-then-act dedupe window
+/// between concurrent `POST /task` requests (Audit 2 A8).
+///
+/// Uses a distinct "dedupe" prefix so its keys don't collide with concurrency
+/// (no prefix) or capacity ("capacity") lock keys. A hash collision between two
+/// *different* dedupe keys is harmless: it only causes unnecessary serialization,
+/// never a false dedupe (the `COUNT(*)` remains the source of truth).
+pub fn dedupe_lock_key(matcher: &Matcher, task_metadata: &serde_json::Value) -> i64 {
+    compute_lock_key(Some("dedupe"), matcher, task_metadata)
+}
+
 impl ToSql<Jsonb, Pg> for Rules {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
         // <serde_json::Value as FromSql<Jsonb, Pg>>::to_sql(

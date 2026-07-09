@@ -61,6 +61,7 @@ testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tokio = { version = "1.45.0", features = ["full", "test-util"] }
 actix-rt = "2.10"
 actix-http = "3"
+futures-util = "0.3.31"
 
 [profile.test]
 opt-level = 1     # Some optimization for faster test execution
