@@ -1,4 +1,4 @@
-use crate::{Conn, DbPool, db_operation::DbError, metrics};
+use crate::{Conn, DbPool, db_operation, db_operation::DbError, metrics};
 use actix_web::rt;
 use dashmap::DashMap;
 use diesel_async::RunQueryDsl;
@@ -234,6 +234,19 @@ async fn final_flush_batch_data(data: &CountMap, pool: &DbPool) {
 /// Apply counter updates for multiple tasks in a single SQL statement using UNNEST.
 /// This reduces N round-trips to 1 for the common case.
 ///
+/// **Deadlock avoidance (Audit 2, A9)**: the UNNEST `UPDATE` locks rows in the query
+/// planner's order (a hash join makes it effectively arbitrary), so it could cross a
+/// concurrent `propagate_to_children` (which touches the same task rows) and deadlock
+/// (`40P01`). To give this flush a canonical acquisition order, the ids are **sorted**
+/// and the whole flush runs in ONE transaction that first pre-locks the target rows
+/// with `SELECT id … WHERE id = ANY(...) ORDER BY id FOR UPDATE` (matching the order
+/// `propagate_to_children` uses), then runs the guarded UPDATE. The pre-lock does NOT
+/// filter on status — locking a terminal row is harmless and keeps the order stable;
+/// the A7 terminal guard still lives in the UPDATE itself. Should a `40P01` still slip
+/// through (e.g. crossing via a parent row not in this array), it surfaces as an `Err`
+/// here and the caller (`flush_updates`) falls back to the per-row path — a single-row
+/// UPDATE holds only one lock and cannot form a cycle, so the retry resolves.
+///
 /// Two audit-A7 guards live in the SQL:
 /// * `AND task.status NOT IN ('success','failure','canceled')` — never mutate a
 ///   **terminal** task (its counters are frozen and were already delivered with
@@ -248,26 +261,48 @@ async fn final_flush_batch_data(data: &CountMap, pool: &DbPool) {
 ///   max. Without the cast a large accumulated delta would raise `integer out of
 ///   range` and poison the flush forever.
 async fn handle_batch_with_counts(updates: &[Update], conn: &mut Conn<'_>) -> Result<(), DbError> {
-    let ids: Vec<uuid::Uuid> = updates.iter().map(|(id, _, _)| *id).collect();
-    let successes: Vec<i32> = updates.iter().map(|(_, s, _)| *s).collect();
-    let fail_counts: Vec<i32> = updates.iter().map(|(_, _, f)| *f).collect();
+    // A9: sort by task_id so the pre-lock (and the UPDATE it guards) acquire row
+    // locks in the same canonical order `propagate_to_children` uses.
+    let mut ordered: Vec<Update> = updates.to_vec();
+    ordered.sort_by_key(|(id, _, _)| *id);
 
-    diesel::sql_query(
-        "UPDATE task SET \
-            success = LEAST(task.success::bigint + batch.s, 2147483647), \
-            failures = LEAST(task.failures::bigint + batch.f, 2147483647), \
-            last_updated = NOW() \
-        FROM UNNEST($1::uuid[], $2::int[], $3::int[]) AS batch(id, s, f) \
-        WHERE task.id = batch.id \
-          AND task.status NOT IN ('success', 'failure', 'canceled')",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&successes)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&fail_counts)
-    .execute(conn)
-    .await?;
+    let ids: Vec<uuid::Uuid> = ordered.iter().map(|(id, _, _)| *id).collect();
+    let successes: Vec<i32> = ordered.iter().map(|(_, s, _)| *s).collect();
+    let fail_counts: Vec<i32> = ordered.iter().map(|(_, _, f)| *f).collect();
 
-    Ok(())
+    // A9: pre-lock the target rows in id order, then apply the UNNEST update, in one
+    // transaction so the locks are held together. A `40P01` on either statement rolls
+    // the whole thing back and propagates as `Err`, letting `flush_updates` recover
+    // per-row (the deadlock-free path).
+    db_operation::run_in_transaction(conn, move |conn| {
+        Box::pin(async move {
+            // Ordered pre-lock (no status filter — locking a terminal row is harmless).
+            diesel::sql_query(
+                "SELECT id FROM task WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
+            .execute(&mut *conn)
+            .await?;
+
+            diesel::sql_query(
+                "UPDATE task SET \
+                    success = LEAST(task.success::bigint + batch.s, 2147483647), \
+                    failures = LEAST(task.failures::bigint + batch.f, 2147483647), \
+                    last_updated = NOW() \
+                FROM UNNEST($1::uuid[], $2::int[], $3::int[]) AS batch(id, s, f) \
+                WHERE task.id = batch.id \
+                  AND task.status NOT IN ('success', 'failure', 'canceled')",
+            )
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&successes)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&fail_counts)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(())
+        })
+    })
+    .await
 }
 
 /// Apply counter update for a single task. Used by the per-row anti-poison

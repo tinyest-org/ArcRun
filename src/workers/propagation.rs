@@ -31,6 +31,28 @@ use super::webhooks::{
 /// failure. The **transition to Pending (step 4) stays `Waiting`-only**: a `Paused`
 /// task whose counters reach 0 remains `Paused` (only an explicit resume moves it
 /// out of `Paused`).
+///
+/// **Deadlock avoidance (Audit 2, A9)**: the batched `UPDATE … WHERE id = ANY(...)`
+/// statements below lock rows in the query planner's chosen order, not the array
+/// order. Two propagations of parents that share children (a "diamond" DAG) — or a
+/// propagation crossing the batch-updater flush — could therefore acquire the same
+/// child locks in opposite orders and deadlock (Postgres `40P01`), surfacing as a
+/// 500 on the PATCH. To give every propagation a single, canonical acquisition
+/// order, this function **pre-locks the whole level's child set once** with a
+/// `SELECT id … WHERE id = ANY(...) ORDER BY id FOR UPDATE` before any UPDATE. Since
+/// `propagate_to_children` always runs inside a transaction (caller invariant), the
+/// locks are held until COMMIT, so two concurrent diamond propagations now queue on
+/// the same globally-ordered locks instead of cycling. The pre-lock deliberately
+/// does NOT filter on status (locking an already-terminal child row is harmless —
+/// the status-guarded UPDATEs below simply won't match it), so the ordering is
+/// stable regardless of how far each child has progressed.
+///
+/// **Assumed residual**: the *recursive* cascade (a failed child's own
+/// `propagate_to_children` call locks its next level in a nested acquisition) and a
+/// flush-vs-propagation crossing *through the parent row* remain theoretically
+/// possible, as there is no single acquisition order spanning levels. Those are left
+/// to Postgres's deadlock detector + the batch-updater's per-row fallback (see
+/// `handle_batch_with_counts`); no generic `40P01` retry is added here (A9 decision).
 #[tracing::instrument(name = "propagate_to_children", level = "debug", skip(conn), fields(parent_id = %parent_id, status = ?result_status))]
 pub(crate) async fn propagate_to_children<'a>(
     parent_id: &uuid::Uuid,
@@ -62,6 +84,25 @@ pub(crate) async fn propagate_to_children<'a>(
     if children_links.is_empty() {
         return Ok(vec![]);
     }
+
+    // A9: pre-lock the entire level's child set in one globally-ordered statement,
+    // BEFORE any batched UPDATE below. `SELECT … ORDER BY id FOR UPDATE` forces a
+    // canonical lock-acquisition order, so two concurrent propagations that share
+    // children (diamond DAG) can no longer acquire those locks in opposite orders
+    // and deadlock. No status filter here on purpose: locking a terminal child row
+    // is harmless (the guarded UPDATEs won't match it), and skipping the filter
+    // keeps the order stable no matter each child's progress. Held until COMMIT
+    // because this always runs inside a transaction (caller invariant).
+    let mut lock_ids: Vec<uuid::Uuid> = children_links.iter().map(|(cid, _)| *cid).collect();
+    lock_ids.sort();
+    lock_ids.dedup();
+    let _locked: Vec<uuid::Uuid> = task_dsl::task
+        .filter(task_dsl::id.eq_any(&lock_ids))
+        .select(task_dsl::id)
+        .order(task_dsl::id.asc())
+        .for_update()
+        .load::<uuid::Uuid>(conn)
+        .await?;
 
     // Split children into groups for batched operations
     let mut fail_child_ids: Vec<uuid::Uuid> = Vec::new();

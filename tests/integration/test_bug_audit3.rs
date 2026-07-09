@@ -2150,3 +2150,263 @@ async fn test_audit2_a10_patch_idempotent_and_conflict() {
         "PATCH on an unknown id must be 404"
     );
 }
+
+// =============================================================================
+// Audit 2, A9 — deadlocks on multi-row UPDATEs (diamond propagation)
+// =============================================================================
+//
+// # Original bug
+// `propagate_to_children` marks/decrements children with batched
+// `UPDATE task … WHERE id = ANY($ids)` statements. Postgres locks the matched rows
+// in the query planner's order, NOT the array order. In a "diamond" DAG (two parents
+// sharing the same set of children), two concurrent parent transitions — a PATCH
+// Success on parent A and a PATCH Success/Failure on parent B — could acquire the
+// shared child-row locks in opposite orders and deadlock (`40P01`). Postgres aborts
+// one transaction, `run_in_transaction` surfaces it as a DB error, and the PATCH
+// returns 500. (The batch-updater flush had the same exposure crossing a
+// propagation.)
+//
+// # Fix
+// Before any batched UPDATE, `propagate_to_children` pre-locks the whole level's
+// child set once with `SELECT id … WHERE id = ANY(...) ORDER BY id FOR UPDATE`,
+// giving every propagation a single canonical lock-acquisition order, so two
+// concurrent diamond propagations queue on the same ordered locks instead of
+// cycling. The batch-updater flush was hardened symmetrically (sorted ids +
+// ordered pre-lock in a transaction; a residual `40P01` falls back to the
+// deadlock-free per-row path).
+//
+// # What these tests assert
+// * `test_audit2_a9_concurrent_diamond_success_no_deadlock` — many diamonds whose
+//   two parents are PATCHed Success concurrently: no request returns 500, and every
+//   shared child ends `Pending` with `wait_finished = wait_success = 0`.
+// * `test_audit2_a9_concurrent_diamond_mixed_fail_success_no_deadlock` — one parent
+//   fails while the other succeeds, concurrently: no 500, and every `requires_success`
+//   child ends `Failure` (Canceled/Failure cascade wins over the success decrement).
+//
+// The deadlock is probabilistic pre-fix, so the tests are made aggressive (many
+// diamonds, wide shared child fan-out, fired via `join_all`) while their assertions
+// are deterministic (the A9 contract: no 500, correct final state).
+
+/// Bring a Pending task straight to `Running` (claim + mark_running, no on_start),
+/// so a subsequent PATCH transitions it terminal.
+async fn force_running(state: &arcrun::handlers::AppState, task_id: uuid::Uuid) {
+    let mut conn = state.pool.get().await.unwrap();
+    assert!(
+        arcrun::db_operation::claim_task(&mut conn, &task_id)
+            .await
+            .unwrap(),
+        "task {task_id} should be claimable"
+    );
+    assert!(
+        arcrun::db_operation::mark_task_running(&mut conn, &task_id)
+            .await
+            .unwrap(),
+        "task {task_id} should be markable running"
+    );
+}
+
+/// PATCH /task/{id} with the given status body, returning the HTTP status.
+fn patch_status_req(task_id: uuid::Uuid, body: serde_json::Value) -> ActixRequest {
+    actix_web::test::TestRequest::patch()
+        .uri(&format!("/task/{}", task_id))
+        .set_json(body)
+        .to_request()
+}
+
+#[tokio::test]
+async fn test_audit2_a9_concurrent_diamond_success_no_deadlock() {
+    // Diamonds: parent_a[i] and parent_b[i] both feed M shared children, all in one
+    // batch. N parents pairs => 2*N concurrent PATCH Success requests contend on the
+    // shared child rows.
+    const N: usize = 12;
+    const M: usize = 10;
+
+    let test_app = setup_test_db_with_pool_size((2 * N as u32) + 8).await;
+    let state = create_test_state(test_app.pool.clone());
+    let app = test_service!(state);
+
+    let kind = "a9-diamond-success";
+    let mut tasks: Vec<serde_json::Value> = Vec::new();
+    for i in 0..N {
+        let pa = format!("pa-{i}");
+        let pb = format!("pb-{i}");
+        tasks.push(task_json(&pa, &pa, kind));
+        tasks.push(task_json(&pb, &pb, kind));
+        for j in 0..M {
+            let cid = format!("c-{i}-{j}");
+            tasks.push(task_with_deps(
+                &cid,
+                &cid,
+                kind,
+                vec![(&pa, true), (&pb, true)],
+            ));
+        }
+    }
+    let created = create_tasks_ok(&app, &tasks).await;
+
+    // Map local name -> server uuid.
+    let by_name: std::collections::HashMap<String, uuid::Uuid> =
+        created.iter().map(|t| (t.name.clone(), t.id)).collect();
+
+    // Bring all parents to Running (sequentially — the contention we test is on the
+    // concurrent terminal PATCHes, not the setup).
+    let mut parent_ids: Vec<uuid::Uuid> = Vec::new();
+    for i in 0..N {
+        for p in [format!("pa-{i}"), format!("pb-{i}")] {
+            let id = by_name[&p];
+            force_running(&state, id).await;
+            parent_ids.push(id);
+        }
+    }
+
+    // Fire every parent's PATCH Success concurrently.
+    let futs = parent_ids.iter().map(|id| {
+        let app = &app;
+        let id = *id;
+        async move {
+            let resp = actix_web::test::call_service(
+                app,
+                patch_status_req(id, json!({"status": "Success"})),
+            )
+            .await;
+            resp.status()
+        }
+    });
+    let statuses = futures_util::future::join_all(futs).await;
+
+    for s in &statuses {
+        assert_ne!(
+            *s,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no PATCH may 500 (deadlock) under concurrent diamond propagation, got {s}"
+        );
+        assert_eq!(
+            *s,
+            StatusCode::OK,
+            "each Running->Success PATCH must be a 200 transition, got {s}"
+        );
+    }
+
+    // Every shared child received both decrements -> Pending, counters at 0/0.
+    for i in 0..N {
+        for j in 0..M {
+            let cid = by_name[&format!("c-{i}-{j}")];
+            let (wf, ws) = read_wait_counters(&state.pool, cid).await;
+            assert_eq!(
+                (wf, ws),
+                (0, 0),
+                "child c-{i}-{j} must have both wait counters decremented to 0"
+            );
+            assert_task_status(
+                &app,
+                cid,
+                StatusKind::Pending,
+                "child must reach Pending after both parents succeed",
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_audit2_a9_concurrent_diamond_mixed_fail_success_no_deadlock() {
+    // Same diamond topology, but parent_a fails while parent_b succeeds, concurrently.
+    const N: usize = 12;
+    const M: usize = 10;
+
+    let test_app = setup_test_db_with_pool_size((2 * N as u32) + 8).await;
+    let state = create_test_state(test_app.pool.clone());
+    let app = test_service!(state);
+
+    let kind = "a9-diamond-mixed";
+    let mut tasks: Vec<serde_json::Value> = Vec::new();
+    for i in 0..N {
+        let pa = format!("pa-{i}");
+        let pb = format!("pb-{i}");
+        tasks.push(task_json(&pa, &pa, kind));
+        tasks.push(task_json(&pb, &pb, kind));
+        // Per-parent keepalive children (requires_success=false, NOT shared): they
+        // stay non-terminal (→ Pending) through the parent's transition, so neither
+        // parent ever becomes a dead-end ancestor once the shared children fail. This
+        // isolates the test from dead-end cancellation (which would otherwise cancel
+        // the still-Running parent_b and turn its PATCH into a 409) WITHOUT relieving
+        // the shared-child lock contention that A9 is about.
+        tasks.push(task_with_deps(
+            &format!("ka-{i}"),
+            &format!("ka-{i}"),
+            kind,
+            vec![(&pa, false)],
+        ));
+        tasks.push(task_with_deps(
+            &format!("kb-{i}"),
+            &format!("kb-{i}"),
+            kind,
+            vec![(&pb, false)],
+        ));
+        for j in 0..M {
+            let cid = format!("c-{i}-{j}");
+            tasks.push(task_with_deps(
+                &cid,
+                &cid,
+                kind,
+                vec![(&pa, true), (&pb, true)],
+            ));
+        }
+    }
+    let created = create_tasks_ok(&app, &tasks).await;
+    let by_name: std::collections::HashMap<String, uuid::Uuid> =
+        created.iter().map(|t| (t.name.clone(), t.id)).collect();
+
+    // Bring all parents to Running.
+    for i in 0..N {
+        for p in [format!("pa-{i}"), format!("pb-{i}")] {
+            force_running(&state, by_name[&p]).await;
+        }
+    }
+
+    // Fire: parent_a[i] -> Failure and parent_b[i] -> Success, all concurrent.
+    let mut reqs: Vec<(uuid::Uuid, serde_json::Value)> = Vec::new();
+    for i in 0..N {
+        reqs.push((
+            by_name[&format!("pa-{i}")],
+            json!({"status": "Failure", "failure_reason": "a9-mixed"}),
+        ));
+        reqs.push((by_name[&format!("pb-{i}")], json!({"status": "Success"})));
+    }
+    let futs = reqs.into_iter().map(|(id, body)| {
+        let app = &app;
+        async move {
+            let resp = actix_web::test::call_service(app, patch_status_req(id, body)).await;
+            resp.status()
+        }
+    });
+    let statuses = futures_util::future::join_all(futs).await;
+
+    for s in &statuses {
+        assert_ne!(
+            *s,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no PATCH may 500 (deadlock) under concurrent mixed diamond propagation, got {s}"
+        );
+        assert_eq!(
+            *s,
+            StatusCode::OK,
+            "each Running->terminal PATCH must be a 200 transition, got {s}"
+        );
+    }
+
+    // Every child requires_success from the failed parent_a -> cascade-fail to Failure,
+    // regardless of the interleaving with parent_b's success decrement.
+    for i in 0..N {
+        for j in 0..M {
+            let cid = by_name[&format!("c-{i}-{j}")];
+            assert_task_status(
+                &app,
+                cid,
+                StatusKind::Failure,
+                "child must cascade-fail from the required parent_a failure",
+            )
+            .await;
+        }
+    }
+}
