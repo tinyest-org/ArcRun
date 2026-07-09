@@ -19,10 +19,14 @@ use super::webhooks::{
 /// 3. Batch-decrement wait_success for children where parent succeeded AND requires_success
 /// 4. Batch-transition children to Pending where both counters reach 0
 ///
-/// Returns the list of all task IDs that were cascade-failed (recursively),
-/// so callers can fire on_failure webhooks for them after the transaction commits.
+/// Returns the list of all task IDs that were cascade-failed, so callers can fire
+/// on_failure webhooks for them after the transaction commits.
 ///
-/// This uses O(1) queries per propagation level instead of O(N) per child.
+/// This uses O(1) queries per propagation level instead of O(N) per child. The
+/// direct level is handled here; the failure cascade below it is then walked
+/// **level by level** (a frontier BFS in `cascade_failure_frontier`, B5) rather
+/// than recursing once per failed child, so a root failure over N descendants
+/// costs O(depth) statements in this transaction instead of O(N).
 ///
 /// **Paused children (Audit 2, A3)**: a `Paused` task is NOT protected from its
 /// dependencies. The cascade-fail (step 1) and the counter decrements (steps 2-3)
@@ -47,10 +51,11 @@ use super::webhooks::{
 /// the status-guarded UPDATEs below simply won't match it), so the ordering is
 /// stable regardless of how far each child has progressed.
 ///
-/// **Assumed residual**: the *recursive* cascade (a failed child's own
-/// `propagate_to_children` call locks its next level in a nested acquisition) and a
-/// flush-vs-propagation crossing *through the parent row* remain theoretically
-/// possible, as there is no single acquisition order spanning levels. Those are left
+/// **Assumed residual**: the failure cascade (each level of
+/// `cascade_failure_frontier` locks its own child set in a nested acquisition,
+/// after the previous level's locks) and a flush-vs-propagation crossing *through
+/// the parent row* remain theoretically possible, as there is no single
+/// acquisition order spanning levels. Those are left
 /// to Postgres's deadlock detector + the batch-updater's per-row fallback (see
 /// `handle_batch_with_counts`); no generic `40P01` retry is added here (A9 decision).
 #[tracing::instrument(name = "propagate_to_children", level = "debug", skip(conn), fields(parent_id = %parent_id, status = ?result_status))]
@@ -156,12 +161,13 @@ pub(crate) async fn propagate_to_children<'a>(
         // Track direct failures
         all_cascade_failed.extend_from_slice(&failed_ids);
 
-        // Recursively propagate failure to each actually-failed child's dependents
-        for fid in &failed_ids {
-            let recursive_failures =
-                Box::pin(propagate_to_children(fid, &StatusKind::Failure, conn)).await?;
-            all_cascade_failed.extend(recursive_failures);
-        }
+        // B5: cascade the failure LEVEL BY LEVEL (frontier BFS) instead of
+        // recursing once per failed child. `failed_ids` is the first failure
+        // frontier; each iteration resolves one whole DAG level with a constant
+        // number of statements, so a root failure over N descendants costs
+        // O(depth) round-trips in this transaction, not O(N).
+        let deeper_failures = cascade_failure_frontier(failed_ids, conn).await?;
+        all_cascade_failed.extend(deeper_failures);
     }
 
     // 2. Batch-decrement counters for remaining children
@@ -219,6 +225,188 @@ pub(crate) async fn propagate_to_children<'a>(
     }
 
     Ok(all_cascade_failed)
+}
+
+/// Cascade a failure LEVEL BY LEVEL, starting from `frontier` — a set of tasks
+/// that have just been marked `Failure` because a required parent failed.
+///
+/// **B5 (perf):** this replaces the old per-failed-child recursion (a `Box::pin`
+/// self-call on `propagate_to_children` for every failed node). That recursion
+/// ran O(N) sequential SELECT/UPDATE round-trips inside the PATCH transaction for
+/// a root failure over N descendants — locks held, latency in seconds. The
+/// frontier walk resolves one whole DAG level per iteration with a constant
+/// number of statements, so the cost is O(depth) instead of O(nodes).
+///
+/// Every node in `frontier` (and every node it later fails) is in `Failure`, so
+/// the whole cascade is a uniform failure propagation: `parent_failed = true`,
+/// `parent_succeeded = false`. Per level the children split into a fail set
+/// (`requires_success = true`) and a plain `wait_finished` decrement set
+/// (`requires_success = false`); `wait_success` is **never** touched (no parent
+/// in the cascade succeeded). The A9 pre-lock and the A3 status filters
+/// (cascade-fail/decrement reach `Paused`; the Pending unblock stays
+/// `Waiting`-only) are preserved on every level exactly as in
+/// `propagate_to_children`.
+///
+/// Returns the ids failed at levels **below** the input frontier (the input
+/// frontier is already tracked by the caller).
+///
+/// **Metric note:** `record_dependency_propagation("failure")` is now recorded
+/// once per node in each processed frontier — the input frontier's own nodes
+/// included. This matches the old semantics exactly: the recursion fired one
+/// `propagate_to_children` call (hence one metric) per failed node, whether or
+/// not it had children.
+async fn cascade_failure_frontier<'a>(
+    mut frontier: Vec<uuid::Uuid>,
+    conn: &mut Conn<'a>,
+) -> Result<Vec<uuid::Uuid>, DbError> {
+    use crate::schema::link::dsl as link_dsl;
+    use crate::schema::task::dsl as task_dsl;
+
+    let mut deeper_failed: Vec<uuid::Uuid> = Vec::new();
+
+    while !frontier.is_empty() {
+        // One dependency-propagation metric per node in this frontier (see the
+        // "Metric note" above — preserves the old per-node recursive semantics).
+        for _ in &frontier {
+            metrics::record_dependency_propagation("failure");
+        }
+
+        // ONE SELECT for the whole frontier's outgoing links.
+        let children_links: Vec<(uuid::Uuid, bool)> = link_dsl::link
+            .filter(link_dsl::parent_id.eq_any(&frontier))
+            .select((link_dsl::child_id, link_dsl::requires_success))
+            .load::<(uuid::Uuid, bool)>(conn)
+            .await?;
+
+        if children_links.is_empty() {
+            break;
+        }
+
+        // A9: pre-lock the level's whole child set in one globally-ordered
+        // statement BEFORE any UPDATE (identical rationale to
+        // `propagate_to_children`). A diamond inside the cascade means a child
+        // appears once per parent in the frontier — dedup the union for the lock
+        // set. No status filter (locking a terminal row is harmless).
+        let mut lock_ids: Vec<uuid::Uuid> = children_links.iter().map(|(cid, _)| *cid).collect();
+        lock_ids.sort();
+        lock_ids.dedup();
+        let _locked: Vec<uuid::Uuid> = task_dsl::task
+            .filter(task_dsl::id.eq_any(&lock_ids))
+            .select(task_dsl::id)
+            .order(task_dsl::id.asc())
+            .for_update()
+            .load::<uuid::Uuid>(conn)
+            .await?;
+
+        // Split (all frontier parents failed): requires_success -> fail set,
+        // otherwise -> wait_finished decrement MULTIPLICITY map. The fail set is
+        // deduped (the Failure transition is idempotent), but the decrements are
+        // NOT: a child with N non-required parents failing in this same frontier
+        // must be decremented N times (`wait_finished` counts every dependency —
+        // the old per-failed-child recursion applied one decrement per parent).
+        // A child that lands in BOTH the fail set (required by parent A) and the
+        // decrement map (not-required by parent B) is failed first; the
+        // decrement's status filter below then no longer matches it, so it ends
+        // `Failure` (the deterministic fail-before-decrement order — one of the
+        // pre-fix orderings, now guaranteed).
+        let mut fail_set: Vec<uuid::Uuid> = Vec::new();
+        let mut decrement_counts: std::collections::HashMap<uuid::Uuid, i32> =
+            std::collections::HashMap::new();
+        for (child_id, requires_success) in &children_links {
+            if *requires_success {
+                fail_set.push(*child_id);
+            } else {
+                *decrement_counts.entry(*child_id).or_insert(0) += 1;
+            }
+        }
+        fail_set.sort();
+        fail_set.dedup();
+
+        // Children actually transitioned to Failure this level = the next frontier.
+        let mut next_frontier: Vec<uuid::Uuid> = Vec::new();
+
+        // 1. Cascade-fail (A3: reaches Paused too). RETURNING drives the next level.
+        if !fail_set.is_empty() {
+            let failed_ids: Vec<uuid::Uuid> = diesel::update(
+                task_dsl::task.filter(
+                    task_dsl::id
+                        .eq_any(&fail_set)
+                        .and(task_dsl::status.eq_any([StatusKind::Waiting, StatusKind::Paused])),
+                ),
+            )
+            .set((
+                task_dsl::status.eq(StatusKind::Failure),
+                task_dsl::failure_reason.eq("Required parent task failed"),
+                task_dsl::ended_at.eq(diesel::dsl::now),
+            ))
+            .returning(task_dsl::id)
+            .get_results::<uuid::Uuid>(conn)
+            .await?;
+
+            for fid in &failed_ids {
+                metrics::record_task_failed_by_dependency();
+                log::info!(
+                    "Child task {} marked as failed due to a required parent failure",
+                    fid
+                );
+            }
+            deeper_failed.extend_from_slice(&failed_ids);
+            next_frontier = failed_ids;
+        }
+
+        // 2. Decrement wait_finished for the non-required children (A3: Paused
+        //    too), by each child's MULTIPLICITY in this level's links (N failed
+        //    parents in the frontier ⇒ -N). Children are grouped by delta so the
+        //    level still costs one UPDATE per DISTINCT delta (1 in the common
+        //    case). wait_success is NOT touched — no parent in the cascade
+        //    succeeded. Runs AFTER the fail UPDATE so a child in both sets stays
+        //    Failure (its status is no longer Waiting/Paused, so it won't match).
+        if !decrement_counts.is_empty() {
+            let mut by_delta: std::collections::HashMap<i32, Vec<uuid::Uuid>> =
+                std::collections::HashMap::new();
+            for (child_id, delta) in &decrement_counts {
+                by_delta.entry(*delta).or_default().push(*child_id);
+            }
+            let decrement_set: Vec<uuid::Uuid> = decrement_counts.keys().copied().collect();
+            for (delta, ids) in by_delta {
+                diesel::update(
+                    task_dsl::task.filter(
+                        task_dsl::id.eq_any(&ids).and(
+                            task_dsl::status.eq_any([StatusKind::Waiting, StatusKind::Paused]),
+                        ),
+                    ),
+                )
+                .set(task_dsl::wait_finished.eq(task_dsl::wait_finished - delta))
+                .execute(conn)
+                .await?;
+            }
+
+            // 3. Unblock (A3: Waiting-only) where both counters reached 0.
+            let unblocked_ids: Vec<uuid::Uuid> = diesel::update(
+                task_dsl::task.filter(
+                    task_dsl::id
+                        .eq_any(&decrement_set)
+                        .and(task_dsl::status.eq(StatusKind::Waiting))
+                        .and(task_dsl::wait_finished.eq(0))
+                        .and(task_dsl::wait_success.eq(0)),
+                ),
+            )
+            .set(task_dsl::status.eq(StatusKind::Pending))
+            .returning(task_dsl::id)
+            .get_results::<uuid::Uuid>(conn)
+            .await?;
+
+            for uid in &unblocked_ids {
+                metrics::record_task_unblocked();
+                metrics::record_status_transition("Waiting", "Pending");
+                log::info!("Child task {} transitioned from Waiting to Pending", uid);
+            }
+        }
+
+        frontier = next_frontier;
+    }
+
+    Ok(deeper_failed)
 }
 
 // =============================================================================

@@ -3495,3 +3495,288 @@ async fn test_audit2_b3_webhook_batch_fires_once_on_last_terminal() {
 
     let _ = shutdown_server.send(());
 }
+
+// =============================================================================
+// B5 — failure cascade walked level-by-level (frontier BFS), not per-child recursion
+// =============================================================================
+//
+// `propagate_to_children`'s failure cascade used to recurse once per failed child
+// (`Box::pin(propagate_to_children(fid, Failure))`), so a root failure over N
+// descendants ran O(N) sequential SELECT/UPDATE round-trips inside the PATCH
+// transaction — locks held, latency in seconds. B5 replaces that with a
+// level-by-level frontier walk (`cascade_failure_frontier`): one links SELECT +
+// one A9 pre-lock + one cascade-fail UPDATE + one decrement UPDATE + one unblock
+// UPDATE per DAG level, i.e. O(depth) statements. These tests assert the rewrite
+// is behaviorally faithful, not the timing.
+
+/// B5 — DEEP linear chain: a root failure must cascade to every descendant.
+///
+/// A chain of 60 `requires_success` tasks (t0 -> t1 -> ... -> t60): the root is
+/// PATCHed Failure and EVERY descendant must end `Failure` with a populated
+/// `failure_reason`, and an on_failure (trigger='end') outbox row must exist for
+/// each. This is the correctness proof of the frontier loop replacing the
+/// per-child recursion.
+#[tokio::test]
+async fn test_audit2_b5_deep_chain_all_descendants_fail() {
+    const DEPTH: usize = 60;
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+    let kind = "b5-chain";
+
+    let mut tasks: Vec<serde_json::Value> = Vec::new();
+    tasks.push(task_json("t0", "t0", kind));
+    for i in 1..=DEPTH {
+        let id = format!("t{i}");
+        let parent = format!("t{}", i - 1);
+        tasks.push(task_with_deps(
+            &id,
+            &id,
+            kind,
+            vec![(parent.as_str(), true)],
+        ));
+    }
+    let created = create_tasks_ok(&app, &tasks).await;
+    let by_name: std::collections::HashMap<String, uuid::Uuid> =
+        created.iter().map(|t| (t.name.clone(), t.id)).collect();
+
+    // Root -> Running, then PATCH Failure.
+    let root = by_name["t0"];
+    force_running(&state, root).await;
+    let resp = actix_web::test::call_service(
+        &app,
+        patch_status_req(
+            root,
+            json!({"status": "Failure", "failure_reason": "root boom"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "root PATCH Failure must be a 200 transition"
+    );
+
+    // Every descendant ends Failure, with a populated reason + exactly one end row.
+    for i in 1..=DEPTH {
+        let id = by_name[&format!("t{i}")];
+        let t = get_task_ok(&app, id).await;
+        assert_eq!(
+            t.status,
+            StatusKind::Failure,
+            "t{i} must cascade to Failure via the frontier walk"
+        );
+        assert!(
+            !t.failure_reason.unwrap_or_default().is_empty(),
+            "t{i} must have a populated failure_reason"
+        );
+        assert_eq!(
+            outbox_count_by_trigger(&state.pool, id, "end").await,
+            1,
+            "t{i} must have exactly one on_failure (end) outbox row"
+        );
+    }
+}
+
+/// B5 — mixed cascade tree exercises fail set, decrement set, and unblock across
+/// two frontier levels.
+///
+/// root -> A (requires_success), B (not required); A -> C (requires_success from
+/// A), D (not required from A). root fails =>
+/// * A and C cascade to `Failure` (required-parent failure, one per level),
+/// * B is `wait_finished`-decremented (root not required) and, its only dep gone,
+///   unblocks to `Pending`,
+/// * D is decremented VIA THE FRONTIER (A failed, D not required from A) and,
+///   its only dep gone, unblocks to `Pending`.
+/// Asserts both statuses and the drained (0,0) wait counters.
+#[tokio::test]
+async fn test_audit2_b5_mixed_tree_fail_decrement_unblock() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+    let kind = "b5-mixed";
+
+    let tasks = vec![
+        task_json("root", "root", kind),
+        task_with_deps("A", "A", kind, vec![("root", true)]),
+        task_with_deps("B", "B", kind, vec![("root", false)]),
+        task_with_deps("C", "C", kind, vec![("A", true)]),
+        task_with_deps("D", "D", kind, vec![("A", false)]),
+    ];
+    let created = create_tasks_ok(&app, &tasks).await;
+    let by = |n: &str| created.iter().find(|t| t.name == n).unwrap().id;
+
+    force_running(&state, by("root")).await;
+    let resp = actix_web::test::call_service(
+        &app,
+        patch_status_req(
+            by("root"),
+            json!({"status": "Failure", "failure_reason": "boom"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "root PATCH Failure must be 200"
+    );
+
+    assert_task_status(
+        &app,
+        by("A"),
+        StatusKind::Failure,
+        "A fails (required parent root failed)",
+    )
+    .await;
+    assert_task_status(
+        &app,
+        by("C"),
+        StatusKind::Failure,
+        "C fails (required parent A failed, via the frontier)",
+    )
+    .await;
+    assert_task_status(
+        &app,
+        by("B"),
+        StatusKind::Pending,
+        "B unblocks to Pending (root not required, only dep drained)",
+    )
+    .await;
+    assert_eq!(
+        read_wait_counters(&state.pool, by("B")).await,
+        (0, 0),
+        "B wait counters drained"
+    );
+    assert_task_status(
+        &app,
+        by("D"),
+        StatusKind::Pending,
+        "D unblocks to Pending via the frontier decrement (A not required)",
+    )
+    .await;
+    assert_eq!(
+        read_wait_counters(&state.pool, by("D")).await,
+        (0, 0),
+        "D wait counters drained"
+    );
+}
+
+/// B5 — diamond INSIDE the cascade: a grandchild required by two parents that
+/// fail in the SAME frontier level is failed exactly once.
+///
+/// root -> A, B (both requires_success); A -> C, B -> C (C requires_success from
+/// both). root fails => A and B fail (level 1), then the next frontier is {A, B}
+/// and C appears twice in the level's links. The frontier walk dedups the fail
+/// set, so C is failed once, appears once in the return set, and gets exactly ONE
+/// on_failure outbox row (no double delivery).
+#[tokio::test]
+async fn test_audit2_b5_diamond_in_cascade_single_outbox() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+    let kind = "b5-diamond";
+
+    let tasks = vec![
+        task_json("root", "root", kind),
+        task_with_deps("A", "A", kind, vec![("root", true)]),
+        task_with_deps("B", "B", kind, vec![("root", true)]),
+        task_with_deps("C", "C", kind, vec![("A", true), ("B", true)]),
+    ];
+    let created = create_tasks_ok(&app, &tasks).await;
+    let by = |n: &str| created.iter().find(|t| t.name == n).unwrap().id;
+
+    force_running(&state, by("root")).await;
+    let resp = actix_web::test::call_service(
+        &app,
+        patch_status_req(
+            by("root"),
+            json!({"status": "Failure", "failure_reason": "boom"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "root PATCH Failure must be 200"
+    );
+
+    assert_task_status(&app, by("A"), StatusKind::Failure, "A fails").await;
+    assert_task_status(&app, by("B"), StatusKind::Failure, "B fails").await;
+    assert_task_status(
+        &app,
+        by("C"),
+        StatusKind::Failure,
+        "C fails once via the deduped {A,B} frontier",
+    )
+    .await;
+    assert_eq!(
+        outbox_count_by_trigger(&state.pool, by("C"), "end").await,
+        1,
+        "C must have exactly ONE on_failure outbox row (deduped frontier, no double)"
+    );
+}
+
+/// A non-required child whose TWO parents fail in the SAME cascade frontier must
+/// receive TWO `wait_finished` decrements — one per failed parent.
+///
+/// # Original bug (caught in the B5 review)
+/// The first frontier implementation deduplicated the level's decrement set and
+/// applied a single `wait_finished - 1` UPDATE. Pre-B5, the per-failed-child
+/// recursion ran one `propagate_to_children` call per failed parent, so a child
+/// with N failed (non-required) parents in the cascade was decremented N times.
+/// With the dedup, such a child was decremented ONCE, leaving `wait_finished`
+/// stranded ≥ 1 forever — the task could never unblock to Pending.
+///
+/// # Fix
+/// `cascade_failure_frontier` counts each child's multiplicity in the level's
+/// links and decrements by that delta (children grouped by delta, one UPDATE per
+/// distinct delta).
+///
+/// # What this test asserts
+/// root → A (required), B (required); D depends on A AND B, both non-required.
+/// root fails ⇒ frontier {A, B} both cascade-fail in ONE level ⇒ D must be
+/// decremented twice (wait_finished 2 → 0) and unblock to Pending.
+#[tokio::test]
+async fn test_audit2_b5_multi_failed_parents_decrement_multiplicity() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+    let kind = "b5-multi";
+
+    let tasks = vec![
+        task_json("root", "root", kind),
+        task_with_deps("A", "A", kind, vec![("root", true)]),
+        task_with_deps("B", "B", kind, vec![("root", true)]),
+        task_with_deps("D", "D", kind, vec![("A", false), ("B", false)]),
+    ];
+    let created = create_tasks_ok(&app, &tasks).await;
+    let by = |n: &str| created.iter().find(|t| t.name == n).unwrap().id;
+
+    assert_eq!(
+        read_wait_counters(&state.pool, by("D")).await,
+        (2, 0),
+        "D starts waiting on both A and B (non-required)"
+    );
+
+    force_running(&state, by("root")).await;
+    let resp = actix_web::test::call_service(
+        &app,
+        patch_status_req(
+            by("root"),
+            json!({"status": "Failure", "failure_reason": "boom"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_task_status(&app, by("A"), StatusKind::Failure, "A cascade-fails").await;
+    assert_task_status(&app, by("B"), StatusKind::Failure, "B cascade-fails").await;
+    assert_eq!(
+        read_wait_counters(&state.pool, by("D")).await,
+        (0, 0),
+        "D must be decremented once PER failed parent (A and B are in the same frontier)"
+    );
+    assert_task_status(
+        &app,
+        by("D"),
+        StatusKind::Pending,
+        "D unblocks to Pending — both its (non-required) deps are terminal",
+    )
+    .await;
+}

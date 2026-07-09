@@ -63,10 +63,12 @@ The delivery loop (`src/workers/delivery_loop.rs`, the 5th worker) drains mature
 ### Dependency Propagation
 When a task completes, `propagate_to_children` in `src/workers.rs` handles:
 1. **Success**: Decrements `wait_finished` and `wait_success` counters on children
-2. **Failure/Canceled**: Children with `requires_success=true` are marked as `Failure` (recursively)
+2. **Failure/Canceled**: Children with `requires_success=true` are marked as `Failure`, and the failure cascades to their descendants
 3. **Transition to Pending**: When `wait_finished=0` and `wait_success=0`, child becomes `Pending`
 
-**Paused children (Audit 2, A3)**: steps 1 and 2 apply to `Paused` children as well as `Waiting` ones — the counter decrements and the cascade-fail both target `status IN ('waiting','paused')`. A pause never strands `wait_*` counters and never shields a task from a required parent's failure (Paused → Failure, propagated recursively, on_failure outbox enqueued as for a Waiting task). Step 3 stays **`Waiting`-only on purpose**: a `Paused` child whose counters reach 0 stays `Paused` (it does NOT auto-transition to `Pending` — resume decides).
+**Failure cascade is level-by-level (Audit 2, B5)**: after the direct level, the failure cascade is walked as a **frontier BFS** (`cascade_failure_frontier` in `src/workers/propagation.rs`), not by recursing once per failed child. Each DAG level below the origin resolves with a constant number of statements (one links `SELECT` over the whole frontier + the A9 ordered pre-lock + one batched cascade-fail `UPDATE … RETURNING` whose result is the next frontier + one `wait_finished` decrement + one Pending unblock), so a root failure over N descendants costs **O(depth)** round-trips in the PATCH transaction instead of O(N). Every frontier node is `Failure`, so `wait_success` is never decremented in the cascade; a child required by one failing parent and optional to another (diamond in the cascade) is deduped and failed once (fail-before-decrement ordering). The `dependency_propagation` metric is still recorded once per propagated node (per-node semantics preserved).
+
+**Paused children (Audit 2, A3)**: steps 1 and 2 apply to `Paused` children as well as `Waiting` ones — the counter decrements and the cascade-fail both target `status IN ('waiting','paused')`. A pause never strands `wait_*` counters and never shields a task from a required parent's failure (Paused → Failure, propagated through the frontier cascade, on_failure outbox enqueued as for a Waiting task). Step 3 stays **`Waiting`-only on purpose**: a `Paused` child whose counters reach 0 stays `Paused` (it does NOT auto-transition to `Pending` — resume decides).
 
 ### Worker Loops
 There are five background workers (spawned in `src/main.rs::spawn_workers`): `start_loop`, `timeout_loop`, `batch_updater`, `retention_cleanup_loop`, and `delivery_loop`. All share the same `watch::Receiver<bool>` shutdown channel.
