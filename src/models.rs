@@ -44,6 +44,75 @@ pub struct Task {
     pub capacity_charge: Option<i32>,
 }
 
+/// A terminal task that the retention loop moved out of the hot `task` table into
+/// the cold `task_archive` table (Audit 2, D6 / 7.5b). Mirrors every [`Task`] column
+/// verbatim plus `archived_at`. Read-only: the archive is never written by any request
+/// path (writes still target `task` only). Its sole reader is the `GET /task/{id}`
+/// fallback, which converts it into a [`Task`] (see `From<TaskArchive> for Task`) and
+/// reuses the existing task-to-DTO mapping — the archived task carries no actions
+/// (they were deleted on archive), so the DTO's `actions` array is empty.
+#[derive(Identifiable, Queryable, Selectable, Debug, Clone)]
+#[diesel(table_name = crate::schema::task_archive)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct TaskArchive {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub kind: String,
+    pub status: StatusKind,
+    pub timeout: i32,
+    pub created_at: chrono::DateTime<Utc>,
+    pub started_at: Option<chrono::DateTime<Utc>>,
+    pub last_updated: chrono::DateTime<Utc>,
+    pub metadata: serde_json::Value,
+    pub ended_at: Option<chrono::DateTime<Utc>>,
+    pub start_condition: Rules,
+    pub wait_success: i32,
+    pub wait_finished: i32,
+    pub success: i32,
+    pub failures: i32,
+    pub failure_reason: Option<String>,
+    pub batch_id: Option<uuid::Uuid>,
+    pub expected_count: Option<i32>,
+    pub dead_end_barrier: bool,
+    pub priority: i32,
+    pub claimed_slot_keys: Option<Vec<String>>,
+    pub capacity_charge: Option<i32>,
+    /// When the retention loop archived this task.
+    pub archived_at: chrono::DateTime<Utc>,
+}
+
+impl From<TaskArchive> for Task {
+    /// Project an archived row back to a [`Task`], dropping the archive-only
+    /// `archived_at`. Lets the `GET /task/{id}` fallback reuse `TaskDto::new` instead
+    /// of duplicating the task-to-DTO mapping.
+    fn from(a: TaskArchive) -> Self {
+        Task {
+            id: a.id,
+            name: a.name,
+            kind: a.kind,
+            status: a.status,
+            timeout: a.timeout,
+            created_at: a.created_at,
+            started_at: a.started_at,
+            last_updated: a.last_updated,
+            metadata: a.metadata,
+            ended_at: a.ended_at,
+            start_condition: a.start_condition,
+            wait_success: a.wait_success,
+            wait_finished: a.wait_finished,
+            success: a.success,
+            failures: a.failures,
+            failure_reason: a.failure_reason,
+            batch_id: a.batch_id,
+            expected_count: a.expected_count,
+            dead_end_barrier: a.dead_end_barrier,
+            priority: a.priority,
+            claimed_slot_keys: a.claimed_slot_keys,
+            capacity_charge: a.capacity_charge,
+        }
+    }
+}
+
 #[derive(Identifiable, Queryable, Associations, Selectable, PartialEq)]
 #[diesel(
     table_name = crate::schema::action,

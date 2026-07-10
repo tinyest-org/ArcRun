@@ -201,8 +201,10 @@ fn init_retention(config: &Config) {
         }
     } else {
         log::info!(
-            "Retention cleanup ENABLED (RETENTION_DAYS={}, interval={}s)",
+            "Retention cleanup ENABLED (RETENTION_DAYS={} → move to task_archive, \
+             RETENTION_ARCHIVE_DAYS={} [0=keep forever], interval={}s)",
             config.retention.retention_days,
+            config.retention.archive_retention_days,
             config.retention.cleanup_interval_secs
         );
     }

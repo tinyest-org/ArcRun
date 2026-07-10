@@ -36,10 +36,14 @@ colonne status ; au terme de la livraison la ligne est supprimée et
 historisée dans `webhook_execution` en une CTE atomique) ;
 `webhook_execution` = ledger on_start + historique ; backstop
 anti-re-signal `NOT EXISTS (ledger)` à l'enqueue ; gates A2/D2 et
-contrat GET /webhook-deliveries inchangés. **7.5b (D6) : en cours**
-(`task_archive` alimenté par la rétention). 7.1 (API v1/HMAC) et 7.4
-(GET /work) restent non décidés — ne rien lancer sans décision
-utilisateur.
+contrat GET /webhook-deliveries inchangés. **7.5b (D6) : FAIT** — la
+rétention déplace les tâches terminales vers `task_archive` (move
+atomique, colonnes explicites, aucune FK) au lieu de les supprimer ;
+`GET /task/{id}` sert l'historique en fallback (actions `[]`), les
+écritures restent 404 ; purge optionnelle `RETENTION_ARCHIVE_DAYS`
+(défaut 0 = conserver pour toujours). **L'item 7.5 est TERMINÉ.**
+7.1 (API v1/HMAC) et 7.4 (GET /work) restent non décidés — ne rien
+lancer sans décision utilisateur.
 Détail et notes de relecture par item dans
 `docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
 Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7) ; renversement

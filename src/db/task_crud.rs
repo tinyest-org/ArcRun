@@ -437,7 +437,12 @@ pub(crate) async fn find_detailed_task_by_id<'a>(
         .await?;
 
     if results.is_empty() {
-        return Ok(None);
+        // Archive fallback (Audit 2, D6): the task is not in the hot `task` table — it
+        // may have been moved to `task_archive` by retention. Serve its history with the
+        // SAME DTO shape. The archive keeps no actions (they were deleted on archive), so
+        // the `actions` array is empty. Only GET reads the archive; writes (PATCH/PUT/
+        // cancel/resume) still target `task` and so stay 404 for an archived task.
+        return find_archived_task_by_id(conn, task_id).await;
     }
 
     // All rows have the same task; take the first one by value, collect actions from the rest
@@ -449,6 +454,25 @@ pub(crate) async fn find_detailed_task_by_id<'a>(
         .collect();
 
     Ok(Some(TaskDto::new(base_task, actions)))
+}
+
+/// Look up a task in the cold `task_archive` table (Audit 2, D6) and render it as the
+/// same `TaskDto` a live task would produce. Returns `None` if absent from the archive
+/// too. Archived tasks carry no actions, so the DTO's `actions` array is empty.
+async fn find_archived_task_by_id<'a>(
+    conn: &mut Conn<'a>,
+    task_id: Uuid,
+) -> Result<Option<dtos::TaskDto>, DbError> {
+    use crate::schema::task_archive::dsl as archive_dsl;
+
+    let archived: Option<models::TaskArchive> = archive_dsl::task_archive
+        .filter(archive_dsl::id.eq(task_id))
+        .select(models::TaskArchive::as_select())
+        .first::<models::TaskArchive>(conn)
+        .await
+        .optional()?;
+
+    Ok(archived.map(|a| TaskDto::new(models::Task::from(a), Vec::new())))
 }
 
 /// Atomically claim a Pending task by transitioning it to Claimed.

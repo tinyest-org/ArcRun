@@ -5,9 +5,22 @@ use diesel_async::RunQueryDsl;
 
 use super::{DbError, run_in_transaction};
 
-/// Delete terminal tasks (Success/Failure/Canceled) with `ended_at` older than the
-/// retention period. Deletes in FK order (actions → links → tasks) within a transaction.
-/// Returns the number of tasks deleted.
+/// The explicit `task` / `task_archive` column list shared by the archive MOVE below.
+/// Kept explicit (never `SELECT *`) so the move survives any future column-order
+/// divergence between the two tables. `archived_at` is appended on the target side only.
+const ARCHIVE_COLUMNS: &str = "id, name, kind, status, timeout, created_at, started_at, \
+    last_updated, metadata, ended_at, start_condition, wait_success, wait_finished, \
+    success, failures, failure_reason, batch_id, expected_count, dead_end_barrier, \
+    priority, claimed_slot_keys, capacity_charge";
+
+/// Archive terminal tasks (Success/Failure/Canceled) with `ended_at` older than the
+/// retention period (Audit 2, D6). Instead of DELETEing the task rows, this MOVES them
+/// into `task_archive` so `GET /task/{id}` can still serve their history. The actions,
+/// links and webhook rows of those tasks are still DELETED (the archive preserves the
+/// task record, not its tooling), in FK order (actions → webhooks → links → move) within
+/// one transaction. The orphan-`batch` sweep is unchanged: a batch whose tasks are all
+/// archived no longer has any `task` rows, so it is swept as an orphan (its `batch_id`
+/// lives on in `task_archive` without an FK). Returns the number of tasks archived.
 pub async fn cleanup_old_terminal_tasks<'a>(
     conn: &mut Conn<'a>,
     retention_days: u32,
@@ -70,8 +83,22 @@ pub async fn cleanup_old_terminal_tasks<'a>(
             .execute(&mut *conn)
             .await?;
 
-            // 4. Delete the tasks themselves
-            diesel::delete(task_dsl::task.filter(task_dsl::id.eq_any(&task_ids)))
+            // 4. MOVE the tasks into the cold archive (D6): a single atomic statement
+            //    that DELETEs from `task` and INSERTs the same rows into `task_archive`
+            //    with `archived_at = now()`. Explicit column lists on both sides (see
+            //    ARCHIVE_COLUMNS) — never `SELECT *` — so the move is immune to any
+            //    column-order divergence between the two tables. Runs in this same
+            //    transaction as the actions/links/webhook deletions above.
+            let move_sql = format!(
+                "WITH moved AS (
+                     DELETE FROM task WHERE id = ANY($1) RETURNING {cols}
+                 )
+                 INSERT INTO task_archive ({cols}, archived_at)
+                 SELECT {cols}, now() FROM moved",
+                cols = ARCHIVE_COLUMNS
+            );
+            diesel::sql_query(move_sql)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&task_ids)
                 .execute(&mut *conn)
                 .await?;
 
@@ -132,5 +159,36 @@ pub async fn gc_empty_rule_slots<'a>(conn: &mut Conn<'a>) -> Result<usize, DbErr
     let deleted = diesel::sql_query("DELETE FROM rule_slot WHERE used = 0")
         .execute(conn)
         .await?;
+    Ok(deleted)
+}
+
+/// Purge archived tasks (Audit 2, D6) whose `archived_at` is older than
+/// `archive_retention_days`, in bounded batches of at most `batch_size`. `task_archive`
+/// is a cold, FK-free store, so a plain bounded DELETE suffices (no dependent rows to
+/// clean first). Returns the number of archive rows purged.
+///
+/// This is the ONLY thing that bounds archive growth: with `RETENTION_ARCHIVE_DAYS=0`
+/// (the default) the caller never invokes this, and the archive keeps every terminal
+/// task forever — growth just moves to a cold table. Set the parameter to bound it.
+pub async fn purge_old_archived_tasks<'a>(
+    conn: &mut Conn<'a>,
+    archive_retention_days: u32,
+    batch_size: i64,
+) -> Result<usize, DbError> {
+    let cutoff = Utc::now() - chrono::Duration::days(archive_retention_days as i64);
+
+    // Bounded DELETE via an id subquery (Postgres has no DELETE ... LIMIT): pick at most
+    // `batch_size` old ids, then delete exactly those. The `archived_at` index serves the
+    // inner scan.
+    let deleted = diesel::sql_query(
+        "DELETE FROM task_archive
+         WHERE id IN (
+             SELECT id FROM task_archive WHERE archived_at <= $1 LIMIT $2
+         )",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .bind::<diesel::sql_types::BigInt, _>(batch_size)
+    .execute(conn)
+    .await?;
     Ok(deleted)
 }

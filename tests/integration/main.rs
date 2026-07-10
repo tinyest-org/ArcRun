@@ -35,6 +35,7 @@ mod test_propagation;
 mod test_propagation_edge;
 mod test_regressions;
 mod test_requeue_stale;
+mod test_retention_archive;
 mod test_rule_slot;
 mod test_status;
 mod test_stop_batch;

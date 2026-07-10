@@ -57,7 +57,7 @@ All HTTP handler functions and route configuration:
 - `configure_routes` - Registers all routes on the Actix `ServiceConfig`
 - `health_check` / `readiness_check` - Health and readiness probes. Both acquire a connection under a short 2s bound (Audit 2, B7 — never the pool's 30s `connection_timeout`, which would hang the kubelet under pool exhaustion). **`/health` (liveness) always returns 200** — a healthy body when the DB is reachable, a `degraded` body when the pool is saturated/unreachable (a restart cannot fix that, so liveness must not kill the pod). **`/ready` (readiness) returns 503** on acquire failure/timeout — the correct signal to remove the pod from the load balancer without restarting it.
 - `add_task` - POST /task (batch create)
-- `get_task` - GET /task/{task_id}
+- `get_task` - GET /task/{task_id}. **Archive fallback (Audit 2, D6):** if the id is not in the hot `task` table, it is looked up in `task_archive` and served with the SAME `TaskDto` shape (an archived task carries no actions, so `actions` is `[]`). Writes (PATCH/PUT/cancel/resume) never consult the archive, so they stay 404 for an archived task.
 - `list_task` - GET /task (filtered, paginated). A malformed `?metadata=` filter is a **400** (A10) — not silently ignored (which used to return every task).
 - `update_task` - PATCH /task/{task_id}. **Idempotent & precise status codes (A10):** a real transition → 200; re-PATCHing the status the task already holds → **200 no-op** (no duplicate propagation/outbox); the task exists but is not Running/Claimed (and not already the requested status) → **409** with `current_status` in the body; unknown id → 404. `metadata` is a **full replace, not a merge** — send the complete object (a partial update drops omitted keys, including any used by dedupe/concurrency matchers).
 - `batch_task_updater` - PUT /task/{task_id} (high-throughput counter updates)
@@ -94,7 +94,7 @@ All HTTP handler functions and route configuration:
 - `decrement_batch_remaining_for_tasks[_for_task]` / `zero_batch_remaining_and_complete` / `init_batch_remaining` / `insert_batch` / `load_batch_on_complete` / `batch_completion_stats` - Batch-complete webhook support (Lot 3b, counter-based since D2)
 - `claim_due_outbox_leased` - Lease-based outbox claim for the delivery loop (selects mature rows + pushes `next_attempt_at` a lease into the future in one statement, so HTTP delivery runs out-of-tx and in parallel)
 - `update_running_task` - Updates status, calls `end_task` and `propagate_to_children`
-- `find_detailed_task_by_id` - Single query with LEFT JOIN for task + actions
+- `find_detailed_task_by_id` - Single query with LEFT JOIN for task + actions; falls back to `find_archived_task_by_id` (reads `task_archive`, maps via `TaskArchive → Task`, empty actions) when the task is not in the hot table (Audit 2, D6)
 - `list_task_filtered_paged` - Filtered listing with pagination
 - `get_dag_for_batch` - Fetches tasks + links for DAG visualization
 - `pause_task` / `resume_task` - Atomic guarded Pending/Waiting → Paused, and Paused → Waiting/Pending (A3)
@@ -165,6 +165,15 @@ batch (id, on_complete, created_at, scope, metadata, remaining)
   -- scope = nullable TEXT label, metadata = JSONB (default '{}') — both filterable/searchable
   --   via GET /batches (?scope= exact, ?metadata= JSONB containment @>, ?search= substring).
   -- Batches with none of on_complete/scope/metadata have no row (tracked only via task.batch_id).
+task_archive (<every task column>, archived_at)
+  -- Cold history of terminal tasks moved out of `task` by the retention loop (Audit 2,
+  --   D6 / 7.5b). Mirrors every `task` column verbatim (same types) PLUS archived_at.
+  --   The retention loop MOVEs a terminal task here (atomic DELETE ... RETURNING + INSERT,
+  --   explicit column lists) instead of DELETEing it, so GET /task/{id} keeps serving its
+  --   history — but the task's actions/links/webhook rows are still deleted (the archive
+  --   preserves the record, not its tooling). NO foreign keys (its batch_id may dangle
+  --   after the orphan-batch sweep). Purged only when RETENTION_ARCHIVE_DAYS > 0 (0 = keep
+  --   forever). Read ONLY by the GET /task/{id} fallback — never by listings/DAG/batches.
 webhook_execution (id, task_id, trigger, condition, idempotency_key,
                    status, attempts, created_at, updated_at,
                    next_attempt_at, last_error, batch_id)
@@ -223,6 +232,10 @@ idx_action_task_id_trigger ON action(task_id, trigger)
   -- serves both `WHERE task_id = $ AND trigger = $` and task_id-only lookups (leading column)
 idx_batch_scope ON batch(scope) WHERE scope IS NOT NULL
 idx_batch_metadata_gin ON batch USING GIN(metadata)
+idx_task_archive_archived_at ON task_archive(archived_at)
+  -- serves the archive purge (DELETE ... WHERE archived_at <= cutoff, RETENTION_ARCHIVE_DAYS).
+  --   task_archive's PK on id serves the GET /task/{id} archive fallback. No other index —
+  --   cold table, never listed.
 -- Dropped as dead/redundant (Audit 2, B7): idx_action_task_id (prefix of
 --   idx_action_task_id_trigger), idx_action_trigger (no query filters trigger alone),
 --   idx_task_kind (every kind predicate is paired with status → idx_task_status_kind,

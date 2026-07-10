@@ -219,13 +219,21 @@ pub struct RetentionConfig {
     /// Whether automatic cleanup is enabled
     pub enabled: bool,
 
-    /// Number of days to retain terminal tasks before cleanup
+    /// Number of days a terminal task lives in the hot `task` table before the retention
+    /// loop MOVES it to the cold `task_archive` (Audit 2, D6). The archived record still
+    /// serves `GET /task/{id}`; only its actions/links/webhook rows are dropped.
     pub retention_days: u32,
+
+    /// Number of days an archived task lives in `task_archive` before it is purged
+    /// (Audit 2, D6). `0` (the default) = keep forever: growth just shifts to the cold
+    /// table (tight hot indexes, healthy vacuum) without being bounded. Set > 0 to bound
+    /// the archive. Purging is gated by `enabled` like the task move.
+    pub archive_retention_days: u32,
 
     /// Interval between cleanup runs in seconds
     pub cleanup_interval_secs: u64,
 
-    /// Maximum number of tasks to delete per cleanup cycle
+    /// Maximum number of tasks to move/purge per cleanup cycle
     pub batch_size: i64,
 }
 
@@ -333,6 +341,7 @@ impl Default for RetentionConfig {
         Self {
             enabled: false,
             retention_days: 30,
+            archive_retention_days: 0,
             cleanup_interval_secs: 3600,
             batch_size: 1000,
         }
@@ -419,6 +428,11 @@ impl Config {
     /// - `MAX_DEPS_PER_TASK`: Max dependencies a single task may declare (default: 100)
     /// - `MAX_ACTIONS_PER_TASK`: Max actions (on_start + on_failure + on_success) per task (default: 20)
     /// - `PAYLOAD_MAX_BYTES`: Max accepted JSON request body size in bytes; larger bodies get 413 (default: 2 MiB)
+    /// - `RETENTION_ENABLED`: Enable the retention loop's task move + archive purge (default: 0/off)
+    /// - `RETENTION_DAYS`: Days a terminal task stays in `task` before being moved to `task_archive` (default: 30)
+    /// - `RETENTION_ARCHIVE_DAYS`: Days an archived task stays in `task_archive` before purge; 0 = keep forever (default: 0)
+    /// - `RETENTION_CLEANUP_INTERVAL_SECS`: Interval between retention loop runs (default: 3600)
+    /// - `RETENTION_BATCH_SIZE`: Max tasks moved/purged per retention cycle (default: 1000)
     pub fn from_env() -> Result<Self, ConfigError> {
         let database_url = std::env::var("DATABASE_URL").map_err(|_| ConfigError {
             field: "DATABASE_URL".to_string(),
@@ -523,6 +537,7 @@ impl Config {
         let retention = RetentionConfig {
             enabled: parse_env_or("RETENTION_ENABLED", 0)? != 0,
             retention_days: parse_env_or("RETENTION_DAYS", 30)?,
+            archive_retention_days: parse_env_or("RETENTION_ARCHIVE_DAYS", 0)?,
             cleanup_interval_secs: parse_env_or("RETENTION_CLEANUP_INTERVAL_SECS", 3600)?,
             batch_size: parse_env_or("RETENTION_BATCH_SIZE", 1000)?,
         };

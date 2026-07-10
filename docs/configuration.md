@@ -89,10 +89,11 @@ All configuration is via environment variables (loaded in `src/config.rs`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RETENTION_ENABLED` | `0` | Enable automatic cleanup of old terminal tasks (the `rule_slot` GC in the same loop always runs, regardless) |
-| `RETENTION_DAYS` | `30` | Number of days to retain terminal tasks before cleanup |
-| `RETENTION_CLEANUP_INTERVAL_SECS` | `3600` | Interval between cleanup runs in seconds |
-| `RETENTION_BATCH_SIZE` | `1000` | Number of tasks to delete per cleanup run |
+| `RETENTION_ENABLED` | `0` | Enable the retention loop's task move + archive purge (the `rule_slot` GC in the same loop always runs, regardless) |
+| `RETENTION_DAYS` | `30` | Days a terminal task stays in the hot `task` table before being **moved** to the cold `task_archive` (Audit 2, D6 — the record is preserved and still served by `GET /task/{id}`; its actions/links/webhook rows are dropped). Not a delete |
+| `RETENTION_ARCHIVE_DAYS` | `0` | Days an archived task stays in `task_archive` before being purged. `0` = **keep forever**: growth just shifts to the cold table (tight hot indexes, healthy vacuum) without being bounded. Set > 0 to bound the archive |
+| `RETENTION_CLEANUP_INTERVAL_SECS` | `3600` | Interval between retention loop runs in seconds |
+| `RETENTION_BATCH_SIZE` | `1000` | Max tasks moved (and archive rows purged) per retention cycle |
 
 ## Security
 

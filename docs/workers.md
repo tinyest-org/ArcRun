@@ -30,7 +30,16 @@ The consumed keys are persisted in `task.claimed_slot_keys` and the charge in `t
 
 **Capacity deltas are pushed by the batch_updater flush** (`handle_batch_with_counts`): in the same flush transaction (cap-slot pre-lock sorted FIRST, then the ordered task pre-lock — A9 slot-before-task discipline; the no-capacity common case costs one empty SELECT), each flushed task's `capacity_charge` shrinks to `GREATEST(LEAST(old, expected - success - failures), 0)` (monotonically non-increasing — a raised expected_count never raises the charge) and the shrink is decremented from its `cap:` slots, freeing capacity as Running tasks report progress via PUT. Divergence (accepted, user decision): a direct PATCH (counter-only `update_running_task`, or metadata/expected_count) does NOT push capacity deltas — only the flush does; the slot may read higher than true remaining (conservative — blocks more, never leaks) and is fully reconciled at release since release uses the stored charge.
 
-Empty (`used = 0`) slot rows are GC'd by the retention loop (which now always runs — the task-retention DELETE stays gated by `RETENTION_ENABLED`, the slot GC does not).
+Empty (`used = 0`) slot rows are GC'd by the retention loop (which now always runs — the task retention stays gated by `RETENTION_ENABLED`, the slot GC does not).
+
+## Retention Loop (`retention_cleanup_loop`, `src/workers/retention.rs`)
+
+The loop ALWAYS runs (its `rule_slot` GC must happen even when task retention is off). When `RETENTION_ENABLED=1`, each pass:
+
+1. **Moves** terminal tasks (Success/Failure/Canceled) with `ended_at` older than `RETENTION_DAYS` into the cold `task_archive` table (Audit 2, D6 / 7.5b) — `cleanup_old_terminal_tasks`. This is an atomic `WITH moved AS (DELETE FROM task ... RETURNING <cols>) INSERT INTO task_archive (<cols>, archived_at) SELECT <cols>, now() FROM moved` (explicit column lists both sides), in the SAME transaction as the deletion of the tasks' actions → webhook rows → links (FK order). The task record survives (still served by `GET /task/{id}`); its tooling does not. The orphan-`batch` sweep is unchanged — a batch whose tasks are all archived has no `task` rows left, so it is swept (its `batch_id` lives on in `task_archive` without an FK), unless a `batch_complete` signal is still queued.
+2. **Purges** the archive when `RETENTION_ARCHIVE_DAYS > 0` — `purge_old_archived_tasks` bounded-DELETEs `task_archive` rows with `archived_at` older than that window (`0` = keep forever, the default). This is the only thing that bounds archive growth.
+
+Both steps are batched by `RETENTION_BATCH_SIZE` and gated by `RETENTION_ENABLED`; the `rule_slot` GC runs regardless.
 
 ## Timeout Loop (`timeout_loop`, `src/workers/timeout_loop.rs`)
 

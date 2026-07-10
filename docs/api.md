@@ -101,6 +101,8 @@ GET /task/{task_id}
 
 Response: Full task details with all actions (fetched via single LEFT JOIN query).
 
+If the task has been moved to the cold archive by retention (Audit 2, D6), this endpoint still serves it from `task_archive` with the **same response shape** — every field is present, except `actions` is an empty array (an archived task's actions are dropped on archive). Only `GET /task/{id}` reads the archive; listings, the DAG view, and writes (`PATCH`/`PUT`/`DELETE`) do not — a write to an archived task is a `404`.
+
 ```json
 {
   "id": "uuid",

@@ -40,7 +40,7 @@ pub(crate) use batch_listing::{get_batch_stats, list_batches, update_batch_rules
 // Re-exports from cleanup
 // `pub` (not pub(crate)) so integration tests can drive one cleanup pass
 // deterministically, like `run_delivery_once` / `run_claim_loop`.
-pub use cleanup::{cleanup_old_terminal_tasks, gc_empty_rule_slots};
+pub use cleanup::{cleanup_old_terminal_tasks, gc_empty_rule_slots, purge_old_archived_tasks};
 
 // Re-exports from webhook_execution (ledger + batch-complete detection)
 pub use webhook_execution::{

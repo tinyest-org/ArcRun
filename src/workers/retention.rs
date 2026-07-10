@@ -69,6 +69,30 @@ pub async fn retention_cleanup_loop(
                             metrics::record_retention_cleanup("error", 0, duration);
                         }
                     }
+
+                    // Archive purge (Audit 2, D6): only when RETENTION_ARCHIVE_DAYS > 0.
+                    // `0` means keep the archive forever, so we never purge. Gated by
+                    // `enabled` like the task move above. Best-effort: a failure is
+                    // logged, not fatal.
+                    if retention_config.archive_retention_days > 0 {
+                        match db_operation::purge_old_archived_tasks(
+                            &mut conn,
+                            retention_config.archive_retention_days,
+                            retention_config.batch_size,
+                        )
+                        .await
+                        {
+                            Ok(n) if n > 0 => log::info!(
+                                "Retention cleanup: purged {} archived tasks older than {} days",
+                                n,
+                                retention_config.archive_retention_days
+                            ),
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::error!("Retention cleanup: archive purge error: {:?}", e)
+                            }
+                        }
+                    }
                 }
 
                 // GC empty concurrency slot rows (Audit 2, D1). Metadata-derived slot

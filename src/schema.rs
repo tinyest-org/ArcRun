@@ -97,6 +97,37 @@ diesel::table! {
 
 diesel::table! {
     use diesel::sql_types::*;
+    use super::sql_types::StatusKind;
+
+    task_archive (id) {
+        id -> Uuid,
+        name -> Text,
+        kind -> Text,
+        status -> StatusKind,
+        timeout -> Int4,
+        created_at -> Timestamptz,
+        started_at -> Nullable<Timestamptz>,
+        last_updated -> Timestamptz,
+        metadata -> Jsonb,
+        ended_at -> Nullable<Timestamptz>,
+        start_condition -> Jsonb,
+        wait_success -> Int4,
+        wait_finished -> Int4,
+        success -> Int4,
+        failures -> Int4,
+        failure_reason -> Nullable<Text>,
+        batch_id -> Nullable<Uuid>,
+        expected_count -> Nullable<Int4>,
+        dead_end_barrier -> Bool,
+        priority -> Int4,
+        claimed_slot_keys -> Nullable<Array<Text>>,
+        capacity_charge -> Nullable<Int4>,
+        archived_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
     use super::sql_types::TriggerKind;
     use super::sql_types::TriggerCondition;
     use super::sql_types::WebhookExecutionStatus;
@@ -149,6 +180,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     link,
     rule_slot,
     task,
+    task_archive,
     webhook_execution,
     webhook_outbox,
 );
