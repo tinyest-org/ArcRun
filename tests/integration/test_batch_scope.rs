@@ -95,8 +95,12 @@ async fn batch_complete_rows(pool: &arcrun::DbPool, batch_id: uuid::Uuid) -> i64
     let mut conn = pool.get().await.unwrap();
     let r: Cnt = diesel_async::RunQueryDsl::get_result(
         diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE batch_id = $1 AND trigger = 'batch_complete'",
+            // D3: the batch_complete signal is in the queue (webhook_outbox) until
+            // delivered, then in the history (webhook_execution) — count both.
+            "SELECT (\
+                (SELECT count(*) FROM webhook_execution WHERE batch_id = $1 AND trigger = 'batch_complete') + \
+                (SELECT count(*) FROM webhook_outbox    WHERE batch_id = $1 AND trigger = 'batch_complete')\
+             ) AS c",
         )
         .bind::<diesel::sql_types::Uuid, _>(batch_id),
         &mut *conn,

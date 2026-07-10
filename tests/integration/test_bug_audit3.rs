@@ -281,17 +281,29 @@ async fn outbox_count(pool: &arcrun::DbPool, task_id: uuid::Uuid, status: &str) 
         c: i64,
     }
     let mut conn = pool.get().await.unwrap();
-    let r: Cnt = diesel_async::RunQueryDsl::get_result(
-        diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE task_id = $1 AND status = $2::webhook_execution_status",
+    // D3: pending end/cancel rows live in the dedicated `webhook_outbox` queue; delivered
+    // (success/failure/exhausted) rows are historised into `webhook_execution`.
+    let r: Cnt = if status == "pending" {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query("SELECT count(*) AS c FROM webhook_outbox WHERE task_id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(task_id),
+            &mut *conn,
         )
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(status),
-        &mut *conn,
-    )
-    .await
-    .unwrap();
+        .await
+        .unwrap()
+    } else {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query(
+                "SELECT count(*) AS c FROM webhook_execution \
+                 WHERE task_id = $1 AND status = $2::webhook_execution_status",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .bind::<diesel::sql_types::Text, _>(status),
+            &mut *conn,
+        )
+        .await
+        .unwrap()
+    };
     r.c
 }
 
@@ -614,18 +626,32 @@ async fn cancel_outbox_count(pool: &arcrun::DbPool, task_id: uuid::Uuid, status:
         c: i64,
     }
     let mut conn = pool.get().await.unwrap();
-    let r: Cnt = diesel_async::RunQueryDsl::get_result(
-        diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE task_id = $1 AND trigger = 'cancel' \
-               AND status = $2::webhook_execution_status",
+    // D3: a pending cancel row lives in the queue; delivered ones in the ledger/history.
+    let r: Cnt = if status == "pending" {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query(
+                "SELECT count(*) AS c FROM webhook_outbox \
+                 WHERE task_id = $1 AND trigger = 'cancel'",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id),
+            &mut *conn,
         )
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(status),
-        &mut *conn,
-    )
-    .await
-    .unwrap();
+        .await
+        .unwrap()
+    } else {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query(
+                "SELECT count(*) AS c FROM webhook_execution \
+                 WHERE task_id = $1 AND trigger = 'cancel' \
+                   AND status = $2::webhook_execution_status",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .bind::<diesel::sql_types::Text, _>(status),
+            &mut *conn,
+        )
+        .await
+        .unwrap()
+    };
     r.c
 }
 
@@ -1868,8 +1894,12 @@ async fn outbox_count_by_trigger(pool: &arcrun::DbPool, task_id: uuid::Uuid, tri
     let mut conn = pool.get().await.unwrap();
     let r: Cnt = diesel_async::RunQueryDsl::get_result(
         diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE task_id = $1 AND trigger = $2::trigger_kind",
+            // D3: pending end/cancel rows are in the queue, delivered ones in history;
+            // start rows only ever live in the ledger (queue has none) — count both.
+            "SELECT (\
+                (SELECT count(*) FROM webhook_execution WHERE task_id = $1 AND trigger = $2::trigger_kind) + \
+                (SELECT count(*) FROM webhook_outbox    WHERE task_id = $1 AND trigger = $2::trigger_kind)\
+             ) AS c",
         )
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(trigger),
@@ -3221,8 +3251,12 @@ async fn b3_batch_complete_total(pool: &arcrun::DbPool, batch_id: uuid::Uuid) ->
     let mut conn = pool.get().await.unwrap();
     let r: Cnt = diesel_async::RunQueryDsl::get_result(
         diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE batch_id = $1 AND trigger = 'batch_complete'",
+            // D3: the batch_complete signal is in the queue (webhook_outbox) until
+            // delivered, then in the history (webhook_execution) — count both.
+            "SELECT (\
+                (SELECT count(*) FROM webhook_execution WHERE batch_id = $1 AND trigger = 'batch_complete') + \
+                (SELECT count(*) FROM webhook_outbox    WHERE batch_id = $1 AND trigger = 'batch_complete')\
+             ) AS c",
         )
         .bind::<diesel::sql_types::Uuid, _>(batch_id),
         &mut *conn,

@@ -1,7 +1,4 @@
-use crate::{
-    Conn,
-    models::{StatusKind, WebhookExecutionStatus},
-};
+use crate::{Conn, models::StatusKind};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -45,13 +42,19 @@ pub async fn cleanup_old_terminal_tasks<'a>(
             use crate::schema::action::dsl as action_dsl;
             use crate::schema::link::dsl as link_dsl;
             use crate::schema::webhook_execution::dsl as we_dsl;
+            use crate::schema::webhook_outbox::dsl as wo_dsl;
 
             // 1. Delete actions belonging to these tasks
             diesel::delete(action_dsl::action.filter(action_dsl::task_id.eq_any(&task_ids)))
                 .execute(&mut *conn)
                 .await?;
 
-            // 2. Delete webhook_execution records (FK on task_id)
+            // 2. Delete webhook rows (FK on task_id): the delivery QUEUE
+            // (webhook_outbox — normally empty for terminal tasks this old, but
+            // belt-and-braces) and the ledger/history (webhook_execution).
+            diesel::delete(wo_dsl::webhook_outbox.filter(wo_dsl::task_id.eq_any(&task_ids)))
+                .execute(&mut *conn)
+                .await?;
             diesel::delete(we_dsl::webhook_execution.filter(we_dsl::task_id.eq_any(&task_ids)))
                 .execute(&mut *conn)
                 .await?;
@@ -73,9 +76,10 @@ pub async fn cleanup_old_terminal_tasks<'a>(
                 .await?;
 
             // 5. Clean up orphaned `batch` rows (Lot 3b): a batch row whose tasks have
-            // all been deleted is unreachable. Delete its batch-level webhook_execution
-            // rows first (FK on batch_id), then the batch rows themselves. We scope to
-            // batches touched by the tasks just deleted to keep this bounded.
+            // all been deleted is unreachable. Delete its batch-level webhook rows first
+            // (FK on batch_id — both the queue and the history), then the batch rows
+            // themselves. We scope to batches touched by the tasks just deleted to keep
+            // this bounded.
             use crate::schema::batch::dsl as batch_dsl;
             let orphan_batch_ids: Vec<uuid::Uuid> = batch_dsl::batch
                 .filter(diesel::dsl::not(diesel::dsl::exists(
@@ -84,13 +88,10 @@ pub async fn cleanup_old_terminal_tasks<'a>(
                 // Never sweep a batch whose batch_complete signal is still awaiting
                 // delivery: an empty batch (all tasks dedupe-skipped) has no tasks at
                 // all, so it is "orphaned" from birth — deleting it here would destroy
-                // the pending outbox row and lose the at-least-once signal.
+                // the queued outbox row and lose the at-least-once signal. A present
+                // webhook_outbox row (D3) with this batch_id IS the pending signal.
                 .filter(diesel::dsl::not(diesel::dsl::exists(
-                    we_dsl::webhook_execution.filter(
-                        we_dsl::batch_id
-                            .eq(batch_dsl::id.nullable())
-                            .and(we_dsl::status.eq(WebhookExecutionStatus::Pending)),
-                    ),
+                    wo_dsl::webhook_outbox.filter(wo_dsl::batch_id.eq(batch_dsl::id.nullable())),
                 )))
                 .select(batch_dsl::id)
                 .limit(batch_size)
@@ -98,6 +99,11 @@ pub async fn cleanup_old_terminal_tasks<'a>(
                 .await?;
 
             if !orphan_batch_ids.is_empty() {
+                diesel::delete(
+                    wo_dsl::webhook_outbox.filter(wo_dsl::batch_id.eq_any(&orphan_batch_ids)),
+                )
+                .execute(&mut *conn)
+                .await?;
                 diesel::delete(
                     we_dsl::webhook_execution.filter(we_dsl::batch_id.eq_any(&orphan_batch_ids)),
                 )

@@ -36,17 +36,29 @@ async fn outbox_count(pool: &arcrun::DbPool, task_id: uuid::Uuid, status: &str) 
         c: i64,
     }
     let mut conn = pool.get().await.unwrap();
-    let r: Cnt = diesel_async::RunQueryDsl::get_result(
-        diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE task_id = $1 AND status = $2::webhook_execution_status",
+    // D3: pending end/cancel rows live in the dedicated `webhook_outbox` queue; delivered
+    // (success/failure/exhausted) rows are historised into `webhook_execution`.
+    let r: Cnt = if status == "pending" {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query("SELECT count(*) AS c FROM webhook_outbox WHERE task_id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(task_id),
+            &mut *conn,
         )
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(status),
-        &mut *conn,
-    )
-    .await
-    .unwrap();
+        .await
+        .unwrap()
+    } else {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query(
+                "SELECT count(*) AS c FROM webhook_execution \
+                 WHERE task_id = $1 AND status = $2::webhook_execution_status",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .bind::<diesel::sql_types::Text, _>(status),
+            &mut *conn,
+        )
+        .await
+        .unwrap()
+    };
     r.c
 }
 
@@ -55,10 +67,8 @@ async fn outbox_count(pool: &arcrun::DbPool, task_id: uuid::Uuid, status: &str) 
 async fn expire_leases(pool: &arcrun::DbPool) {
     let mut conn = pool.get().await.unwrap();
     diesel_async::RunQueryDsl::execute(
-        diesel::sql_query(
-            "UPDATE webhook_execution SET next_attempt_at = now() - interval '1 hour' \
-             WHERE status = 'pending'",
-        ),
+        // D3: the delivery queue is webhook_outbox now — every row is a pending attempt.
+        diesel::sql_query("UPDATE webhook_outbox SET next_attempt_at = now() - interval '1 hour'"),
         &mut *conn,
     )
     .await
@@ -282,7 +292,8 @@ async fn test_failing_row_does_not_block_others() {
     }
     let mut conn = state.pool.get().await.unwrap();
     let a: AttemptsRow = diesel_async::RunQueryDsl::get_result(
-        diesel::sql_query("SELECT attempts FROM webhook_execution WHERE task_id = $1")
+        // D3: a still-failing (not exhausted) row stays in the webhook_outbox queue.
+        diesel::sql_query("SELECT attempts FROM webhook_outbox WHERE task_id = $1")
             .bind::<diesel::sql_types::Uuid, _>(bad),
         &mut *conn,
     )

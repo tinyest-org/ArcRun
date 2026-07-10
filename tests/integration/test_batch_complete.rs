@@ -30,18 +30,32 @@ async fn batch_outbox_count(pool: &arcrun::DbPool, batch_id: uuid::Uuid, status:
         c: i64,
     }
     let mut conn = pool.get().await.unwrap();
-    let r: Cnt = diesel_async::RunQueryDsl::get_result(
-        diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE batch_id = $1 AND trigger = 'batch_complete' \
-               AND status = $2::webhook_execution_status",
+    // D3: a pending batch_complete signal lives in the queue; delivered ones in history.
+    let r: Cnt = if status == "pending" {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query(
+                "SELECT count(*) AS c FROM webhook_outbox \
+                 WHERE batch_id = $1 AND trigger = 'batch_complete'",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(batch_id),
+            &mut *conn,
         )
-        .bind::<diesel::sql_types::Uuid, _>(batch_id)
-        .bind::<diesel::sql_types::Text, _>(status),
-        &mut *conn,
-    )
-    .await
-    .unwrap();
+        .await
+        .unwrap()
+    } else {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query(
+                "SELECT count(*) AS c FROM webhook_execution \
+                 WHERE batch_id = $1 AND trigger = 'batch_complete' \
+                   AND status = $2::webhook_execution_status",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(batch_id)
+            .bind::<diesel::sql_types::Text, _>(status),
+            &mut *conn,
+        )
+        .await
+        .unwrap()
+    };
     r.c
 }
 
@@ -55,8 +69,12 @@ async fn batch_outbox_total(pool: &arcrun::DbPool, batch_id: uuid::Uuid) -> i64 
     let mut conn = pool.get().await.unwrap();
     let r: Cnt = diesel_async::RunQueryDsl::get_result(
         diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE batch_id = $1 AND trigger = 'batch_complete'",
+            // D3: the batch_complete signal is in the queue (webhook_outbox) until
+            // delivered, then in the history (webhook_execution) — count both.
+            "SELECT (\
+                (SELECT count(*) FROM webhook_execution WHERE batch_id = $1 AND trigger = 'batch_complete') + \
+                (SELECT count(*) FROM webhook_outbox    WHERE batch_id = $1 AND trigger = 'batch_complete')\
+             ) AS c",
         )
         .bind::<diesel::sql_types::Uuid, _>(batch_id),
         &mut *conn,
@@ -821,6 +839,91 @@ async fn test_cleanup_spares_batch_with_pending_signal() {
         batch_outbox_total(&state.pool, batch_id).await,
         0,
         "delivered batch signal rows are swept once no longer pending"
+    );
+
+    let _ = shutdown_server.send(());
+}
+
+/// D3 backstop: once a batch_complete signal has been DELIVERED (its queue row removed
+/// and a `success` history row written), a re-signal of the same batch must NOT
+/// re-enqueue it. With the pre-D3 single table, a double `stop_batch`/re-signal was
+/// blocked by `ON CONFLICT` hitting the retained `success` row; now the queue is emptied
+/// on success, so the `NOT EXISTS (webhook_execution ... key)` ledger backstop is what
+/// prevents a second delivery. Asserts: no new queue row, no second HTTP hit.
+#[tokio::test]
+async fn test_batch_complete_backstop_no_resignal_after_delivery() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits.clone());
+
+    let body = json!({
+        "tasks": [task_json("a", "A", "backstop")],
+        "on_batch_complete": [
+            {"kind": "Webhook", "params": {"url": webhook_url, "verb": "Post"}}
+        ]
+    });
+    let (_s, batch_id) = post_body(&app, &body).await;
+    let batch_id = batch_id.unwrap();
+    let ids = get_batch_task_ids(&app, batch_id).await;
+
+    // Complete the only task -> remaining 0 -> batch_complete queued.
+    succeed_task(&state, ids[0]).await;
+    assert_eq!(
+        batch_outbox_count(&state.pool, batch_id, "pending").await,
+        1,
+        "batch_complete should be queued after the last task terminalizes"
+    );
+
+    // Deliver it -> queue emptied, historised as success.
+    drain_outbox(&state).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "batch_complete delivered once"
+    );
+    assert_eq!(
+        batch_outbox_count(&state.pool, batch_id, "pending").await,
+        0,
+        "queue row removed on delivery"
+    );
+    assert_eq!(
+        batch_outbox_count(&state.pool, batch_id, "success").await,
+        1,
+        "delivery historised in webhook_execution"
+    );
+
+    // Re-signal the (already-delivered) batch: the backstop must block re-enqueue.
+    {
+        let mut conn = state.pool.get().await.unwrap();
+        arcrun::db_operation::zero_batch_remaining_and_complete(
+            &mut conn,
+            batch_id,
+            "test-resignal",
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        batch_outbox_count(&state.pool, batch_id, "pending").await,
+        0,
+        "backstop (NOT EXISTS ledger) must prevent re-enqueue after delivery"
+    );
+    assert_eq!(
+        batch_outbox_total(&state.pool, batch_id).await,
+        1,
+        "still exactly one batch_complete signal across queue + history"
+    );
+
+    // A further drain must not deliver anything new.
+    drain_outbox(&state).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "no second batch_complete delivery after a re-signal"
     );
 
     let _ = shutdown_server.send(());

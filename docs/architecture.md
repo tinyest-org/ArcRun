@@ -170,17 +170,34 @@ webhook_execution (id, task_id, trigger, condition, idempotency_key,
                    next_attempt_at, last_error, batch_id)
   -- status: pending | success | failure | exhausted
   -- trigger: start | end | cancel | batch_complete
-  -- doubles as the transactional outbox for end/cancel webhooks (Lot 2) and the
-  -- batch_complete webhook (Lot 3b):
+  -- Since Audit 2 D3 this is the idempotency LEDGER + delivery HISTORY only (NOT the
+  -- live queue — that moved to webhook_outbox):
+  --   * on_start idempotency ledger: `pending`/`success`/`failure` `start` rows drive the
+  --     start_loop gate (try_claim_webhook_execution) and the start-before-end gate.
+  --   * delivery history: terminated end/cancel/batch_complete deliveries are written here
+  --     as `success`/`exhausted` (moved out of the queue on completion). Retained for
+  --     GET /webhook-deliveries.
   --   task_id  is NULL for batch_complete rows; batch_id is set instead
   --   CHECK (task_id IS NOT NULL OR batch_id IS NOT NULL)
-  --   next_attempt_at = when the row is eligible for (re)delivery (DEFAULT now())
-  --   last_error      = last delivery error (diagnostics)
+webhook_outbox (id, task_id, batch_id, trigger, condition, idempotency_key,
+                attempts, created_at, updated_at, next_attempt_at, last_error)
+  -- The dedicated at-least-once delivery QUEUE for end/cancel/batch_complete webhooks
+  --   (Audit 2, D3). PURE queue: every row present is awaiting delivery, so there is NO
+  --   `status` column. A row is enqueued in the status-change transaction and DELETED —
+  --   historised into webhook_execution as success/exhausted — the moment delivery ends.
+  --   task_id XOR batch_id (batch_complete rows carry batch_id, task rows carry task_id);
+  --     `condition` is the Success sentinel for cancel/batch_complete.
+  --   next_attempt_at = when the row is eligible for (re)delivery (DEFAULT now(); pushed
+  --     forward by the claim lease and each failed attempt); last_error = diagnostics.
+  --   Kept disjoint from the ledger per idempotency_key by the enqueue backstop
+  --     (NOT EXISTS webhook_execution) + the DELETE-then-INSERT on terminal.
 
 -- FK constraints (relevant for cleanup ordering)
 action.task_id -> task.id
 webhook_execution.task_id -> task.id
 webhook_execution.batch_id -> batch.id
+webhook_outbox.task_id -> task.id
+webhook_outbox.batch_id -> batch.id
 link.parent_id -> task.id
 link.child_id -> task.id
 
@@ -191,8 +208,13 @@ link_parent_id_idx ON link(parent_id)
 link_child_id_idx ON link(child_id)
 idx_webhook_execution_task_id ON webhook_execution(task_id)
 idx_webhook_execution_status ON webhook_execution(status)
-idx_webhook_execution_pending_due ON webhook_execution(next_attempt_at) WHERE status = 'pending'
 idx_webhook_execution_batch_id ON webhook_execution(batch_id) WHERE batch_id IS NOT NULL
+  -- NB: the old partial idx_webhook_execution_pending_due (next_attempt_at WHERE
+  --   status='pending') served ONLY the queue drain and was dropped by D3 — the queue's
+  --   maturity scan is now served by idx_webhook_outbox_next_attempt_at below.
+idx_webhook_outbox_next_attempt_at ON webhook_outbox(next_attempt_at)
+idx_webhook_outbox_task_id ON webhook_outbox(task_id) WHERE task_id IS NOT NULL
+idx_webhook_outbox_batch_id ON webhook_outbox(batch_id) WHERE batch_id IS NOT NULL
 idx_task_priority ON task(status, priority DESC, created_at ASC, id ASC)
   -- the trailing `id ASC` (Audit 2, B7) matches the start_loop keyset ORDER BY exactly
   --   (priority DESC, created_at ASC, id ASC), so the Pending claim scan is a pure Index

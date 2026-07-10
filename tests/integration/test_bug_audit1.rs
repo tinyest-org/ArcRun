@@ -245,7 +245,11 @@ async fn test_bug3_double_update_via_api_second_call_idempotent() {
     }
     let cnt: Cnt = diesel_async::RunQueryDsl::get_result(
         diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution WHERE task_id = $1 AND trigger = 'end'",
+            // D3: the end row is in the queue until delivered, then in history — count both.
+            "SELECT (\
+                (SELECT count(*) FROM webhook_execution WHERE task_id = $1 AND trigger = 'end') + \
+                (SELECT count(*) FROM webhook_outbox    WHERE task_id = $1 AND trigger = 'end')\
+             ) AS c",
         )
         .bind::<diesel::sql_types::Uuid, _>(task_id),
         &mut *conn,

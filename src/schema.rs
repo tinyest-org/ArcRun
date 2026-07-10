@@ -117,9 +117,31 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+    use super::sql_types::TriggerKind;
+    use super::sql_types::TriggerCondition;
+
+    webhook_outbox (id) {
+        id -> Uuid,
+        task_id -> Nullable<Uuid>,
+        batch_id -> Nullable<Uuid>,
+        trigger -> TriggerKind,
+        condition -> TriggerCondition,
+        idempotency_key -> Text,
+        attempts -> Int4,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        next_attempt_at -> Timestamptz,
+        last_error -> Nullable<Text>,
+    }
+}
+
 diesel::joinable!(action -> task (task_id));
 diesel::joinable!(webhook_execution -> task (task_id));
 diesel::joinable!(webhook_execution -> batch (batch_id));
+diesel::joinable!(webhook_outbox -> task (task_id));
+diesel::joinable!(webhook_outbox -> batch (batch_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     action,
@@ -128,4 +150,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     rule_slot,
     task,
     webhook_execution,
+    webhook_outbox,
 );

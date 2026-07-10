@@ -4,6 +4,7 @@ mod task_crud;
 mod task_lifecycle;
 mod task_query;
 mod webhook_execution;
+mod webhook_outbox;
 
 use crate::Conn;
 use diesel_async::AsyncConnection;
@@ -41,15 +42,20 @@ pub(crate) use batch_listing::{get_batch_stats, list_batches, update_batch_rules
 // deterministically, like `run_delivery_once` / `run_claim_loop`.
 pub use cleanup::{cleanup_old_terminal_tasks, gc_empty_rule_slots};
 
-// Re-exports from webhook_execution
+// Re-exports from webhook_execution (ledger + batch-complete detection)
 pub use webhook_execution::{
-    BatchCompletionStats, batch_completion_stats, claim_due_outbox, claim_due_outbox_leased,
-    decrement_batch_remaining_for_task, decrement_batch_remaining_for_tasks,
-    enqueue_batch_complete_outbox, enqueue_outbox, init_batch_remaining, insert_batch,
-    list_webhook_deliveries, load_batch_on_complete, mark_outbox_exhausted, mark_outbox_retry,
-    mark_outbox_success, outbox_backlog_stats, zero_batch_remaining_and_complete,
+    BatchCompletionStats, batch_completion_stats, complete_webhook_execution,
+    decrement_batch_remaining_for_task, decrement_batch_remaining_for_tasks, init_batch_remaining,
+    insert_batch, load_batch_on_complete, try_claim_webhook_execution,
+    zero_batch_remaining_and_complete,
 };
-pub use webhook_execution::{complete_webhook_execution, try_claim_webhook_execution};
+
+// Re-exports from webhook_outbox (dedicated delivery queue, Audit 2 D3)
+pub use webhook_outbox::{
+    claim_due_outbox, claim_due_outbox_leased, enqueue_batch_complete_outbox, enqueue_outbox,
+    list_webhook_deliveries, mark_outbox_exhausted, mark_outbox_retry, mark_outbox_success,
+    outbox_backlog_stats,
+};
 
 /// Execute a closure within a database transaction.
 /// Automatically rolls back on error. Commits on success.

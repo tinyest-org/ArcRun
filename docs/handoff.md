@@ -28,8 +28,18 @@ slots-avant-tasks), libérée par le release généralisé (`cap:` ⇒ charge
 stockée). Advisory + probe CTE-SUM supprimés ; divergence assumée : le
 PATCH compteur direct ne pousse pas de delta (sur-comptage conservateur,
 réconcilié au release). **Le périmètre décidé du Lot 7 (7.2 + 7.3) est
-TERMINÉ** ; 7.1 (API v1/HMAC), 7.4 (GET /work), 7.5 (split outbox)
-restent non décidés — ne rien lancer sans décision utilisateur.
+TERMINÉ**. Décision utilisateur du 2026-07-10 : lancement du **7.5**
+(D3/D6), périmètre = 7.5a table `webhook_outbox` dédiée + 7.5b
+`task_archive` (dispatcher séparé écarté, partitioning hors périmètre).
+**7.5a (D3) : FAIT** — queue de livraison dans `webhook_outbox` (pas de
+colonne status ; au terme de la livraison la ligne est supprimée et
+historisée dans `webhook_execution` en une CTE atomique) ;
+`webhook_execution` = ledger on_start + historique ; backstop
+anti-re-signal `NOT EXISTS (ledger)` à l'enqueue ; gates A2/D2 et
+contrat GET /webhook-deliveries inchangés. **7.5b (D6) : en cours**
+(`task_archive` alimenté par la rétention). 7.1 (API v1/HMAC) et 7.4
+(GET /work) restent non décidés — ne rien lancer sans décision
+utilisateur.
 Détail et notes de relecture par item dans
 `docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
 Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7) ; renversement

@@ -243,6 +243,37 @@ pub struct NewWebhookExecution<'a> {
     pub idempotency_key: &'a str,
 }
 
+/// A row of the dedicated webhook delivery QUEUE (`webhook_outbox`, Audit 2 D3).
+///
+/// The queue is pure: every row present is awaiting delivery, so there is no `status`
+/// column (contrast with [`WebhookExecution`], which is the idempotency ledger + the
+/// delivery history/log). A row is DELETED from this table — and historised into
+/// `webhook_execution` as `success`/`exhausted` — the moment its delivery terminates.
+/// Field order matches the `webhook_outbox` column order (positional `Queryable`).
+#[derive(Identifiable, Queryable, QueryableByName, Selectable, Debug, Clone)]
+#[diesel(table_name = crate::schema::webhook_outbox)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct WebhookOutbox {
+    pub id: uuid::Uuid,
+    /// Owning task, for task-level rows (end/cancel). NULL for batch-level
+    /// (`batch_complete`) rows, which are keyed by `batch_id` instead.
+    pub task_id: Option<uuid::Uuid>,
+    /// Owning batch, for batch-level (`batch_complete`) rows. NULL for task-level rows.
+    pub batch_id: Option<uuid::Uuid>,
+    pub trigger: TriggerKind,
+    pub condition: TriggerCondition,
+    pub idempotency_key: String,
+    pub attempts: i32,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+    /// When this queue row becomes eligible for (re)delivery. Defaults to now() on
+    /// insert (mature immediately); pushed forward by the claim lease and on each
+    /// failed attempt.
+    pub next_attempt_at: chrono::DateTime<Utc>,
+    /// Last delivery error message (for diagnostics; copied into the history row).
+    pub last_error: Option<String>,
+}
+
 /// Task lifecycle status. See the API description for the full state machine.
 ///
 /// Valid transitions:

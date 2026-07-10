@@ -1,7 +1,8 @@
 //! Lot 2 — transactional webhook outbox tests.
 //!
-//! End/cancel webhooks are enqueued into the `webhook_execution` outbox inside the
-//! status-change transaction and delivered asynchronously by the delivery loop.
+//! End/cancel webhooks are enqueued into the dedicated `webhook_outbox` queue (Audit 2
+//! D3) inside the status-change transaction and delivered asynchronously by the delivery
+//! loop; a terminated delivery leaves the queue and is historised in `webhook_execution`.
 //! These tests drive delivery deterministically via `run_delivery_once`
 //! (exposed as `drain_outbox*` helpers) instead of waiting on the worker timer.
 
@@ -23,17 +24,29 @@ async fn outbox_count(pool: &arcrun::DbPool, task_id: uuid::Uuid, status: &str) 
         c: i64,
     }
     let mut conn = pool.get().await.unwrap();
-    let r: Cnt = diesel_async::RunQueryDsl::get_result(
-        diesel::sql_query(
-            "SELECT count(*) AS c FROM webhook_execution \
-             WHERE task_id = $1 AND status = $2::webhook_execution_status",
+    // D3: pending end/cancel rows live in the dedicated `webhook_outbox` queue; delivered
+    // (success/failure/exhausted) rows are historised into `webhook_execution`.
+    let r: Cnt = if status == "pending" {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query("SELECT count(*) AS c FROM webhook_outbox WHERE task_id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(task_id),
+            &mut *conn,
         )
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(status),
-        &mut *conn,
-    )
-    .await
-    .unwrap();
+        .await
+        .unwrap()
+    } else {
+        diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query(
+                "SELECT count(*) AS c FROM webhook_execution \
+                 WHERE task_id = $1 AND status = $2::webhook_execution_status",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .bind::<diesel::sql_types::Text, _>(status),
+            &mut *conn,
+        )
+        .await
+        .unwrap()
+    };
     r.c
 }
 
@@ -88,6 +101,160 @@ async fn test_outbox_crash_window_delivers_on_restart() {
         outbox_count(&state.pool, task_id, "success").await,
         1,
         "outbox row should be marked success"
+    );
+
+    let _ = shutdown_server.send(());
+}
+
+/// D3: a successful end delivery REMOVES the row from the `webhook_outbox` queue and
+/// historises it as a `success` row in `webhook_execution` — visible via
+/// GET /webhook-deliveries?status=success. Proves the queue is emptied on success while
+/// the ledger keeps the delivery history.
+#[tokio::test]
+async fn test_outbox_success_moves_queue_row_to_history() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits.clone());
+
+    let task_payload = json!({
+        "id": "queue-to-history",
+        "name": "Queue To History",
+        "kind": "outbox-test",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": webhook_action(),
+        "on_success": [{"kind": "Webhook", "params": {"url": webhook_url, "verb": "Post"}}]
+    });
+
+    let created = create_tasks_ok(&app, &[task_payload]).await;
+    let task_id = created[0].id;
+
+    succeed_task(&state, task_id).await;
+
+    // Before delivery: one row in the QUEUE, nothing in the history yet.
+    assert_eq!(
+        outbox_count(&state.pool, task_id, "pending").await,
+        1,
+        "end:success row should be queued in webhook_outbox"
+    );
+    assert_eq!(
+        outbox_count(&state.pool, task_id, "success").await,
+        0,
+        "no history row before delivery"
+    );
+
+    drain_outbox(&state).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "webhook delivered once");
+
+    // After delivery: the queue row is GONE and a `success` history row exists.
+    assert_eq!(
+        outbox_count(&state.pool, task_id, "pending").await,
+        0,
+        "queue row must be removed on success"
+    );
+    assert_eq!(
+        outbox_count(&state.pool, task_id, "success").await,
+        1,
+        "delivery must be historised as a success row in webhook_execution"
+    );
+
+    // Visible via GET /webhook-deliveries?status=success.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/webhook-deliveries?status=success")
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+    let list: Vec<serde_json::Value> = actix_web::test::read_body_json(resp).await;
+    assert_eq!(list.len(), 1, "exactly one success delivery expected");
+    assert_eq!(list[0]["task_id"], task_id.to_string());
+    assert_eq!(list[0]["status"], "Success");
+
+    let _ = shutdown_server.send(());
+}
+
+/// D3: a FAILED end delivery leaves the row IN the `webhook_outbox` queue with
+/// `attempts` incremented and `next_attempt_at` pushed into the future (backoff); nothing
+/// is historised until the row terminates (success/exhausted).
+#[tokio::test]
+async fn test_outbox_failure_keeps_row_in_queue() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let (webhook_url, shutdown_server) = spawn_500_webhook_server();
+
+    let task_payload = json!({
+        "id": "queue-failure",
+        "name": "Queue Failure",
+        "kind": "outbox-test",
+        "timeout": 60,
+        "metadata": {"test": true},
+        "on_start": webhook_action(),
+        "on_success": [{"kind": "Webhook", "params": {"url": webhook_url, "verb": "Post"}}]
+    });
+
+    let created = create_tasks_ok(&app, &[task_payload]).await;
+    let task_id = created[0].id;
+
+    succeed_task(&state, task_id).await;
+
+    // High max_attempts + long backoff so a single failed pass stays pending (not
+    // exhausted) with next_attempt_at clearly in the future.
+    let cfg = DeliveryConfig {
+        batch_size: 100,
+        max_attempts: 5,
+        backoff_base_secs: 60,
+        backoff_cap_secs: 60,
+        lease_secs: 120,
+        concurrency: 10,
+        start_stale_secs: 30,
+    };
+
+    drain_outbox_with(&state, cfg, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Still queued, not historised.
+    assert_eq!(
+        outbox_count(&state.pool, task_id, "pending").await,
+        1,
+        "failed delivery must leave the row in the queue"
+    );
+    assert_eq!(
+        outbox_count(&state.pool, task_id, "success").await,
+        0,
+        "a failed (non-exhausted) delivery must not be historised"
+    );
+    assert_eq!(
+        outbox_count(&state.pool, task_id, "exhausted").await,
+        0,
+        "not exhausted yet"
+    );
+
+    // attempts incremented to 1 and next_attempt_at pushed into the future.
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempts: i32,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        future: bool,
+    }
+    let mut conn = state.pool.get().await.unwrap();
+    let r: Row = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query(
+            "SELECT attempts, (next_attempt_at > now()) AS future \
+             FROM webhook_outbox WHERE task_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.attempts, 1, "one observed failed attempt");
+    assert!(
+        r.future,
+        "next_attempt_at should be pushed into the future by backoff"
     );
 
     let _ = shutdown_server.send(());

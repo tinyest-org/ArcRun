@@ -1,9 +1,10 @@
 //! Webhook delivery loop (Lot 2 — transactional outbox).
 //!
 //! The 5th background worker. End/cancel webhooks are no longer fired inline in the
-//! HTTP/worker call path: the status-change transaction enqueues a `pending` row in
-//! `webhook_execution` (the outbox), and this loop drains it asynchronously with
-//! at-least-once delivery semantics and exponential backoff.
+//! HTTP/worker call path: the status-change transaction enqueues a row in the dedicated
+//! `webhook_outbox` queue (Audit 2 D3), and this loop drains it asynchronously with
+//! at-least-once delivery semantics and exponential backoff. A terminated delivery leaves
+//! the queue and is historised into `webhook_execution` as `success`/`exhausted`.
 //!
 //! Guarantees (see `docs/perf-correctness-plan.md`, "Contrat API cible"):
 //! - **At-least-once**: a row survives crash/redeploy and is delivered on restart.
@@ -45,7 +46,7 @@ use crate::{
     Conn, DbPool,
     action::{ActionExecutor, WebhookEnrichment},
     db_operation, metrics,
-    models::{Action, StatusKind, Task, TriggerCondition, TriggerKind, WebhookExecution},
+    models::{Action, StatusKind, Task, TriggerCondition, TriggerKind, WebhookOutbox},
     workers::WorkerNudges,
 };
 
@@ -238,7 +239,7 @@ struct DeliveryOutcome {
 /// Phase 2 helper: prefetch a row's delivery inputs and resolve fast-paths.
 async fn prepare_row<'a>(
     conn: &mut Conn<'a>,
-    row: WebhookExecution,
+    row: WebhookOutbox,
 ) -> Result<Prepared, db_operation::DbError> {
     if row.trigger == TriggerKind::BatchComplete {
         return prepare_batch_complete_row(conn, row).await;
@@ -248,7 +249,7 @@ async fn prepare_row<'a>(
 
 async fn prepare_task_row<'a>(
     conn: &mut Conn<'a>,
-    row: WebhookExecution,
+    row: WebhookOutbox,
 ) -> Result<Prepared, db_operation::DbError> {
     use crate::schema::action::dsl::{condition as a_condition, trigger as a_trigger};
     use crate::schema::task::dsl::{id as task_id_col, task as task_tbl};
@@ -327,7 +328,7 @@ async fn prepare_task_row<'a>(
 
 async fn prepare_batch_complete_row<'a>(
     conn: &mut Conn<'a>,
-    row: WebhookExecution,
+    row: WebhookOutbox,
 ) -> Result<Prepared, db_operation::DbError> {
     let key = row.idempotency_key.clone();
     let label = "batch_complete";
