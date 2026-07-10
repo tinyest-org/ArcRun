@@ -1,6 +1,6 @@
 # Configuration
 
-All configuration is via environment variables.
+All configuration is via environment variables (loaded in `src/config.rs`).
 
 ## Required
 
@@ -32,13 +32,37 @@ All configuration is via environment variables.
 | `PAGINATION_DEFAULT` | `50` | Default items per page |
 | `PAGINATION_MAX` | `100` | Maximum items per page |
 
-## Worker
+## Workers
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WORKER_LOOP_INTERVAL_MS` | `1000` | Worker loop interval in ms |
 | `WORKER_CLAIM_TIMEOUT_SECS` | `30` | Max time a task can stay Claimed before requeue |
+| `WORKER_START_BATCH_SIZE` | `50` | Max claims per start_loop iteration (claim cap). The Pending backlog is scanned page-by-page via keyset pagination (internal page size ~500) so the full backlog stays visible; only the number of claims per iteration is capped, never visibility. Early stop only fires once this cap is reached. |
+| `WORKER_TIMEOUT_BATCH_SIZE` | `100` | Must be > 0. Max timed-out `Running` tasks processed per timeout_loop pass (Audit 2, B7). The loop drains in bounded passes (up to `MAX_TIMEOUT_DRAIN_PASSES` = 50 per iteration) so a mass-timeout never pins the loop and starves the stale-`Claimed` requeue that shares it. |
+| `WORKER_WEBHOOK_CONCURRENCY` | `10` | Max concurrent on_start webhook executions (should not exceed `POOL_MAX_SIZE`) |
 | `BATCH_CHANNEL_CAPACITY` | `100` | Batch update channel size |
+
+## Webhook Delivery (outbox)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEBHOOK_DELIVERY_INTERVAL_MS` | `1000` | Interval between webhook delivery-loop iterations (outbox drain) |
+| `WEBHOOK_DELIVERY_BATCH_SIZE` | `50` | Max outbox rows claimed per delivery-loop iteration |
+| `WEBHOOK_DELIVERY_LEASE_SECS` | `120` | Must be >= 1. Lease applied to an outbox row at claim time; the row is not re-claimable until the lease expires. Must exceed the worst-case single-row delivery time so an in-flight delivery is never double-claimed. |
+| `WEBHOOK_DELIVERY_CONCURRENCY` | `10` | Must be >= 1. Max concurrent HTTP deliveries within one delivery-loop batch (`buffer_unordered` bound) |
+| `WEBHOOK_MAX_ATTEMPTS` | `10` | Delivery attempts before an outbox row is marked `exhausted` |
+| `WEBHOOK_RETRY_BACKOFF_BASE_SECS` | `2` | Base of the exponential retry backoff (delay = base^attempt, capped) |
+| `WEBHOOK_RETRY_BACKOFF_CAP_SECS` | `300` | Cap on the retry backoff delay |
+
+## Structural Limits (Audit 2, A10)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_TASKS_PER_BATCH` | `1000` | Max tasks accepted in one `POST /task` batch. Over the limit ⇒ 400. |
+| `MAX_DEPS_PER_TASK` | `100` | Max dependencies a single task may declare. Over ⇒ 400. |
+| `MAX_ACTIONS_PER_TASK` | `20` | Max actions per task (on_start + on_failure + on_success). Over ⇒ 400. |
+| `PAYLOAD_MAX_BYTES` | 2 MiB | Explicit `web::JsonConfig` body-size cap; larger request bodies ⇒ 413. Matches the historical implicit actix default, so non-breaking. |
 
 ## Circuit Breaker
 
@@ -65,7 +89,7 @@ All configuration is via environment variables.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RETENTION_ENABLED` | `0` | Enable automatic cleanup of old terminal tasks |
+| `RETENTION_ENABLED` | `0` | Enable automatic cleanup of old terminal tasks (the `rule_slot` GC in the same loop always runs, regardless) |
 | `RETENTION_DAYS` | `30` | Number of days to retain terminal tasks before cleanup |
 | `RETENTION_CLEANUP_INTERVAL_SECS` | `3600` | Interval between cleanup runs in seconds |
 | `RETENTION_BATCH_SIZE` | `1000` | Number of tasks to delete per cleanup run |
@@ -77,3 +101,4 @@ All configuration is via environment variables.
 | `SKIP_SSRF_VALIDATION` | `1` (debug) / `0` (release) | Skip SSRF validation on webhook URLs |
 | `BLOCKED_HOSTNAMES` | `localhost,127.0.0.1,::1,0.0.0.0,local,internal` | Comma-separated blocked hostnames |
 | `BLOCKED_HOSTNAME_SUFFIXES` | `.local,.internal,.localdomain,.localhost` | Comma-separated blocked hostname suffixes |
+| `AUTH_TOKEN` | unset ⇒ auth disabled | Optional static bearer token (Audit 2, A6). When set, an actix `from_fn` middleware (`src/auth.rs`) requires `Authorization: Bearer <token>` on **every** endpoint (including `/metrics`, Swagger UI, `/view`) **except** `/health` and `/ready` (k8s probes). Comparison is constant-time (manual byte XOR — `subtle` is only a transitive dep). Unset/blank ⇒ total pass-through (historical open behavior), with a loud release-build warning at startup. Token is header-only (never a query string), so `/view` needs a reverse proxy injecting the header. The `?handle=` capability URL is NOT gated here (deferred to a later breaking lot). |
