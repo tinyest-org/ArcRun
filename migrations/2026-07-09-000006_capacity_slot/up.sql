@@ -1,0 +1,23 @@
+-- Audit 2, D1 (7.3b) — DB-enforced **Capacity** rules via the same `rule_slot` counters.
+--
+-- Capacity rules used to be enforced with a `pg_advisory_xact_lock` + a CTE
+-- `SUM(GREATEST(expected_count - success - failures, 0))` probe over the whole `task`
+-- table. 7.3b migrates them onto the `rule_slot` counter mechanism introduced by 7.3a
+-- (000005) for Concurrency:
+--   * each Capacity rule of a candidate maps to a canonical `cap:` slot key
+--     (rule::capacity_slot_key), distinct from the `conc:` Concurrency keys;
+--   * the claim increments the slot by the candidate's **charge**
+--     (= GREATEST(expected_count - success - failures, 0)) with the same conditional
+--     upsert (blocked when `used >= max_capacity`), in the SAME transaction as the
+--     Pending -> Claimed UPDATE;
+--   * as the Running task reports progress via PUT /task counters, the batch_updater
+--     flush pushes the shrink of its remaining work down onto the slot (frees capacity);
+--   * every exit from Claimed/Running releases the task's outstanding charge from the
+--     slot (decrement) — reusing the 7.3a `release_slots_for_tasks` machinery.
+--
+-- `capacity_charge` = the amount this task currently contributes to each of its `cap:`
+-- slot keys (the "outstanding capacity charge"). It is set at claim time, decremented
+-- as progress is flushed, read back at release (NEVER recomputed — expected_count and
+-- metadata are mutable while Running), and NULLed on release. NULL = holds no capacity
+-- charge (never claimed through a Capacity rule, or already released).
+ALTER TABLE task ADD COLUMN capacity_charge INTEGER;

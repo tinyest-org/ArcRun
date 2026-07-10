@@ -274,9 +274,38 @@ async fn handle_batch_with_counts(updates: &[Update], conn: &mut Conn<'_>) -> Re
     // transaction so the locks are held together. A `40P01` on either statement rolls
     // the whole thing back and propagates as `Err`, letting `flush_updates` recover
     // per-row (the deadlock-free path).
+    //
+    // Capacity slot maintenance (Audit 2, D1 / 7.3b): as a Running task reports progress
+    // its remaining work (`capacity_charge`) shrinks, freeing capacity for new claims.
+    // We push that shrink onto the `cap:` `rule_slot` counters in the SAME transaction.
+    // A9 requires slot locks BEFORE task locks and both sorted, so the cap: slot pre-lock
+    // (sorted `lock_key`) runs FIRST — matching `claim_task_with_rules` and
+    // `release_slots_for_tasks`. The overwhelmingly common flush touches no capacity task,
+    // so this is a single cheap SELECT that returns nothing and the later capacity
+    // statement is skipped entirely.
     db_operation::run_in_transaction(conn, move |conn| {
         Box::pin(async move {
-            // Ordered pre-lock (no status filter — locking a terminal row is harmless).
+            // 1. (A9 first) Pre-lock the cap: slots of any task in this flush that still
+            //    carries a positive charge, in sorted key order. Empty ⇒ no capacity work.
+            #[derive(diesel::QueryableByName)]
+            struct LockKeyRow {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                #[allow(dead_code)]
+                lock_key: String,
+            }
+            let cap_slots: Vec<LockKeyRow> = diesel::sql_query(
+                "SELECT lock_key FROM rule_slot \
+                 WHERE lock_key IN ( \
+                     SELECT DISTINCT k FROM task, unnest(claimed_slot_keys) AS k \
+                     WHERE id = ANY($1) AND capacity_charge > 0 AND k LIKE 'cap:%' \
+                 ) \
+                 ORDER BY lock_key FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
+            .get_results(&mut *conn)
+            .await?;
+
+            // 2. Ordered task pre-lock (no status filter — locking a terminal row is harmless).
             diesel::sql_query(
                 "SELECT id FROM task WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
             )
@@ -284,6 +313,7 @@ async fn handle_batch_with_counts(updates: &[Update], conn: &mut Conn<'_>) -> Re
             .execute(&mut *conn)
             .await?;
 
+            // 3. Counter UPDATE.
             diesel::sql_query(
                 "UPDATE task SET \
                     success = LEAST(task.success::bigint + batch.s, 2147483647), \
@@ -299,10 +329,62 @@ async fn handle_batch_with_counts(updates: &[Update], conn: &mut Conn<'_>) -> Re
             .execute(&mut *conn)
             .await?;
 
+            // 4. Charge adjust + slot decrement — only when step 1 found capacity slots.
+            //    The charge is MONOTONICALLY NON-INCREASING: `LEAST(old_charge, remaining)`
+            //    where remaining = expected - success - failures recomputed from the
+            //    now-updated counters (step 3). A PATCH that raised expected_count mid-run
+            //    does NOT raise the charge (same never-recompute-upward discipline as
+            //    release). `delta = old_charge - new_charge >= 0` is the amount to release
+            //    from each of the task's cap: slots. bigint arithmetic in the remaining
+            //    computation avoids an int4 underflow when success + failures is large.
+            //
+            //    Terminal-race safety: a task terminalized by a concurrent tx had its
+            //    charge released + NULLed there, so `capacity_charge > 0` excludes it; the
+            //    step-2 task FOR UPDATE lock serializes the two txs (both also lock the
+            //    cap: slots first, in the same sorted order — no deadlock).
+            if !cap_slots.is_empty() {
+                diesel::sql_query(
+                    "WITH adj AS ( \
+                        UPDATE task t \
+                        SET capacity_charge = GREATEST( \
+                                LEAST(t.capacity_charge::bigint, \
+                                      COALESCE(t.expected_count, 0)::bigint - t.success::bigint - t.failures::bigint), \
+                                0)::int \
+                        FROM (SELECT id, capacity_charge AS old_charge \
+                              FROM task WHERE id = ANY($1) AND capacity_charge > 0) s \
+                        WHERE t.id = s.id \
+                        RETURNING t.id, t.claimed_slot_keys, (s.old_charge - t.capacity_charge) AS delta \
+                     ), \
+                     key_deltas AS ( \
+                        SELECT k AS lock_key, SUM(delta)::int AS dec \
+                        FROM adj, unnest(claimed_slot_keys) AS k \
+                        WHERE k LIKE 'cap:%' AND delta > 0 \
+                        GROUP BY k \
+                     ) \
+                     UPDATE rule_slot rs SET used = GREATEST(rs.used - kd.dec, 0) \
+                     FROM key_deltas kd WHERE rs.lock_key = kd.lock_key",
+                )
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
+                .execute(&mut *conn)
+                .await?;
+            }
+
             Ok(())
         })
     })
     .await
+}
+
+/// Test/inspection entry: apply ONE batch of counter deltas through the real flush path
+/// (counter UPDATE + the D1/7.3b capacity-slot maintenance) in a single call, exactly as
+/// the steady-state updater loop does per drained batch. Exposed so integration tests can
+/// drive the capacity-slot delta deterministically without spinning the full loop or
+/// racing its flush interval. `updates` is `(task_id, +success, +failures)`.
+pub async fn run_counter_flush_once(
+    conn: &mut Conn<'_>,
+    updates: &[(uuid::Uuid, i32, i32)],
+) -> Result<(), DbError> {
+    handle_batch_with_counts(updates, conn).await
 }
 
 /// Apply counter update for a single task. Used by the per-row anti-poison

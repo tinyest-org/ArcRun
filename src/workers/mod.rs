@@ -8,7 +8,7 @@ mod start_loop;
 mod timeout_loop;
 pub(crate) mod webhooks;
 
-pub use batch_updater::{UpdateEvent, batch_updater};
+pub use batch_updater::{UpdateEvent, batch_updater, run_counter_flush_once};
 pub use delivery_loop::{DeliveryConfig, delivery_loop};
 pub use nudge::WorkerNudges;
 // Exposed for integration tests to drive outbox delivery deterministically (Lot 2).

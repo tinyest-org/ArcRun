@@ -69,6 +69,7 @@ fn task_for_claim(id: uuid::Uuid, kind: &str, metadata: serde_json::Value, rules
         dead_end_barrier: false,
         priority: 0,
         claimed_slot_keys: None,
+        capacity_charge: None,
     }
 }
 

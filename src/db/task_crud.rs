@@ -527,45 +527,45 @@ pub enum ClaimResult {
     AlreadyClaimed,
 }
 
-/// Re-export lock key functions from rule module for use by other crates/modules.
-pub(crate) use rule::capacity_lock_key;
+/// Re-export slot key functions from rule module for use by other crates/modules.
+pub(crate) use rule::capacity_slot_key;
 pub(crate) use rule::concurrency_slot_key;
 
 /// Pre-computed parameters for the rule-check-and-claim transaction.
 /// Built from a task's rules and metadata before entering the transaction,
 /// so no references to the Task are needed inside the closure.
 struct RuleQueryParams {
-    /// Concurrency slots (Audit 2, D1): `(canonical_key, threshold)` where the
-    /// threshold is the candidate rule's own `max_concurency`. Sorted by key and
-    /// deduped (BTreeMap): two rules of the same candidate producing the SAME key are
-    /// a single increment (keeping the MOST restrictive / lowest threshold), and the
-    /// sorted order gives every worker one canonical slot-lock acquisition order
-    /// (A9 deadlock discipline).
-    conc_slots: Vec<(String, i32)>,
-    /// Capacity advisory-lock keys (sorted, deduped). Capacity still uses the
-    /// advisory-lock + CTE-SUM mechanism (unchanged; 7.3b will revisit it).
-    cap_lock_keys: Vec<i64>,
-    // Capacity rule arrays (parallel arrays, one entry per rule)
-    cap_kinds: Vec<String>,
-    cap_meta_texts: Vec<String>,
-    cap_max_capacities: Vec<i64>,
+    /// Unified slot list (Audit 2, D1 / 7.3b): `(canonical_key, increment, threshold)`,
+    /// covering **both** Concurrency (`conc:` key, increment `1`, threshold
+    /// `max_concurency`) and Capacity (`cap:` key, increment = the task's capacity
+    /// **charge**, threshold `max_capacity`) rules. Sorted by key and deduped
+    /// (BTreeMap): two rules of the same candidate producing the SAME key collapse to a
+    /// single slot (keeping the MOST restrictive / lowest threshold), and the sorted
+    /// order gives every worker one canonical slot-lock acquisition order (A9 deadlock
+    /// discipline). `cap:` sorts before `conc:` lexicographically — consistent, so the
+    /// global slot-lock order stays well-defined across both prefixes.
+    slots: Vec<(String, i32, i32)>,
+    /// The capacity charge to persist in `task.capacity_charge` — `Some(charge)` when the
+    /// task has ≥1 Capacity rule (charge is task-level, identical for every `cap:` key),
+    /// `None` when it has none (column stays/goes NULL).
+    capacity_charge: Option<i32>,
 }
 
 impl RuleQueryParams {
     /// Build query parameters from a task's rules and metadata.
     /// Returns `Err(ClaimResult::RuleBlocked)` if a rule cannot be evaluated
-    /// (missing metadata field or missing expected_count for capacity).
+    /// (missing metadata field, missing expected_count for capacity, or a
+    /// non-positive `max_capacity`).
     fn from_task(t: &Task) -> Result<Self, ClaimResult> {
         let rules = &t.start_condition.0;
         let task_id = t.id;
 
         // BTreeMap: dedup by canonical key + deterministic (sorted) iteration order.
-        let mut conc_map: std::collections::BTreeMap<String, i32> =
+        // Value = (increment, threshold).
+        let mut slot_map: std::collections::BTreeMap<String, (i32, i32)> =
             std::collections::BTreeMap::new();
-        let mut cap_lock_keys: Vec<i64> = Vec::new();
-        let mut cap_kinds: Vec<String> = Vec::new();
-        let mut cap_meta_texts: Vec<String> = Vec::new();
-        let mut cap_max_capacities: Vec<i64> = Vec::new();
+        let mut has_capacity = false;
+        let mut capacity_charge: i32 = 0;
 
         for strategy in rules {
             match strategy {
@@ -588,19 +588,17 @@ impl RuleQueryParams {
                     // consumed it (claimed WITH a rule producing this key), and the
                     // candidate ALWAYS consumes it — so the candidate counts itself and
                     // the threshold is simply its own `max_concurency` (allow while
-                    // `used < max`). This replaces the old cross-kind `is_same_kind`
-                    // `+1` fudge, which existed only because the old COUNT(*) also
-                    // counted tasks that merely matched the matcher without carrying the
-                    // rule. See the module note on the semantic change.
+                    // `used < max`). Concurrency increments the slot by exactly 1.
                     let threshold = concurrency_rule.max_concurency;
-                    conc_map
+                    slot_map
                         .entry(key)
-                        .and_modify(|e| *e = (*e).min(threshold))
-                        .or_insert(threshold);
+                        .and_modify(|(_inc, thr)| *thr = (*thr).min(threshold))
+                        .or_insert((1, threshold));
                 }
                 Strategy::Capacity(capacity_rule) => {
-                    let m = match capacity_rule.matcher.extract_metadata_fields(&t.metadata) {
-                        Ok(m) => m,
+                    // Canonical `cap:` slot key. A missing required metadata field blocks.
+                    let key = match capacity_slot_key(capacity_rule, &t.metadata) {
+                        Ok(k) => k,
                         Err(field) => {
                             log::warn!(
                                 "Task {} missing metadata field '{}' required by capacity rule, blocking",
@@ -611,35 +609,62 @@ impl RuleQueryParams {
                         }
                     };
 
-                    // Candidate must have expected_count set
-                    if t.expected_count.is_none() {
+                    // Candidate must have expected_count set.
+                    let expected = match t.expected_count {
+                        Some(e) => e,
+                        None => {
+                            log::warn!(
+                                "Task {} has a Capacity rule but no expected_count, blocking",
+                                task_id,
+                            );
+                            return Err(ClaimResult::RuleBlocked);
+                        }
+                    };
+
+                    // Rust-side guard (7.3b): a non-positive `max_capacity` must block.
+                    // The conditional-upsert's fresh-INSERT arm has no `WHERE used < max`
+                    // check, so a brand-new slot would otherwise admit a candidate that
+                    // the old `sum(0) >= max_cap(0)` probe blocked. This guard preserves
+                    // the old admission semantics.
+                    if capacity_rule.max_capacity <= 0 {
                         log::warn!(
-                            "Task {} has a Capacity rule but no expected_count, blocking",
+                            "Task {} has a Capacity rule with non-positive max_capacity {}, blocking",
                             task_id,
+                            capacity_rule.max_capacity,
                         );
                         return Err(ClaimResult::RuleBlocked);
                     }
 
-                    let lock_key = capacity_lock_key(capacity_rule, &t.metadata);
-                    cap_lock_keys.push(lock_key);
-                    cap_kinds.push(capacity_rule.matcher.kind.clone());
-                    cap_meta_texts.push(m.to_string());
-                    cap_max_capacities.push(capacity_rule.max_capacity as i64);
+                    // Charge = the candidate's remaining work. i64 arithmetic avoids an
+                    // int overflow when success + failures exceeds i32::MAX; the clamped
+                    // result is <= expected_count, so it fits back into i32.
+                    let charge =
+                        (expected as i64 - t.success as i64 - t.failures as i64).max(0) as i32;
+                    has_capacity = true;
+                    capacity_charge = charge; // task-level, identical for every cap: key
+                    let threshold = capacity_rule.max_capacity;
+                    slot_map
+                        .entry(key)
+                        .and_modify(|(inc, thr)| {
+                            *inc = charge;
+                            *thr = (*thr).min(threshold);
+                        })
+                        .or_insert((charge, threshold));
                 }
             }
         }
 
-        // Sort + dedup capacity advisory keys for a consistent acquisition order.
-        cap_lock_keys.sort();
-        cap_lock_keys.dedup();
-
         Ok(RuleQueryParams {
             // BTreeMap iterates in ascending key order → already sorted + deduped.
-            conc_slots: conc_map.into_iter().collect(),
-            cap_lock_keys,
-            cap_kinds,
-            cap_meta_texts,
-            cap_max_capacities,
+            slots: slot_map
+                .into_iter()
+                .map(|(k, (inc, thr))| (k, inc, thr))
+                .collect(),
+            capacity_charge: if has_capacity {
+                Some(capacity_charge)
+            } else {
+                None
+            },
         })
     }
 }
@@ -671,20 +696,24 @@ impl From<DbError> for ClaimTxAbort {
 /// Atomically evaluate a task's rules and claim it (Pending -> Claimed) in ONE
 /// transaction.
 ///
-/// **Concurrency (Audit 2, D1):** each of the candidate's Concurrency rules maps to a
-/// `rule_slot` row. In sorted key order (A9 deadlock discipline) the claim increments
-/// each slot with a conditional upsert
-/// (`ON CONFLICT DO UPDATE SET used = used + 1 WHERE used < threshold RETURNING used`).
-/// A slot that returns no row is at its limit ⇒ the whole transaction rolls back
-/// (undoing earlier increments) ⇒ `RuleBlocked`. The row lock taken by the upsert (and
-/// the unique-index insert lock for a brand-new key) serializes concurrent claimers of
-/// the same slot, so the advisory-lock layer that Concurrency used before is gone. The
-/// consumed keys are persisted into `task.claimed_slot_keys` by the same claim UPDATE,
-/// so they can be released precisely later.
+/// **Concurrency + Capacity (Audit 2, D1 — 7.3a for Concurrency, 7.3b for Capacity):**
+/// each of the candidate's rules maps to a `rule_slot` row. In sorted key order (A9
+/// deadlock discipline) the claim increments each slot with a conditional upsert
+/// (`ON CONFLICT DO UPDATE SET used = used + $inc WHERE used < $threshold RETURNING used`):
+/// Concurrency increments by `1` against `max_concurency`; Capacity increments by the
+/// candidate's **charge** (`GREATEST(expected_count - success - failures, 0)`) against
+/// `max_capacity`. A slot that returns no row is at its limit ⇒ the whole transaction
+/// rolls back (undoing earlier increments) ⇒ `RuleBlocked`. The row lock taken by the
+/// upsert (and the unique-index insert lock for a brand-new key) serializes concurrent
+/// claimers of the same slot, so the advisory-lock + CTE-SUM layer Capacity used before
+/// is gone. The consumed keys are persisted into `task.claimed_slot_keys` and the charge
+/// into `task.capacity_charge` by the same claim UPDATE, so both can be released
+/// precisely later (release reads the stored charge — never recomputed).
 ///
-/// **Capacity:** unchanged — a `pg_advisory_xact_lock` per capacity key serializes the
-/// check-then-claim, then a CTE-SUM `cap_blocked` probe decides admission. (7.3b will
-/// migrate Capacity to a counter too.)
+/// Capacity admission semantics preserved: allowed iff **others' current sum <
+/// max_capacity** (the candidate's own charge is not counted in the check — the
+/// fresh-INSERT / `used < threshold` gate matches the old `sum >= max_cap` probe;
+/// overshoot when a large candidate lands on a near-full slot is allowed, as before).
 ///
 /// The final claim `UPDATE ... WHERE id = $ AND status = 'pending'` matching 0 rows
 /// (task already claimed) also rolls back ⇒ `AlreadyClaimed` (no slot consumed).
@@ -692,7 +721,8 @@ pub async fn claim_task_with_rules<'a>(
     conn: &mut Conn<'a>,
     t: &Task,
 ) -> Result<ClaimResult, DbError> {
-    // No rules — just do a plain claim (no slot, no advisory lock needed)
+    // No rules — just do a plain claim (no slot needed). A rule-less task never held a
+    // capacity charge (start_condition is immutable), so capacity_charge stays NULL.
     if t.start_condition.0.is_empty() {
         return match claim_task(conn, &t.id).await? {
             true => Ok(ClaimResult::Claimed),
@@ -708,76 +738,31 @@ pub async fn claim_task_with_rules<'a>(
     };
 
     let RuleQueryParams {
-        conc_slots,
-        cap_lock_keys,
-        cap_kinds,
-        cap_meta_texts,
-        cap_max_capacities,
+        slots,
+        capacity_charge,
     } = params;
 
     let tx: Result<(), ClaimTxAbort> = conn
         .transaction(async move |conn: &mut Conn<'a>| {
-            // 1. Capacity (unchanged mechanism): advisory-lock the capacity keys, then
-            //    run the CTE-SUM `cap_blocked` probe. Concurrency does NOT advisory-lock
-            //    anymore (the slot row lock replaces it).
-            if !cap_lock_keys.is_empty() {
-                diesel::sql_query("SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k")
-                    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&cap_lock_keys)
-                    .execute(&mut *conn)
-                    .await?;
-
-                #[derive(diesel::QueryableByName)]
-                struct OkRow {
-                    #[diesel(sql_type = diesel::sql_types::Bool)]
-                    ok: bool,
-                }
-                let row: OkRow = diesel::sql_query(
-                    r#"
-                    WITH cap_rules AS (
-                        SELECT ord, kind, meta_text, max_cap
-                        FROM unnest($1::text[], $2::text[], $3::bigint[])
-                        WITH ORDINALITY AS r(kind, meta_text, max_cap, ord)
-                    ),
-                    cap_blocked AS (
-                        SELECT r.ord
-                        FROM cap_rules r
-                        WHERE (
-                            SELECT COALESCE(SUM(GREATEST(COALESCE(t.expected_count, 0) - t.success - t.failures, 0)), 0)
-                            FROM task t
-                            WHERE t.kind = r.kind
-                              AND (t.status = 'running' OR t.status = 'claimed')
-                              AND t.metadata @> r.meta_text::jsonb
-                        ) >= r.max_cap
-                    )
-                    SELECT NOT EXISTS (SELECT 1 FROM cap_blocked) AS ok
-                    "#,
-                )
-                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&cap_kinds)
-                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&cap_meta_texts)
-                .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&cap_max_capacities)
-                .get_result(&mut *conn)
-                .await?;
-                if !row.ok {
-                    return Err(ClaimTxAbort::RuleBlocked);
-                }
-            }
-
-            // 2. Concurrency slots: conditional upsert per key, in sorted order.
-            //    No row returned ⇒ at limit ⇒ abort (rollback undoes earlier increments).
+            // 1. Slot upserts (Concurrency + Capacity unified): conditional upsert per
+            //    key, in sorted order. No row returned ⇒ at limit ⇒ abort (rollback
+            //    undoes earlier increments). `$2` = increment (1 for conc:, charge for
+            //    cap:), `$3` = threshold (max_concurency / max_capacity).
             #[derive(diesel::QueryableByName)]
             struct SlotUsed {
                 #[diesel(sql_type = diesel::sql_types::Integer)]
                 #[allow(dead_code)]
                 used: i32,
             }
-            for (key, threshold) in &conc_slots {
+            for (key, increment, threshold) in &slots {
                 let row: Option<SlotUsed> = diesel::sql_query(
-                    "INSERT INTO rule_slot AS rs (lock_key, used) VALUES ($1, 1)
-                     ON CONFLICT (lock_key) DO UPDATE SET used = rs.used + 1
-                     WHERE rs.used < $2
+                    "INSERT INTO rule_slot AS rs (lock_key, used) VALUES ($1, $2)
+                     ON CONFLICT (lock_key) DO UPDATE SET used = rs.used + $2
+                     WHERE rs.used < $3
                      RETURNING used",
                 )
                 .bind::<diesel::sql_types::Text, _>(key)
+                .bind::<diesel::sql_types::Integer, _>(*increment)
                 .bind::<diesel::sql_types::Integer, _>(*threshold)
                 .get_result::<SlotUsed>(&mut *conn)
                 .await
@@ -787,27 +772,23 @@ pub async fn claim_task_with_rules<'a>(
                 }
             }
 
-            // 3. Claim UPDATE, persisting the consumed slot keys.
-            let keys: Vec<String> = conc_slots.iter().map(|(k, _)| k.clone()).collect();
-            let claimed_rows = if keys.is_empty() {
-                // Capacity-only task: no slots to persist (claimed_slot_keys stays NULL).
-                use crate::schema::task::dsl::*;
-                use diesel::dsl::now;
-                diesel::update(task.filter(id.eq(task_id).and(status.eq(StatusKind::Pending))))
-                    .set((status.eq(StatusKind::Claimed), last_updated.eq(now)))
-                    .execute(&mut *conn)
-                    .await?
-            } else {
-                diesel::sql_query(
-                    "UPDATE task
-                     SET status = 'claimed', last_updated = now(), claimed_slot_keys = $2
-                     WHERE id = $1 AND status = 'pending'",
-                )
-                .bind::<diesel::sql_types::Uuid, _>(task_id)
-                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&keys)
-                .execute(&mut *conn)
-                .await?
-            };
+            // 2. Claim UPDATE, persisting the consumed slot keys AND the capacity charge.
+            //    A non-empty start_condition always yields ≥1 slot (every rule produces a
+            //    key or blocks), so `keys` is non-empty here. `capacity_charge` is bound
+            //    NULL when the task carries no Capacity rule (explicit, paranoia against a
+            //    stale value on a re-claim after release).
+            let keys: Vec<String> = slots.iter().map(|(k, _, _)| k.clone()).collect();
+            let claimed_rows = diesel::sql_query(
+                "UPDATE task
+                 SET status = 'claimed', last_updated = now(),
+                     claimed_slot_keys = $2, capacity_charge = $3
+                 WHERE id = $1 AND status = 'pending'",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&keys)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(capacity_charge)
+            .execute(&mut *conn)
+            .await?;
             if claimed_rows == 0 {
                 return Err(ClaimTxAbort::AlreadyClaimed);
             }
@@ -824,9 +805,17 @@ pub async fn claim_task_with_rules<'a>(
     }
 }
 
-/// Release the concurrency slots (Audit 2, D1) held by the given tasks. For every id
-/// in `task_ids` whose `claimed_slot_keys` is non-NULL, decrement `rule_slot.used`
-/// (clamped at 0) once per key it holds, then NULL its `claimed_slot_keys`.
+/// Release the concurrency + capacity slots (Audit 2, D1) held by the given tasks. For
+/// every id in `task_ids` whose `claimed_slot_keys` is non-NULL, decrement
+/// `rule_slot.used` (clamped at 0) by the amount that task contributed to each key — `1`
+/// for a `conc:` key, the task's stored `capacity_charge` for a `cap:` key — then NULL
+/// both `claimed_slot_keys` and `capacity_charge`.
+///
+/// The capacity charge is READ from the `capacity_charge` column (never recomputed:
+/// expected_count/metadata are mutable while Running, so recomputation could diverge and
+/// leak a slot). Progress flushed by the batch_updater has already shrunk the charge (and
+/// decremented the slot by the shrink), so releasing the *remaining* stored charge here
+/// exactly zeroes out this task's contribution.
 ///
 /// **Exactly-once / no double-release.** Callers pass the ids they just terminalized
 /// (or requeued). The `claimed_slot_keys IS NOT NULL` gate is what encodes "only a task
@@ -876,13 +865,14 @@ pub async fn release_slots_for_tasks<'a>(
     // aggregates the pre-NULL keys while `cleared` clears them and `slot_dec` decrements.
     diesel::sql_query(
         "WITH to_release AS (
-            SELECT id, claimed_slot_keys
+            SELECT id, claimed_slot_keys, capacity_charge
             FROM task
             WHERE id = ANY($1) AND claimed_slot_keys IS NOT NULL
             FOR UPDATE
          ),
          key_counts AS (
-            SELECT k AS lock_key, COUNT(*)::int AS cnt
+            SELECT k AS lock_key,
+                   SUM(CASE WHEN k LIKE 'cap:%' THEN COALESCE(capacity_charge, 0) ELSE 1 END)::int AS cnt
             FROM to_release, unnest(claimed_slot_keys) AS k
             GROUP BY k
          ),
@@ -895,7 +885,7 @@ pub async fn release_slots_for_tasks<'a>(
          ),
          cleared AS (
             UPDATE task
-            SET claimed_slot_keys = NULL
+            SET claimed_slot_keys = NULL, capacity_charge = NULL
             WHERE id IN (SELECT id FROM to_release)
             RETURNING id
          )

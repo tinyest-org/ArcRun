@@ -103,6 +103,7 @@ async fn make_running_consuming(
         dead_end_barrier: false,
         priority: 0,
         claimed_slot_keys: None,
+        capacity_charge: None,
     };
     let mut conn = state.pool.get().await.unwrap();
     assert_eq!(

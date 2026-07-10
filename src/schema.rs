@@ -91,6 +91,7 @@ diesel::table! {
         dead_end_barrier -> Bool,
         priority -> Int4,
         claimed_slot_keys -> Nullable<Array<Text>>,
+        capacity_charge -> Nullable<Int4>,
     }
 }
 

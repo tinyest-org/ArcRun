@@ -20,10 +20,16 @@ partiel B3, droppé), décrément groupé en-tx à chaque site terminal,
 `rule_slot` + `task.claimed_slot_keys` (libération aux 7 sites de sortie de
 Claimed/Running, dont requeue-stale), leader-lease advisory sur la
 start_loop (connexion dédiée, failover). Sémantique assumée : seuls les
-porteurs de la règle comptent dans le slot. **Suivant : 7.3b** (D1
-Capacity) : basculer les règles Capacity sur `rule_slot` — deltas de
-`remaining` poussés depuis le flush du batch_updater (décision actée
-Concurrency + Capacity d'emblée).
+porteurs de la règle comptent dans le slot. **7.3b (D1 Capacity) : FAIT**
+(2026-07-10) — Capacity sur `rule_slot` aussi : `task.capacity_charge`
+consommée au claim (upsert unifié conc+cap, garde `max_capacity <= 0`),
+rétrécie de façon monotone par le flush du batch_updater (pré-lock A9
+slots-avant-tasks), libérée par le release généralisé (`cap:` ⇒ charge
+stockée). Advisory + probe CTE-SUM supprimés ; divergence assumée : le
+PATCH compteur direct ne pousse pas de delta (sur-comptage conservateur,
+réconcilié au release). **Le périmètre décidé du Lot 7 (7.2 + 7.3) est
+TERMINÉ** ; 7.1 (API v1/HMAC), 7.4 (GET /work), 7.5 (split outbox)
+restent non décidés — ne rien lancer sans décision utilisateur.
 Détail et notes de relecture par item dans
 `docs/audits/AUDIT_2_FIXES.md`. Décisions actées : pause = Pending+Waiting,
 Running → 400 (4.5) ; doc metadata = replace, merge → Lot 7 (4.7) ; renversement

@@ -185,10 +185,24 @@ pub fn concurrency_slot_key(
     Ok(format!("conc:{payload}"))
 }
 
-/// Compute a deterministic i64 advisory lock key for a capacity rule and task metadata.
-/// Uses a "capacity" prefix to avoid collisions with concurrency lock keys.
-pub fn capacity_lock_key(rule: &CapacityRule, task_metadata: &serde_json::Value) -> i64 {
-    compute_lock_key(Some("capacity"), &rule.matcher, task_metadata)
+/// Compute the **canonical, collision-free textual** slot key (Audit 2, D1 / 7.3b) for
+/// a Capacity rule + task metadata. Mirrors [`concurrency_slot_key`] but with a distinct
+/// `cap:` prefix (vs `conc:`), so the two rule kinds can never share a `rule_slot` row
+/// even on an identical matcher. Same canonicality guarantees: a JSON-encoded tuple
+/// `cap:{"fields":<matched-fields>,"kind":<kind>,"status":<status>}` (serde_json's Map is
+/// a `BTreeMap` ⇒ sorted keys ⇒ canonical), injective under JSON escaping. `Err(field)`
+/// when a required metadata field is missing — the caller then blocks the claim.
+pub fn capacity_slot_key(
+    rule: &CapacityRule,
+    task_metadata: &serde_json::Value,
+) -> Result<String, String> {
+    let matched = rule.matcher.extract_metadata_fields(task_metadata)?;
+    let payload = json!({
+        "kind": rule.matcher.kind,
+        "status": rule.matcher.status,
+        "fields": matched,
+    });
+    Ok(format!("cap:{payload}"))
 }
 
 /// Compute a deterministic i64 advisory lock key for a dedupe matcher and task
@@ -218,5 +232,79 @@ impl FromSql<Jsonb, Pg> for Rules {
     fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
         let value = <serde_json::Value as FromSql<Jsonb, Pg>>::from_sql(bytes)?;
         Ok(serde_json::from_value(value)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matcher(kind: &str, fields: &[&str]) -> Matcher {
+        Matcher {
+            status: StatusKind::Running,
+            kind: kind.to_string(),
+            fields: fields.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// `capacity_slot_key` is canonical (stable, sorted-field JSON) and carries the
+    /// `cap:` prefix.
+    #[test]
+    fn capacity_slot_key_is_canonical_and_prefixed() {
+        let rule = CapacityRule {
+            max_capacity: 500,
+            matcher: matcher("cluster", &["b", "a"]),
+        };
+        let meta = json!({"a": 1, "b": 2, "ignored": 9});
+        let key = capacity_slot_key(&rule, &meta).unwrap();
+        assert!(key.starts_with("cap:"), "must carry the cap: prefix: {key}");
+        // Field order in the matcher does not change the key (extract uses matcher order,
+        // but serde_json::Map serializes its keys sorted, so both encode {"a":1,"b":2}).
+        let rule2 = CapacityRule {
+            max_capacity: 500,
+            matcher: matcher("cluster", &["a", "b"]),
+        };
+        assert_eq!(key, capacity_slot_key(&rule2, &meta).unwrap());
+    }
+
+    /// A Capacity key and a Concurrency key built from the SAME matcher+metadata differ
+    /// only by prefix — so the two rule kinds can never share a `rule_slot` row.
+    #[test]
+    fn capacity_and_concurrency_keys_are_prefix_distinct() {
+        let m = matcher("cluster", &["projectId"]);
+        let meta = json!({"projectId": 42});
+        let cap = capacity_slot_key(
+            &CapacityRule {
+                max_capacity: 10,
+                matcher: m.clone(),
+            },
+            &meta,
+        )
+        .unwrap();
+        let conc = concurrency_slot_key(
+            &ConcurencyRule {
+                max_concurency: 10,
+                matcher: m,
+            },
+            &meta,
+        )
+        .unwrap();
+        assert_ne!(cap, conc);
+        assert_eq!(
+            cap.strip_prefix("cap:").unwrap(),
+            conc.strip_prefix("conc:").unwrap(),
+            "same matcher payload, only the prefix differs"
+        );
+    }
+
+    /// A missing required metadata field is an `Err(field)` — the caller blocks the claim.
+    #[test]
+    fn capacity_slot_key_errors_on_missing_field() {
+        let rule = CapacityRule {
+            max_capacity: 10,
+            matcher: matcher("cluster", &["projectId"]),
+        };
+        let err = capacity_slot_key(&rule, &json!({"other": 1})).unwrap_err();
+        assert_eq!(err, "projectId");
     }
 }

@@ -35,6 +35,13 @@ pub struct Task {
     /// `None` = the task holds no concurrency slots. NEVER recomputed from `metadata`
     /// (which is mutable while Running) — always read back from this column.
     pub claimed_slot_keys: Option<Vec<String>>,
+    /// Outstanding **capacity charge** (Audit 2, D1 / 7.3b) this task currently
+    /// contributes to each of its `cap:` slot keys. Set at claim time to
+    /// `GREATEST(expected_count - success - failures, 0)`, shrunk as progress is
+    /// flushed (batch_updater), read back at release (NEVER recomputed — expected_count
+    /// is mutable while Running), and NULLed on release. `None` = holds no capacity
+    /// charge (never claimed through a Capacity rule, or already released).
+    pub capacity_charge: Option<i32>,
 }
 
 #[derive(Identifiable, Queryable, Associations, Selectable, PartialEq)]

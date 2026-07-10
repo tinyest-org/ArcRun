@@ -35,6 +35,7 @@ fn make_task_for_claim(
         dead_end_barrier: false,
         priority: 0,
         claimed_slot_keys: None,
+        capacity_charge: None,
     }
 }
 
@@ -411,25 +412,8 @@ fn make_task_for_claim_with_expected(
         dead_end_barrier: false,
         priority: 0,
         claimed_slot_keys: None,
+        capacity_charge: None,
     }
-}
-
-/// Helper: directly set success/failures counters on a task via raw SQL.
-async fn set_task_counters(
-    pool: &arcrun::DbPool,
-    task_id: uuid::Uuid,
-    success: i32,
-    failures: i32,
-) {
-    use diesel_async::RunQueryDsl;
-    let mut conn = pool.get().await.unwrap();
-    diesel::sql_query("UPDATE task SET success = $1, failures = $2 WHERE id = $3")
-        .bind::<diesel::sql_types::Integer, _>(success)
-        .bind::<diesel::sql_types::Integer, _>(failures)
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
 }
 
 // =============================================================================
@@ -729,15 +713,20 @@ async fn test_capacity_accounts_for_progress() {
         "sum=600 >= 500, should be blocked"
     );
 
-    // Simulate progress: task 1 completed 200 items (remaining = 600 - 200 = 400)
-    set_task_counters(&state.pool, id1, 200, 0).await;
+    // Simulate progress THROUGH THE REAL FLUSH PATH: task 1 completed 200 items. Under
+    // D1/7.3b the capacity slot is a claim-time charge counter — raw-SQL counter writes no
+    // longer influence it; only the batch_updater flush pushes progress onto the slot,
+    // shrinking task 1's capacity_charge 600 -> 400 and rule_slot.used 600 -> 400.
+    arcrun::workers::run_counter_flush_once(&mut conn, &[(id1, 200, 0)])
+        .await
+        .unwrap();
 
-    // Now sum=400 < 500 → candidate should be allowed
+    // Now the slot reflects remaining 400 < 500 → candidate should be allowed
     let result3 = claim_task_with_rules(&mut conn, &t2).await.unwrap();
     assert_eq!(
         result3,
         ClaimResult::Claimed,
-        "After progress, sum=400 < 500, should be allowed"
+        "After flushed progress, sum=400 < 500, should be allowed"
     );
 }
 
@@ -836,6 +825,12 @@ async fn test_capacity_requires_running_status() {
 }
 
 /// Running tasks with expected_count = 0 or NULL contribute 0 remaining capacity.
+///
+/// Under D1/7.3b semantics this holds for two reasons that both point the same way: the
+/// two holders are claimed rule-less (`rules_empty`), so they do not occupy the `cap:`
+/// slot at all (only tasks that claim THROUGH the rule count — the assumed D1 semantic
+/// change), and a 0/NULL-expected task would in any case carry a charge of 0. Either way
+/// the candidate is admitted.
 #[tokio::test]
 async fn test_capacity_zero_or_null_expected_count_contributes_zero() {
     let (_g, state) = setup_test_app().await;
