@@ -844,6 +844,153 @@ async fn test_cleanup_spares_batch_with_pending_signal() {
     let _ = shutdown_server.send(());
 }
 
+/// Batch enrichment is computed from hot task rows at delivery time. Retention must
+/// therefore preserve every old terminal member while the batch_complete signal is
+/// still queued, even if that member's own task-level outbox row is already gone.
+#[tokio::test]
+async fn test_cleanup_spares_terminal_members_until_batch_signal_is_delivered() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits);
+
+    let body = json!({
+        "tasks": [task_json("member", "Member", "retention-batch")],
+        "on_batch_complete": [
+            {"kind": "Webhook", "params": {"url": webhook_url, "verb": "Post"}}
+        ]
+    });
+    let (status, batch_id) = post_body(&app, &body).await;
+    assert_eq!(status, actix_web::http::StatusCode::CREATED);
+    let batch_id = batch_id.unwrap();
+
+    #[derive(diesel::QueryableByName)]
+    struct IdRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
+    let mut conn = state.pool.get().await.unwrap();
+    let member: IdRow = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query("SELECT id FROM task WHERE batch_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(batch_id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    succeed_task(&state, member.id).await;
+
+    let mut conn = state.pool.get().await.unwrap();
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query("DELETE FROM webhook_outbox WHERE task_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(member.id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query("UPDATE task SET ended_at = now() - interval '40 days' WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(member.id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    let moved = arcrun::db_operation::cleanup_old_terminal_tasks(&mut conn, 30, 100)
+        .await
+        .unwrap();
+    assert_eq!(moved, 0);
+
+    let still_hot: IdRow = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query("SELECT id FROM task WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(member.id),
+        &mut *conn,
+    )
+    .await
+    .expect("batch member remains available for completion stats");
+    assert_eq!(still_hot.id, member.id);
+    assert_eq!(
+        batch_outbox_count(&state.pool, batch_id, "pending").await,
+        1
+    );
+
+    let _ = shutdown_server.send(());
+}
+
+/// The protection starts before the signal exists: an old completed member of a
+/// still-active batch is part of the future completion counts and must remain hot.
+#[tokio::test]
+async fn test_cleanup_spares_old_member_while_batch_is_still_active() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (webhook_url, shutdown_server) = spawn_webhook_server(hits);
+
+    let body = json!({
+        "tasks": [
+            task_json("done", "Done", "active-retention"),
+            task_json("pending", "Pending", "active-retention")
+        ],
+        "on_batch_complete": [
+            {"kind": "Webhook", "params": {"url": webhook_url, "verb": "Post"}}
+        ]
+    });
+    let (status, batch_id) = post_body(&app, &body).await;
+    assert_eq!(status, actix_web::http::StatusCode::CREATED);
+    let batch_id = batch_id.unwrap();
+
+    #[derive(diesel::QueryableByName)]
+    struct IdRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
+    let mut conn = state.pool.get().await.unwrap();
+    let done: IdRow = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query("SELECT id FROM task WHERE batch_id = $1 AND name = 'Done'")
+            .bind::<diesel::sql_types::Uuid, _>(batch_id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    succeed_task(&state, done.id).await;
+
+    let mut conn = state.pool.get().await.unwrap();
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query("DELETE FROM webhook_outbox WHERE task_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(done.id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query("UPDATE task SET ended_at = now() - interval '40 days' WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(done.id),
+        &mut *conn,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        arcrun::db_operation::cleanup_old_terminal_tasks(&mut conn, 30, 100)
+            .await
+            .unwrap(),
+        0
+    );
+    let kept: IdRow = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query("SELECT id FROM task WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(done.id),
+        &mut *conn,
+    )
+    .await
+    .expect("old member remains until the batch completes");
+    assert_eq!(kept.id, done.id);
+    assert_eq!(
+        batch_outbox_count(&state.pool, batch_id, "pending").await,
+        0
+    );
+
+    let _ = shutdown_server.send(());
+}
+
 /// D3 backstop: once a batch_complete signal has been DELIVERED (its queue row removed
 /// and a `success` history row written), a re-signal of the same batch must NOT
 /// re-enqueue it. With the pre-D3 single table, a double `stop_batch`/re-signal was
@@ -952,6 +1099,21 @@ async fn test_batch_complete_ssrf_validation() {
         actix_web::http::StatusCode::BAD_REQUEST,
         "invalid on_batch_complete webhook URL is rejected"
     );
+}
+
+/// Batch-level webhooks share the same bounded action budget as task-level hooks.
+#[tokio::test]
+async fn test_batch_complete_action_count_is_bounded() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+    let actions: Vec<_> = (0..21).map(|_| webhook_action()).collect();
+    let body = json!({
+        "tasks": [task_json("a", "A", "action-limit")],
+        "on_batch_complete": actions
+    });
+
+    let (status, _) = post_body(&app, &body).await;
+    assert_eq!(status, actix_web::http::StatusCode::BAD_REQUEST);
 }
 
 // ============================================================================

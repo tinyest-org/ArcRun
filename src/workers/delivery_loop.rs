@@ -34,7 +34,7 @@
 //!    NOT roll back already-posted marks (the old single-tx design's flaw); the lease
 //!    re-delivers, which is fine under at-least-once.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use actix_web::rt;
 use diesel::prelude::*;
@@ -82,6 +82,9 @@ pub async fn delivery_loop(
     mut shutdown: watch::Receiver<bool>,
     nudges: WorkerNudges,
 ) {
+    const BACKLOG_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+    let mut last_backlog_sample = Instant::now() - BACKLOG_SAMPLE_INTERVAL;
+
     loop {
         let loop_start = std::time::Instant::now();
         if let Ok(mut conn) = pool.get().await {
@@ -91,16 +94,18 @@ pub async fn delivery_loop(
                 Err(e) => log::error!("Delivery worker: error draining outbox: {:?}", e),
             }
 
-            // Snapshot the outbox backlog (depth + oldest-mature age). A single
-            // indexed scan per iteration — reveals a growing backlog or a stuck row,
-            // neither of which the per-delivery lag histogram can show.
-            match db_operation::outbox_backlog_stats(&mut conn).await {
-                Ok(stats) => metrics::set_webhook_outbox_backlog(
-                    stats.ready,
-                    stats.leased,
-                    stats.oldest_ready_age_secs,
-                ),
-                Err(e) => log::warn!("Delivery worker: outbox backlog stats failed: {:?}", e),
+            // Nudges can make this loop run many times per second. Backlog gauges do
+            // not need request-path freshness, so cap the aggregate scan frequency.
+            if last_backlog_sample.elapsed() >= BACKLOG_SAMPLE_INTERVAL {
+                match db_operation::outbox_backlog_stats(&mut conn).await {
+                    Ok(stats) => metrics::set_webhook_outbox_backlog(
+                        stats.ready,
+                        stats.leased,
+                        stats.oldest_ready_age_secs,
+                    ),
+                    Err(e) => log::warn!("Delivery worker: outbox backlog stats failed: {:?}", e),
+                }
+                last_backlog_sample = Instant::now();
             }
         } else {
             log::error!("Delivery worker: failed to acquire DB connection");
@@ -155,8 +160,8 @@ pub async fn run_delivery_once<'a>(
     // Phase 2 — prefetch delivery inputs (autocommit reads). Fast-path marks are
     // collected separately so they don't need an HTTP round-trip.
     let mut plans: Vec<DeliveryPlan> = Vec::with_capacity(claimed.len());
-    for row in claimed {
-        match prepare_row(conn, row).await? {
+    for prepared in prepare_rows(conn, claimed).await? {
+        match prepared {
             Prepared::Mark(mark) => apply_mark(conn, mark).await,
             Prepared::Deliver(plan) => plans.push(plan),
         }
@@ -186,22 +191,39 @@ enum Prepared {
     Deliver(DeliveryPlan),
 }
 
+#[derive(diesel::QueryableByName)]
+struct BatchStatsRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    batch_id: uuid::Uuid,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    success: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    failure: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    canceled: i64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// What to do with an outbox row's `status` after preparing/delivering it. Owns its
 /// data so it can be applied without any borrow of the original row.
 enum MarkAction {
     Success {
         key: String,
+        lease_token: uuid::Uuid,
         lag: Option<f64>,
         label: &'static str,
     },
     Retry {
         key: String,
+        lease_token: uuid::Uuid,
         error: String,
         backoff: i64,
         label: &'static str,
     },
     Exhausted {
         key: String,
+        lease_token: uuid::Uuid,
         error: String,
         label: &'static str,
     },
@@ -210,6 +232,7 @@ enum MarkAction {
 /// Everything needed to deliver one outbox row's HTTP, owned (no DB borrow).
 struct DeliveryPlan {
     key: String,
+    lease_token: uuid::Uuid,
     trigger_label: &'static str,
     /// Prior failed-attempt count (for backoff/exhaustion decisions).
     attempts: i32,
@@ -236,25 +259,127 @@ struct DeliveryOutcome {
     mark: MarkAction,
 }
 
-/// Phase 2 helper: prefetch a row's delivery inputs and resolve fast-paths.
-async fn prepare_row<'a>(
+/// Phase 2 helper: bulk-load all delivery inputs, then resolve each row's fast-path.
+/// This keeps the DB work bounded to four queries per claimed page (tasks, actions,
+/// batches, batch stats), instead of two queries per outbox row.
+async fn prepare_rows<'a>(
     conn: &mut Conn<'a>,
-    row: WebhookOutbox,
-) -> Result<Prepared, db_operation::DbError> {
-    if row.trigger == TriggerKind::BatchComplete {
-        return prepare_batch_complete_row(conn, row).await;
+    rows: Vec<WebhookOutbox>,
+) -> Result<Vec<Prepared>, db_operation::DbError> {
+    use crate::schema::action::dsl as action_dsl;
+    use crate::schema::batch::dsl as batch_dsl;
+    use crate::schema::task::dsl as task_dsl;
+
+    let task_ids: Vec<uuid::Uuid> = rows
+        .iter()
+        .filter(|row| row.trigger != TriggerKind::BatchComplete)
+        .filter_map(|row| row.task_id)
+        .collect();
+    let batch_ids: Vec<uuid::Uuid> = rows
+        .iter()
+        .filter(|row| row.trigger == TriggerKind::BatchComplete)
+        .filter_map(|row| row.batch_id)
+        .collect();
+
+    let tasks = if task_ids.is_empty() {
+        Vec::new()
+    } else {
+        task_dsl::task
+            .filter(task_dsl::id.eq_any(&task_ids))
+            .load::<Task>(conn)
+            .await?
+    };
+    let actions = if task_ids.is_empty() {
+        Vec::new()
+    } else {
+        action_dsl::action
+            .filter(action_dsl::task_id.eq_any(&task_ids))
+            .load::<Action>(conn)
+            .await?
+    };
+    let batch_payloads: Vec<(uuid::Uuid, serde_json::Value)> = if batch_ids.is_empty() {
+        Vec::new()
+    } else {
+        batch_dsl::batch
+            .filter(batch_dsl::id.eq_any(&batch_ids))
+            .select((batch_dsl::id, batch_dsl::on_complete))
+            .load(conn)
+            .await?
+    };
+
+    let batch_stats: Vec<BatchStatsRow> = if batch_ids.is_empty() {
+        Vec::new()
+    } else {
+        diesel::sql_query(
+            "SELECT batch_id,
+                    COUNT(*) FILTER (WHERE status = 'success') AS success,
+                    COUNT(*) FILTER (WHERE status = 'failure') AS failure,
+                    COUNT(*) FILTER (WHERE status = 'canceled') AS canceled,
+                    MAX(ended_at) AS completed_at
+             FROM task
+             WHERE batch_id = ANY($1)
+             GROUP BY batch_id",
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&batch_ids)
+        .load(conn)
+        .await?
+    };
+
+    let tasks_by_id: HashMap<_, _> = tasks.into_iter().map(|task| (task.id, task)).collect();
+    let mut actions_by_task: HashMap<uuid::Uuid, Vec<Action>> = HashMap::new();
+    for action in actions {
+        actions_by_task
+            .entry(action.task_id)
+            .or_default()
+            .push(action);
     }
-    prepare_task_row(conn, row).await
+    let payloads_by_batch: HashMap<_, _> = batch_payloads.into_iter().collect();
+    let stats_by_batch: HashMap<_, _> = batch_stats
+        .into_iter()
+        .map(|stats| (stats.batch_id, stats))
+        .collect();
+
+    let mut prepared = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.trigger == TriggerKind::BatchComplete {
+            let payload = row
+                .batch_id
+                .and_then(|id| payloads_by_batch.get(&id).cloned());
+            let stats = row.batch_id.and_then(|id| stats_by_batch.get(&id));
+            prepared.push(prepare_batch_complete_row(row, payload, stats)?);
+        } else {
+            let task = row.task_id.and_then(|id| tasks_by_id.get(&id).cloned());
+            let actions = row
+                .task_id
+                .and_then(|id| actions_by_task.get(&id))
+                .map(|actions| {
+                    actions
+                        .iter()
+                        .filter(|action| {
+                            action.trigger == row.trigger && action.condition == row.condition
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            prepared.push(prepare_task_row(row, task, actions)?);
+        }
+    }
+    Ok(prepared)
 }
 
-async fn prepare_task_row<'a>(
-    conn: &mut Conn<'a>,
+fn prepare_task_row(
     row: WebhookOutbox,
+    task: Option<Task>,
+    actions: Vec<Action>,
 ) -> Result<Prepared, db_operation::DbError> {
-    use crate::schema::action::dsl::{condition as a_condition, trigger as a_trigger};
-    use crate::schema::task::dsl::{id as task_id_col, task as task_tbl};
-
     let key = row.idempotency_key.clone();
+    let lease_token = row.lease_token.ok_or_else(|| {
+        crate::error::ArcRunError::Internal(format!(
+            "claimed outbox row {} has no lease token",
+            row.id
+        ))
+    })?;
     let label = trigger_label(row.trigger, row.condition);
 
     let Some(row_task_id) = row.task_id else {
@@ -264,16 +389,11 @@ async fn prepare_task_row<'a>(
         );
         return Ok(Prepared::Mark(MarkAction::Success {
             key,
+            lease_token,
             lag: None,
             label,
         }));
     };
-
-    let task: Option<Task> = task_tbl
-        .filter(task_id_col.eq(row_task_id))
-        .first::<Task>(conn)
-        .await
-        .optional()?;
 
     let Some(task) = task else {
         log::warn!(
@@ -283,22 +403,18 @@ async fn prepare_task_row<'a>(
         );
         return Ok(Prepared::Mark(MarkAction::Success {
             key,
+            lease_token,
             lag: None,
             label,
         }));
     };
-
-    let actions = Action::belonging_to(&task)
-        .filter(a_trigger.eq(row.trigger))
-        .filter(a_condition.eq(row.condition))
-        .load::<Action>(conn)
-        .await?;
 
     // No matching actions: nothing to deliver. Mark success immediately (documented
     // design choice — we enqueue unconditionally to keep the transition tx minimal).
     if actions.is_empty() {
         return Ok(Prepared::Mark(MarkAction::Success {
             key,
+            lease_token,
             lag: Some(lag_secs(row.created_at)),
             label,
         }));
@@ -315,6 +431,7 @@ async fn prepare_task_row<'a>(
 
     Ok(Prepared::Deliver(DeliveryPlan {
         key,
+        lease_token,
         trigger_label: label,
         attempts: row.attempts,
         created_at: row.created_at,
@@ -326,11 +443,18 @@ async fn prepare_task_row<'a>(
     }))
 }
 
-async fn prepare_batch_complete_row<'a>(
-    conn: &mut Conn<'a>,
+fn prepare_batch_complete_row(
     row: WebhookOutbox,
+    on_complete: Option<serde_json::Value>,
+    stats: Option<&BatchStatsRow>,
 ) -> Result<Prepared, db_operation::DbError> {
     let key = row.idempotency_key.clone();
+    let lease_token = row.lease_token.ok_or_else(|| {
+        crate::error::ArcRunError::Internal(format!(
+            "claimed outbox row {} has no lease token",
+            row.id
+        ))
+    })?;
     let label = "batch_complete";
 
     let Some(batch_id) = row.batch_id else {
@@ -340,12 +464,12 @@ async fn prepare_batch_complete_row<'a>(
         );
         return Ok(Prepared::Mark(MarkAction::Success {
             key,
+            lease_token,
             lag: None,
             label,
         }));
     };
 
-    let on_complete = db_operation::load_batch_on_complete(conn, batch_id).await?;
     let Some(on_complete) = on_complete else {
         log::warn!(
             "Delivery worker: batch {} for outbox key {} no longer exists; marking success",
@@ -354,6 +478,7 @@ async fn prepare_batch_complete_row<'a>(
         );
         return Ok(Prepared::Mark(MarkAction::Success {
             key,
+            lease_token,
             lag: None,
             label,
         }));
@@ -371,6 +496,7 @@ async fn prepare_batch_complete_row<'a>(
             );
             return Ok(Prepared::Mark(MarkAction::Exhausted {
                 key,
+                lease_token,
                 error: format!("malformed payload: {}", e),
                 label,
             }));
@@ -380,20 +506,22 @@ async fn prepare_batch_complete_row<'a>(
     if actions.is_empty() {
         return Ok(Prepared::Mark(MarkAction::Success {
             key,
+            lease_token,
             lag: Some(lag_secs(row.created_at)),
             label,
         }));
     }
 
     // Compute counts + completed_at at delivery time.
-    let stats = db_operation::batch_completion_stats(conn, batch_id).await?;
-    let completed_at = stats.completed_at.unwrap_or(row.updated_at);
+    let completed_at = stats
+        .and_then(|stats| stats.completed_at)
+        .unwrap_or(row.updated_at);
     let enrichment = serde_json::json!({
         "batch_id": batch_id,
         "counts": {
-            "success": stats.success,
-            "failure": stats.failure,
-            "canceled": stats.canceled,
+            "success": stats.map_or(0, |stats| stats.success),
+            "failure": stats.map_or(0, |stats| stats.failure),
+            "canceled": stats.map_or(0, |stats| stats.canceled),
         },
         "completed_at": completed_at,
         "trigger": "batch_complete",
@@ -401,6 +529,7 @@ async fn prepare_batch_complete_row<'a>(
 
     Ok(Prepared::Deliver(DeliveryPlan {
         key,
+        lease_token,
         trigger_label: label,
         attempts: row.attempts,
         created_at: row.created_at,
@@ -419,6 +548,7 @@ async fn deliver_plan(
 ) -> DeliveryOutcome {
     let DeliveryPlan {
         key,
+        lease_token,
         trigger_label,
         attempts,
         created_at,
@@ -472,6 +602,7 @@ async fn deliver_plan(
         return DeliveryOutcome {
             mark: MarkAction::Success {
                 key,
+                lease_token,
                 lag: Some(lag_secs(created_at)),
                 label: trigger_label,
             },
@@ -492,6 +623,7 @@ async fn deliver_plan(
         DeliveryOutcome {
             mark: MarkAction::Exhausted {
                 key,
+                lease_token,
                 error: error_msg,
                 label: trigger_label,
             },
@@ -501,6 +633,7 @@ async fn deliver_plan(
         DeliveryOutcome {
             mark: MarkAction::Retry {
                 key,
+                lease_token,
                 error: error_msg,
                 backoff,
                 label: trigger_label,
@@ -514,52 +647,70 @@ async fn deliver_plan(
 /// back marks already posted for other rows in the batch.
 async fn apply_mark<'a>(conn: &mut Conn<'a>, mark: MarkAction) {
     let (result, mark_label) = match &mark {
-        MarkAction::Success { key, lag, label } => {
-            if let Some(lag) = lag {
-                metrics::record_webhook_delivery_lag(*lag);
-            }
-            let r = db_operation::mark_outbox_success(conn, key).await;
-            if r.is_ok() {
+        MarkAction::Success {
+            key,
+            lease_token,
+            lag,
+            label,
+        } => {
+            let r = db_operation::mark_outbox_success(conn, key, *lease_token).await;
+            if matches!(r, Ok(true)) {
+                if let Some(lag) = lag {
+                    metrics::record_webhook_delivery_lag(*lag);
+                }
                 metrics::record_webhook_delivery_success(label);
             }
             (r, "success")
         }
         MarkAction::Retry {
             key,
+            lease_token,
             error,
             backoff,
             label,
         } => {
-            let r = db_operation::mark_outbox_retry(conn, key, error, *backoff).await;
-            if r.is_ok() {
+            let r = db_operation::mark_outbox_retry(conn, key, *lease_token, error, *backoff).await;
+            if matches!(r, Ok(true)) {
                 metrics::record_webhook_delivery_retry(label);
             }
             (r, "retry")
         }
-        MarkAction::Exhausted { key, error, label } => {
-            let r = db_operation::mark_outbox_exhausted(conn, key, error).await;
-            if r.is_ok() {
+        MarkAction::Exhausted {
+            key,
+            lease_token,
+            error,
+            label,
+        } => {
+            let r = db_operation::mark_outbox_exhausted(conn, key, *lease_token, error).await;
+            if matches!(r, Ok(true)) {
                 metrics::record_webhook_delivery_exhausted(label);
             }
             (r, "exhausted")
         }
     };
 
-    if let Err(e) = result {
-        // Previously swallowed silently (M2): count it so a mark that fails in a loop
-        // is visible without grepping logs. The lease re-delivers (at-least-once).
-        metrics::record_webhook_mark_failure(mark_label);
-        let key = match &mark {
-            MarkAction::Success { key, .. }
-            | MarkAction::Retry { key, .. }
-            | MarkAction::Exhausted { key, .. } => key,
-        };
-        log::error!(
-            "Delivery worker: failed to post outbox mark for key {} ({:?}); \
-             lease will re-deliver",
-            key,
-            e
-        );
+    let key = match &mark {
+        MarkAction::Success { key, .. }
+        | MarkAction::Retry { key, .. }
+        | MarkAction::Exhausted { key, .. } => key,
+    };
+    match result {
+        Err(e) => {
+            // A DB failure leaves the leased row in place; it will mature and retry.
+            metrics::record_webhook_mark_failure(mark_label);
+            log::error!(
+                "Delivery worker: failed to post outbox mark for key {} ({:?}); \
+                 lease will re-deliver",
+                key,
+                e
+            );
+        }
+        Ok(false) => log::debug!(
+            "Delivery worker: ignored stale {} mark for key {} (lease was reclaimed)",
+            mark_label,
+            key
+        ),
+        Ok(true) => {}
     }
 }
 

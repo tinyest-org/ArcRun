@@ -165,6 +165,7 @@ diesel::table! {
         updated_at -> Timestamptz,
         next_attempt_at -> Timestamptz,
         last_error -> Nullable<Text>,
+        lease_token -> Nullable<Uuid>,
     }
 }
 

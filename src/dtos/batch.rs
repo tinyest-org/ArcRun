@@ -90,7 +90,7 @@ pub struct BatchFilterDto {
     pub search: Option<String>,
 }
 
-/// Payload for updating concurrency/capacity rules on non-terminal tasks in a batch,
+/// Payload for updating concurrency/capacity rules on Waiting/Pending/Paused tasks in a batch,
 /// filtered by task kind.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateBatchRulesDto {
@@ -108,7 +108,7 @@ pub struct UpdateBatchRulesResponseDto {
     pub batch_id: uuid::Uuid,
     /// The task kind that was targeted.
     pub kind: String,
-    /// Number of tasks whose rules were updated.
+    /// Number of not-yet-active tasks whose rules were updated.
     pub updated_count: i64,
 }
 

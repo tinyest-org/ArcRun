@@ -25,6 +25,7 @@ reqwest = { version = "0.13", features = [
     "json",
     "query",
     "rustls",
+    "stream",
 ], default-features = false }
 diesel-derive-enum = { version = "3.0.0-beta.1", features = [
     "postgres",

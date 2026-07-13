@@ -13,16 +13,19 @@ use diesel::BelongingToDsl;
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 /// In order to cache results and avoid too many db calls.
-/// Uses lock keys (i64) instead of Strategy to ensure metadata-sensitive caching:
-/// two tasks with the same rule but different metadata values get different lock keys.
+/// Uses canonical slot keys plus the proven saturated threshold, so metadata and
+/// candidate-specific limits are both represented without hash collisions.
 struct EvaluationContext {
-    ko: HashSet<i64>,
+    /// For each canonical Concurrency slot, the greatest threshold at which the DB
+    /// proved `used >= threshold` during this iteration. A later candidate is safely
+    /// skippable only when its own threshold is <= this value.
+    ko: HashMap<String, i32>,
 }
 
 /// Outcome of `start_task_phase_a` — the connection-holding preamble of on_start
@@ -311,7 +314,7 @@ async fn claim_phase(pool: &DbPool, claim_cap: i64) -> Vec<Task> {
 /// Early stop is gated on `claimed >= claim_cap` (we stop because we have work, not
 /// blindly). A short (incomplete) page means the backlog is exhausted -> stop.
 pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: i64) -> Vec<Task> {
-    let mut ctx = EvaluationContext { ko: HashSet::new() };
+    let mut ctx = EvaluationContext { ko: HashMap::new() };
     let mut claimed: Vec<Task> = Vec::new();
     let mut cursor: Option<db_operation::PendingCursor> = None;
     let mut pages_scanned: usize = 0;
@@ -368,34 +371,31 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
                 continue;
             }
 
-            match db_operation::claim_task_with_rules(conn, &t).await {
-                Ok(db_operation::ClaimResult::Claimed) => {
+            match db_operation::claim_task_with_rules_detailed(conn, &t).await {
+                Ok(outcome) if outcome.result == db_operation::ClaimResult::Claimed => {
                     metrics::record_status_transition("Pending", "Claimed");
                     claimed.push(t);
                     if claim_cap > 0 && claimed.len() as i64 >= claim_cap {
                         break 'pages;
                     }
                 }
-                Ok(db_operation::ClaimResult::RuleBlocked) => {
-                    // Cache the blocked lock keys for this iteration so subsequent
-                    // tasks with the same rule+metadata combo are skipped without a DB call.
-                    // Only cache Concurency keys; Capacity sums change with task progress
-                    // and cannot be reliably cached within a loop iteration.
-                    for strategy in &t.start_condition.0 {
-                        match strategy {
-                            Strategy::Concurency(rule) => {
-                                let key = db_operation::concurrency_lock_key(rule, &t.metadata);
-                                ctx.ko.insert(key);
-                            }
-                            Strategy::Capacity(_) => {
-                                // Skip: capacity sum depends on live progress, can't cache
-                            }
-                        }
+                Ok(outcome) if outcome.result == db_operation::ClaimResult::RuleBlocked => {
+                    // Cache ONLY the exact Concurrency slot whose conditional upsert
+                    // returned no row. A Capacity rejection (or another rule on a mixed
+                    // task) carries no concurrency detail and therefore cannot poison the
+                    // prefilter. Keep the greatest proven-blocked threshold: if used >= T,
+                    // candidates with threshold <= T are blocked, but a higher threshold
+                    // must still reach the DB.
+                    if let Some(blocked) = outcome.blocked_concurrency {
+                        ctx.ko
+                            .entry(blocked.key)
+                            .and_modify(|t| *t = (*t).max(blocked.threshold))
+                            .or_insert(blocked.threshold);
                     }
                     metrics::record_task_blocked_by_concurrency();
                     log::debug!("Start worker: task {} blocked by concurrency rule", t.id);
                 }
-                Ok(db_operation::ClaimResult::AlreadyClaimed) => {
+                Ok(outcome) if outcome.result == db_operation::ClaimResult::AlreadyClaimed => {
                     log::debug!(
                         "Start worker: task {} already claimed by another worker",
                         t.id
@@ -404,6 +404,7 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
                 Err(e) => {
                     log::error!("Start worker: failed to claim task {}: {:?}", t.id, e);
                 }
+                Ok(_) => unreachable!("all ClaimResult variants handled"),
             }
         }
 
@@ -830,10 +831,10 @@ fn is_prefilter_blocked(task: &Task, ctx: &EvaluationContext) -> bool {
         return false;
     }
     conditions.iter().any(|cond| match cond {
-        Strategy::Concurency(rule) => {
-            let key = db_operation::concurrency_lock_key(rule, &task.metadata);
-            ctx.ko.contains(&key)
-        }
+        Strategy::Concurency(rule) => db_operation::concurrency_slot_key(rule, &task.metadata)
+            .ok()
+            .and_then(|key| ctx.ko.get(&key).copied())
+            .is_some_and(|blocked_threshold| rule.max_concurency <= blocked_threshold),
         Strategy::Capacity(_) => false, // Can't prefilter: sum depends on live progress
     })
 }

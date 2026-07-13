@@ -156,7 +156,7 @@ pub async fn claim_due_outbox<'a>(
                    AND s.status = 'pending'
                    AND s.updated_at > now() - ($2::bigint * interval '1 second')
            )
-         ORDER BY we.created_at ASC
+         ORDER BY we.next_attempt_at ASC, we.created_at ASC, we.id ASC
          LIMIT $1
          FOR UPDATE OF we SKIP LOCKED",
     )
@@ -190,7 +190,9 @@ pub async fn claim_due_outbox_leased<'a>(
 ) -> Result<Vec<WebhookOutbox>, DbError> {
     let rows = diesel::sql_query(
         "UPDATE webhook_outbox we
-         SET next_attempt_at = now() + ($2::bigint * interval '1 second')
+         SET next_attempt_at = now() + ($2::bigint * interval '1 second'),
+             lease_token = gen_random_uuid(),
+             updated_at = now()
          FROM (
              SELECT c.id FROM webhook_outbox c
              WHERE c.next_attempt_at <= now()
@@ -201,7 +203,7 @@ pub async fn claim_due_outbox_leased<'a>(
                        AND s.status = 'pending'
                        AND s.updated_at > now() - ($3::bigint * interval '1 second')
                )
-             ORDER BY c.created_at ASC
+             ORDER BY c.next_attempt_at ASC, c.created_at ASC, c.id ASC
              LIMIT $1
              FOR UPDATE SKIP LOCKED
          ) AS claimed
@@ -222,23 +224,37 @@ pub async fn claim_due_outbox_leased<'a>(
 /// original id/timestamps/attempts, `updated_at = now()`, no error). A single CTE, so the
 /// row can never be lost between the two tables. `ON CONFLICT DO NOTHING` guards the rare
 /// case where a history row for the key already exists.
-pub async fn mark_outbox_success<'a>(conn: &mut Conn<'a>, key: &str) -> Result<(), DbError> {
-    diesel::sql_query(
+pub async fn mark_outbox_success<'a>(
+    conn: &mut Conn<'a>,
+    key: &str,
+    lease_token: uuid::Uuid,
+) -> Result<bool, DbError> {
+    #[derive(diesel::QueryableByName)]
+    struct Marked {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        marked: bool,
+    }
+    let result: Marked = diesel::sql_query(
         "WITH del AS (
-            DELETE FROM webhook_outbox WHERE idempotency_key = $1 RETURNING *
-        )
-        INSERT INTO webhook_execution
+            DELETE FROM webhook_outbox
+            WHERE idempotency_key = $1 AND lease_token = $2
+            RETURNING *
+        ), ins AS (
+          INSERT INTO webhook_execution
             (id, task_id, batch_id, trigger, condition, idempotency_key,
              status, attempts, created_at, updated_at, next_attempt_at, last_error)
-        SELECT id, task_id, batch_id, trigger, condition, idempotency_key,
-               'success', attempts, created_at, now(), next_attempt_at, NULL
-        FROM del
-        ON CONFLICT (idempotency_key) DO NOTHING",
+          SELECT id, task_id, batch_id, trigger, condition, idempotency_key,
+                 'success', attempts, created_at, now(), next_attempt_at, NULL
+          FROM del
+          ON CONFLICT (idempotency_key) DO NOTHING
+        )
+        SELECT EXISTS(SELECT 1 FROM del) AS marked",
     )
     .bind::<diesel::sql_types::Text, _>(key)
-    .execute(conn)
+    .bind::<diesel::sql_types::Uuid, _>(lease_token)
+    .get_result(conn)
     .await?;
-    Ok(())
+    Ok(result.marked)
 }
 
 /// Record a failed delivery attempt: increment `attempts`, store `last_error`, and
@@ -246,25 +262,28 @@ pub async fn mark_outbox_success<'a>(conn: &mut Conn<'a>, key: &str) -> Result<(
 pub async fn mark_outbox_retry<'a>(
     conn: &mut Conn<'a>,
     key: &str,
+    lease_token: uuid::Uuid,
     error: &str,
     backoff_secs: i64,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     // Truncate overly-long error bodies to keep the row bounded.
     let trimmed: String = error.chars().take(1000).collect();
-    diesel::sql_query(
+    let rows = diesel::sql_query(
         "UPDATE webhook_outbox
          SET attempts = attempts + 1,
              last_error = $2,
              next_attempt_at = now() + ($3::bigint * interval '1 second'),
-             updated_at = now()
-         WHERE idempotency_key = $1",
+             updated_at = now(),
+             lease_token = NULL
+         WHERE idempotency_key = $1 AND lease_token = $4",
     )
     .bind::<diesel::sql_types::Text, _>(key)
     .bind::<diesel::sql_types::Text, _>(trimmed)
     .bind::<diesel::sql_types::BigInt, _>(backoff_secs)
+    .bind::<diesel::sql_types::Uuid, _>(lease_token)
     .execute(conn)
     .await?;
-    Ok(())
+    Ok(rows > 0)
 }
 
 /// Mark a queue row permanently failed after exhausting retries: DELETE it from
@@ -274,26 +293,37 @@ pub async fn mark_outbox_retry<'a>(
 pub async fn mark_outbox_exhausted<'a>(
     conn: &mut Conn<'a>,
     key: &str,
+    lease_token: uuid::Uuid,
     error: &str,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     let trimmed: String = error.chars().take(1000).collect();
-    diesel::sql_query(
+    #[derive(diesel::QueryableByName)]
+    struct Marked {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        marked: bool,
+    }
+    let result: Marked = diesel::sql_query(
         "WITH del AS (
-            DELETE FROM webhook_outbox WHERE idempotency_key = $1 RETURNING *
-        )
-        INSERT INTO webhook_execution
+            DELETE FROM webhook_outbox
+            WHERE idempotency_key = $1 AND lease_token = $3
+            RETURNING *
+        ), ins AS (
+          INSERT INTO webhook_execution
             (id, task_id, batch_id, trigger, condition, idempotency_key,
              status, attempts, created_at, updated_at, next_attempt_at, last_error)
-        SELECT id, task_id, batch_id, trigger, condition, idempotency_key,
-               'exhausted', attempts + 1, created_at, now(), next_attempt_at, $2
-        FROM del
-        ON CONFLICT (idempotency_key) DO NOTHING",
+          SELECT id, task_id, batch_id, trigger, condition, idempotency_key,
+                 'exhausted', attempts + 1, created_at, now(), next_attempt_at, $2
+          FROM del
+          ON CONFLICT (idempotency_key) DO NOTHING
+        )
+        SELECT EXISTS(SELECT 1 FROM del) AS marked",
     )
     .bind::<diesel::sql_types::Text, _>(key)
     .bind::<diesel::sql_types::Text, _>(trimmed)
-    .execute(conn)
+    .bind::<diesel::sql_types::Uuid, _>(lease_token)
+    .get_result(conn)
     .await?;
-    Ok(())
+    Ok(result.marked)
 }
 
 /// List webhook delivery records for `GET /webhook-deliveries`, optionally filtered by

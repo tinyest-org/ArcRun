@@ -52,9 +52,16 @@ pub(crate) async fn list_batches<'a>(
     let kind_filter = filter.kind.map(|k| escape_like_pattern(&k));
     let name_filter = filter.name.map(|n| escape_like_pattern(&n));
     let search_filter = filter.search.map(|s| escape_like_pattern(&s));
-    // Invalid JSON in the metadata filter is treated as "no filter" (mirrors task filtering).
-    let metadata_filter: Option<serde_json::Value> =
-        filter.metadata.and_then(|m| serde_json::from_str(&m).ok());
+    // A malformed filter must never silently broaden the result set. Surface the same
+    // validation error semantics as GET /task instead of turning invalid JSON into NULL.
+    let metadata_filter: Option<serde_json::Value> = match filter.metadata {
+        None => None,
+        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
+            crate::error::ArcRunError::Validation(format!(
+                "invalid `metadata` filter: expected valid JSON ({e})"
+            ))
+        })?),
+    };
 
     let rows = diesel::sql_query(
         r#"
@@ -246,9 +253,9 @@ pub(crate) async fn get_batch_stats<'a>(
     }))
 }
 
-/// Update the concurrency/capacity rules (`start_condition`) for all non-terminal
-/// tasks of a given kind in a batch. Returns the number of tasks updated, or
-/// NotFound if no tasks exist for the batch.
+/// Update concurrency/capacity rules for pre-claim tasks (Waiting/Pending/Paused) of a
+/// given kind in a batch. Claimed/Running and terminal tasks are immutable here.
+/// Returns the number of tasks updated, or NotFound if no tasks exist for the batch.
 #[tracing::instrument(name = "update_batch_rules", skip(conn, new_rules), fields(batch_id = %bid, kind = %task_kind))]
 pub(crate) async fn update_batch_rules<'a>(
     conn: &mut Conn<'a>,
@@ -271,15 +278,16 @@ pub(crate) async fn update_batch_rules<'a>(
         });
     }
 
-    // Update non-terminal tasks of the specified kind
+    // Update only tasks that have not acquired execution slots yet. Claimed/Running
+    // tasks must finish with the exact rule set whose slot keys they persisted at claim
+    // time; mutating their rules here would make the visible rules diverge from the slots
+    // they actually hold. Paused tasks are safe because only Pending tasks can be claimed.
     let updated = diesel::update(
         dsl::task.filter(
             dsl::batch_id.eq(bid).and(dsl::kind.eq(task_kind)).and(
                 dsl::status
                     .eq(StatusKind::Waiting)
                     .or(dsl::status.eq(StatusKind::Pending))
-                    .or(dsl::status.eq(StatusKind::Claimed))
-                    .or(dsl::status.eq(StatusKind::Running))
                     .or(dsl::status.eq(StatusKind::Paused)),
             ),
         ),

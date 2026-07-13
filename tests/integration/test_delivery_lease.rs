@@ -193,6 +193,57 @@ async fn test_lease_expires_and_redelivers() {
     let _ = shutdown_server.send(());
 }
 
+/// A worker finishing after its lease expired must not be able to delete or reschedule
+/// a row that a newer worker has reclaimed.
+#[tokio::test]
+async fn test_stale_lease_token_cannot_mark_reclaimed_row() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (url, shutdown_server) = spawn_webhook_server(hits);
+    let task_id = task_with_success_webhook(&app, &state, "lease-fence", &url).await;
+
+    let mut conn = state.pool.get().await.unwrap();
+    let first = arcrun::db_operation::claim_due_outbox_leased(&mut conn, 1, 120, 30)
+        .await
+        .unwrap();
+    let old_token = first[0].lease_token.expect("claim assigns a lease token");
+    drop(conn);
+
+    expire_leases(&state.pool).await;
+    let mut conn = state.pool.get().await.unwrap();
+    let second = arcrun::db_operation::claim_due_outbox_leased(&mut conn, 1, 120, 30)
+        .await
+        .unwrap();
+    let current_token = second[0]
+        .lease_token
+        .expect("reclaim assigns a lease token");
+    assert_ne!(old_token, current_token);
+
+    assert!(
+        !arcrun::db_operation::mark_outbox_success(&mut conn, &first[0].idempotency_key, old_token)
+            .await
+            .unwrap(),
+        "stale worker mark is fenced out"
+    );
+    assert_eq!(outbox_count(&state.pool, task_id, "pending").await, 1);
+    assert!(
+        arcrun::db_operation::mark_outbox_success(
+            &mut conn,
+            &second[0].idempotency_key,
+            current_token,
+        )
+        .await
+        .unwrap(),
+        "current lease owner can mark the row"
+    );
+    drop(conn);
+    assert_eq!(outbox_count(&state.pool, task_id, "success").await, 1);
+
+    let _ = shutdown_server.send(());
+}
+
 /// Parallelism: N rows whose webhooks each take ~500ms must be delivered concurrently,
 /// so a single `run_delivery_once` finishes in ~1 delay, not ~N delays.
 #[tokio::test]

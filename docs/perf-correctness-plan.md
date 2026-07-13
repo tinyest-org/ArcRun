@@ -125,7 +125,7 @@ success) ; (3) **livraison HTTP hors-tx en parallèle** via
 tenue, actions d'une même ligne séquentielles ; (4) **marks en statements courts autocommit**
 (`mark_outbox_*` ; une erreur de mark est loggée et ignorée — ne rollback plus les marks déjà
 posés ; le bail relivre). Signature de `run_delivery_once(evaluator, conn, cfg)` inchangée
-(pilotage déterministe des tests). 2 nouveaux env : `WEBHOOK_DELIVERY_LEASE_SECS` (120,
+(pilotage déterministe des tests). 2 nouveaux env : `WEBHOOK_DELIVERY_LEASE_SECS` (210,
 >= 1), `WEBHOOK_DELIVERY_CONCURRENCY` (10, >= 1). 4 nouveaux tests d'intégration dans
 `tests/integration/test_delivery_lease.rs` (anti double-claim, expiration du bail,
 parallélisme wall-clock, indépendance des marks). 180 tests d'intégration verts.

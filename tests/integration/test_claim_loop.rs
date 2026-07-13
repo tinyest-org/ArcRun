@@ -174,6 +174,52 @@ async fn test_head_of_line_eligible_low_priority_claimed() {
     }
 }
 
+/// A saturation proof is threshold-specific. Seeing `used >= 1` for a high-priority
+/// candidate must not pre-filter a later candidate that allows `used < 2` on the same
+/// canonical slot.
+#[actix_web::test]
+async fn test_prefilter_keeps_same_slot_candidate_with_higher_threshold() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+    let kind = "threshold-kind";
+
+    let blocker = task_with_priority("threshold-blocker", kind, 0, Some(conc_rule(kind, 1)));
+    let created = create_tasks_ok(&app, &[blocker]).await;
+    make_running_consuming(&state, created[0].id, kind, 1).await;
+
+    let candidates = vec![
+        task_with_priority("strict", kind, 200, Some(conc_rule(kind, 1))),
+        task_with_priority("permissive", kind, 100, Some(conc_rule(kind, 2))),
+    ];
+    let created = create_tasks_ok(&app, &candidates).await;
+    let strict = created[0].id;
+    let permissive = created[1].id;
+
+    let mut conn = state.pool.get().await.unwrap();
+    let claimed = arcrun::workers::run_claim_loop(&mut conn, 50, 500).await;
+    drop(conn);
+
+    assert!(!claimed.iter().any(|task| task.id == strict));
+    assert!(
+        claimed.iter().any(|task| task.id == permissive),
+        "the higher threshold remains eligible after the strict candidate is blocked"
+    );
+    assert_task_status(
+        &app,
+        strict,
+        StatusKind::Pending,
+        "strict task stays Pending",
+    )
+    .await;
+    assert_task_status(
+        &app,
+        permissive,
+        StatusKind::Claimed,
+        "permissive task is Claimed",
+    )
+    .await;
+}
+
 // =============================================================================
 // 2. Claim cap respected
 // =============================================================================

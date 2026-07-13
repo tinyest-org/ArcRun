@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -371,36 +372,84 @@ impl ActionExecutor {
             ));
         }
         if status.is_success() {
-            metrics::record_webhook_execution(
-                trigger_str,
-                "success",
-                started_at.elapsed().as_secs_f64(),
-            );
-            Ok(match response.text().await {
-                Ok(body) => {
-                    log::info!("query with success: -> {}", &body);
+            let result = match read_response_body_limited(response).await {
+                Ok((body, false)) => {
+                    log::debug!(
+                        "Webhook returned a successful response body ({} bytes)",
+                        body.len()
+                    );
                     match serde_json::from_str(&body) {
-                        Ok(dto) => Some(dto),
+                        Ok(dto) => Ok(Some(dto)),
                         Err(e) => {
                             log::debug!("Response body did not parse as NewActionDto: {}", e);
-                            None
+                            Ok(None)
                         }
                     }
                 }
-                Err(_) => {
-                    log::info!("query with success");
-                    None
+                Ok((_body, true)) if trigger_str != "start" => {
+                    // Notification responses do not drive control flow. A large body is
+                    // ignored after the cap instead of allocating it or retrying a
+                    // delivery that already succeeded remotely.
+                    log::warn!(
+                        "Webhook response body exceeded {} bytes and was truncated",
+                        MAX_WEBHOOK_RESPONSE_BYTES
+                    );
+                    Ok(None)
                 }
-            })
+                Ok((_body, true)) => Err(format!(
+                    "on_start response body exceeds {} bytes",
+                    MAX_WEBHOOK_RESPONSE_BYTES
+                )),
+                Err(e) => Err(e),
+            };
+            metrics::record_webhook_execution(
+                trigger_str,
+                if result.is_ok() { "success" } else { "failure" },
+                started_at.elapsed().as_secs_f64(),
+            );
+            result
         } else {
             metrics::record_webhook_execution(
                 trigger_str,
                 "failure",
                 started_at.elapsed().as_secs_f64(),
             );
-            let body = response.text().await.unwrap_or_default();
-            log::error!("Response ({}): {}", status, body);
+            let body = read_response_body_limited(response)
+                .await
+                .map(|(body, truncated)| {
+                    if truncated {
+                        format!("{body}…[truncated]")
+                    } else {
+                        body
+                    }
+                })
+                .unwrap_or_default();
+            log::error!("Webhook response status {} (body capped): {}", status, body);
             Err(format!("Request failed with status: {}", status))
         }
     }
+}
+
+/// Hard cap for response bodies controlled by webhook targets. The on_start body may
+/// contain one cancel action, so 64 KiB is ample while preventing an untrusted peer from
+/// forcing an unbounded allocation or log write.
+const MAX_WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
+
+async fn read_response_body_limited(response: reqwest::Response) -> Result<(String, bool), String> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(4096);
+    let mut truncated = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read webhook response: {e}"))?;
+        let remaining = MAX_WEBHOOK_RESPONSE_BYTES.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok((String::from_utf8_lossy(&body).into_owned(), truncated))
 }

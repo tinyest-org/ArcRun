@@ -1,4 +1,4 @@
-use crate::{Conn, models::StatusKind};
+use crate::Conn;
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -26,23 +26,48 @@ pub async fn cleanup_old_terminal_tasks<'a>(
     retention_days: u32,
     batch_size: i64,
 ) -> Result<usize, DbError> {
-    use crate::schema::task::dsl as task_dsl;
-
     let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
 
-    // Find task IDs eligible for cleanup
-    let task_ids: Vec<uuid::Uuid> = task_dsl::task
-        .filter(
-            task_dsl::status
-                .eq(StatusKind::Success)
-                .or(task_dsl::status.eq(StatusKind::Failure))
-                .or(task_dsl::status.eq(StatusKind::Canceled)),
-        )
-        .filter(task_dsl::ended_at.le(cutoff))
-        .select(task_dsl::id)
-        .limit(batch_size)
-        .load::<uuid::Uuid>(conn)
-        .await?;
+    #[derive(diesel::QueryableByName)]
+    struct TaskIdRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
+
+    // A terminal task is not eligible while its own notification is queued. Batch
+    // members are also retained from the first terminal member until batch_complete
+    // reaches a terminal delivery state: while `remaining > 0` no signal exists yet,
+    // then the outbox-row guard covers the queued signal. Batch enrichment is computed
+    // from hot `task` rows at delivery time, so archiving one early would under-count it.
+    let task_ids: Vec<uuid::Uuid> = diesel::sql_query(
+        "SELECT t.id
+         FROM task t
+         WHERE t.status IN ('success', 'failure', 'canceled')
+           AND t.ended_at <= $1
+           AND NOT EXISTS (
+               SELECT 1 FROM webhook_outbox wo WHERE wo.task_id = t.id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM webhook_outbox wo WHERE wo.batch_id = t.batch_id
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM batch b
+               WHERE b.id = t.batch_id
+                 AND jsonb_typeof(b.on_complete) = 'array'
+                 AND jsonb_array_length(b.on_complete) > 0
+                 AND b.remaining > 0
+           )
+         ORDER BY t.ended_at, t.id
+         LIMIT $2",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .bind::<diesel::sql_types::BigInt, _>(batch_size)
+    .load::<TaskIdRow>(conn)
+    .await?
+    .into_iter()
+    .map(|row| row.id)
+    .collect();
 
     if task_ids.is_empty() {
         return Ok(0);
@@ -54,6 +79,7 @@ pub async fn cleanup_old_terminal_tasks<'a>(
         Box::pin(async move {
             use crate::schema::action::dsl as action_dsl;
             use crate::schema::link::dsl as link_dsl;
+            use crate::schema::task::dsl as task_dsl;
             use crate::schema::webhook_execution::dsl as we_dsl;
             use crate::schema::webhook_outbox::dsl as wo_dsl;
 

@@ -213,6 +213,19 @@ async fn test_batches_filter_by_metadata_containment() {
     );
 }
 
+/// Invalid JSON must not silently turn into an unfiltered listing.
+#[tokio::test]
+async fn test_batches_reject_malformed_metadata_filter() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let req = actix_web::test::TestRequest::get()
+        .uri("/batches?metadata=%7Bnot-json%7D")
+        .to_request();
+    let response = actix_web::test::call_service(&app, req).await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+}
+
 // ============================================================================
 // Search: substring across scope + metadata text
 // ============================================================================

@@ -67,10 +67,61 @@ async fn backdate_archived_at(pool: &arcrun::DbPool, id: uuid::Uuid, days: i64) 
 }
 
 async fn run_cleanup(state: &arcrun::handlers::AppState) -> usize {
+    // Normal production cleanup runs behind the delivery worker. Empty-action end
+    // signals are nevertheless enqueued transactionally, so drain their fast-path
+    // before exercising archive behavior unrelated to pending delivery.
+    drain_outbox(state).await;
+    run_cleanup_without_draining(state).await
+}
+
+async fn run_cleanup_without_draining(state: &arcrun::handlers::AppState) -> usize {
     let mut conn = state.pool.get().await.unwrap();
     arcrun::db_operation::cleanup_old_terminal_tasks(&mut conn, 30, 1000)
         .await
         .unwrap()
+}
+
+/// Retention must never destroy an at-least-once notification that has not reached a
+/// terminal delivery state yet.
+#[tokio::test]
+async fn test_pending_task_outbox_blocks_archival() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let created = create_tasks_ok(
+        &app,
+        &[task_with_metadata(
+            "pending-outbox",
+            "Pending outbox",
+            "archive-kind",
+            json!({}),
+        )],
+    )
+    .await;
+    let id = created[0].id;
+    succeed_task(&state, id).await;
+    backdate_ended_at(&state.pool, id, 40).await;
+
+    assert_eq!(
+        count_by_id(
+            &state.pool,
+            "SELECT COUNT(*) AS count FROM webhook_outbox WHERE task_id = $1",
+            id,
+        )
+        .await,
+        1
+    );
+    assert_eq!(run_cleanup_without_draining(&state).await, 0);
+    assert_eq!(
+        task_count(&state.pool, id).await,
+        1,
+        "hot task is preserved"
+    );
+    assert_eq!(archive_count(&state.pool, id).await, 0);
+
+    drain_outbox(&state).await;
+    assert_eq!(run_cleanup_without_draining(&state).await, 1);
+    assert_eq!(archive_count(&state.pool, id).await, 1);
 }
 
 /// A terminal task older than the retention window is MOVED out of `task` and INTO

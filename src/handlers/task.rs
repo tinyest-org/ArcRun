@@ -263,6 +263,18 @@ pub async fn add_task(
 
     // Validate the batch-complete actions (SSRF etc.) the same way as task actions.
     if let Some(ref actions) = on_batch_complete {
+        let max_actions = validation::get_limits_config().max_actions_per_task;
+        if actions.len() > max_actions {
+            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Validation failed",
+                "batch_id": batch_id,
+                "details": [format!(
+                    "on_batch_complete cannot exceed {} actions (received {})",
+                    max_actions,
+                    actions.len()
+                )]
+            })));
+        }
         for (i, action) in actions.iter().enumerate() {
             if let Err(e) = validation::validate_action_params(&action.kind, &action.params) {
                 let msg = format!("on_batch_complete[{}].params: {}", i, e);

@@ -305,7 +305,7 @@ impl Default for WorkerConfig {
             webhook_max_attempts: 10,
             webhook_retry_backoff_base_secs: 2,
             webhook_retry_backoff_cap_secs: 300,
-            webhook_delivery_lease_secs: 120,
+            webhook_delivery_lease_secs: 210,
             webhook_delivery_concurrency: 10,
             metrics_sampler_interval: Duration::from_secs(15),
         }
@@ -413,7 +413,7 @@ impl Config {
     /// - `CIRCUIT_BREAKER_FAILURE_WINDOW_SECS`: Failure counting window (default: 10)
     /// - `CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECS`: Time before half-open (default: 30)
     /// - `CIRCUIT_BREAKER_SUCCESS_THRESHOLD`: Successes to close (default: 2)
-    /// - `WEBHOOK_DELIVERY_LEASE_SECS`: Lease applied to an outbox row at claim time, in seconds; must be >= 1 and exceed worst-case single-row delivery time (default: 120)
+    /// - `WEBHOOK_DELIVERY_LEASE_SECS`: Lease applied to an outbox row at claim time, in seconds; must be >= 1 and exceed worst-case single-row delivery time (default: 210)
     /// - `WEBHOOK_DELIVERY_CONCURRENCY`: Max concurrent HTTP deliveries per delivery-loop batch; must be >= 1 (default: 10)
     /// - `SLOW_QUERY_THRESHOLD_MS`: Threshold for slow query warnings in ms (default: 100)
     /// - `TRACING_ENABLED`: Enable distributed tracing (default: false)
@@ -475,7 +475,7 @@ impl Config {
             webhook_max_attempts: parse_env_or("WEBHOOK_MAX_ATTEMPTS", 10)?,
             webhook_retry_backoff_base_secs: parse_env_or("WEBHOOK_RETRY_BACKOFF_BASE_SECS", 2)?,
             webhook_retry_backoff_cap_secs: parse_env_or("WEBHOOK_RETRY_BACKOFF_CAP_SECS", 300)?,
-            webhook_delivery_lease_secs: parse_env_or("WEBHOOK_DELIVERY_LEASE_SECS", 120)?,
+            webhook_delivery_lease_secs: parse_env_or("WEBHOOK_DELIVERY_LEASE_SECS", 210)?,
             webhook_delivery_concurrency: parse_env_or("WEBHOOK_DELIVERY_CONCURRENCY", 10)?,
             metrics_sampler_interval: Duration::from_secs(parse_env_or(
                 "METRICS_SAMPLER_INTERVAL_SECS",
@@ -715,6 +715,21 @@ impl Config {
                 field: "MAX_ACTIONS_PER_TASK".to_string(),
                 message: "Must be greater than 0".to_string(),
             });
+        }
+
+        let worst_case_delivery_secs = (self.limits.max_actions_per_task as u64)
+            .saturating_mul(WEBHOOK_HTTP_TIMEOUT_SECS)
+            .saturating_add(WEBHOOK_HTTP_TIMEOUT_SECS);
+        if (self.worker.webhook_delivery_lease_secs as u64) < worst_case_delivery_secs {
+            log::warn!(
+                "WEBHOOK_DELIVERY_LEASE_SECS ({}) is below the configured worst-case \
+                 sequential delivery duration ({}s for {} actions). Lease fencing keeps \
+                 stale workers from corrupting state, but duplicate HTTP delivery remains \
+                 possible; raise the lease or lower MAX_ACTIONS_PER_TASK",
+                self.worker.webhook_delivery_lease_secs,
+                worst_case_delivery_secs,
+                self.limits.max_actions_per_task
+            );
         }
 
         if self.payload_max_bytes == 0 {

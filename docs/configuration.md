@@ -49,7 +49,7 @@ All configuration is via environment variables (loaded in `src/config.rs`).
 |----------|---------|-------------|
 | `WEBHOOK_DELIVERY_INTERVAL_MS` | `1000` | Interval between webhook delivery-loop iterations (outbox drain) |
 | `WEBHOOK_DELIVERY_BATCH_SIZE` | `50` | Max outbox rows claimed per delivery-loop iteration |
-| `WEBHOOK_DELIVERY_LEASE_SECS` | `120` | Must be >= 1. Lease applied to an outbox row at claim time; the row is not re-claimable until the lease expires. Must exceed the worst-case single-row delivery time so an in-flight delivery is never double-claimed. |
+| `WEBHOOK_DELIVERY_LEASE_SECS` | `210` | Must be >= 1. Lease applied to an outbox row at claim time. Each claim is fenced by a unique token; keep this above the worst-case sequential action duration to avoid duplicate HTTP delivery. |
 | `WEBHOOK_DELIVERY_CONCURRENCY` | `10` | Must be >= 1. Max concurrent HTTP deliveries within one delivery-loop batch (`buffer_unordered` bound) |
 | `WEBHOOK_MAX_ATTEMPTS` | `10` | Delivery attempts before an outbox row is marked `exhausted` |
 | `WEBHOOK_RETRY_BACKOFF_BASE_SECS` | `2` | Base of the exponential retry backoff (delay = base^attempt, capped) |
@@ -61,7 +61,7 @@ All configuration is via environment variables (loaded in `src/config.rs`).
 |----------|---------|-------------|
 | `MAX_TASKS_PER_BATCH` | `1000` | Max tasks accepted in one `POST /task` batch. Over the limit ⇒ 400. |
 | `MAX_DEPS_PER_TASK` | `100` | Max dependencies a single task may declare. Over ⇒ 400. |
-| `MAX_ACTIONS_PER_TASK` | `20` | Max actions per task (on_start + on_failure + on_success). Over ⇒ 400. |
+| `MAX_ACTIONS_PER_TASK` | `20` | Max actions per task (on_start + on_failure + on_success), and max `on_batch_complete` actions. Over ⇒ 400. |
 | `PAYLOAD_MAX_BYTES` | 2 MiB | Explicit `web::JsonConfig` body-size cap; larger request bodies ⇒ 413. Matches the historical implicit actix default, so non-breaking. |
 
 ## Circuit Breaker

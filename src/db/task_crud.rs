@@ -551,6 +551,28 @@ pub enum ClaimResult {
     AlreadyClaimed,
 }
 
+/// Exact concurrency slot that rejected a rule-bearing claim.  This is deliberately
+/// separate from [`ClaimResult`], whose public shape is kept stable for callers that only
+/// care about claimed/blocked/already-claimed.  The start-loop uses this detail to maintain
+/// a sound negative cache: a Capacity failure, or a different Concurrency rule on the same
+/// task, must never poison an unrelated concurrency key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedConcurrency {
+    pub key: String,
+    pub threshold: i32,
+}
+
+pub(crate) struct RuleClaimOutcome {
+    pub result: ClaimResult,
+    pub blocked_concurrency: Option<BlockedConcurrency>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    Concurrency,
+    Capacity,
+}
+
 /// Re-export slot key functions from rule module for use by other crates/modules.
 pub(crate) use rule::capacity_slot_key;
 pub(crate) use rule::concurrency_slot_key;
@@ -568,7 +590,7 @@ struct RuleQueryParams {
     /// order gives every worker one canonical slot-lock acquisition order (A9 deadlock
     /// discipline). `cap:` sorts before `conc:` lexicographically — consistent, so the
     /// global slot-lock order stays well-defined across both prefixes.
-    slots: Vec<(String, i32, i32)>,
+    slots: Vec<(String, i32, i32, SlotKind)>,
     /// The capacity charge to persist in `task.capacity_charge` — `Some(charge)` when the
     /// task has ≥1 Capacity rule (charge is task-level, identical for every `cap:` key),
     /// `None` when it has none (column stays/goes NULL).
@@ -586,7 +608,7 @@ impl RuleQueryParams {
 
         // BTreeMap: dedup by canonical key + deterministic (sorted) iteration order.
         // Value = (increment, threshold).
-        let mut slot_map: std::collections::BTreeMap<String, (i32, i32)> =
+        let mut slot_map: std::collections::BTreeMap<String, (i32, i32, SlotKind)> =
             std::collections::BTreeMap::new();
         let mut has_capacity = false;
         let mut capacity_charge: i32 = 0;
@@ -616,8 +638,8 @@ impl RuleQueryParams {
                     let threshold = concurrency_rule.max_concurency;
                     slot_map
                         .entry(key)
-                        .and_modify(|(_inc, thr)| *thr = (*thr).min(threshold))
-                        .or_insert((1, threshold));
+                        .and_modify(|(_inc, thr, _kind)| *thr = (*thr).min(threshold))
+                        .or_insert((1, threshold, SlotKind::Concurrency));
                 }
                 Strategy::Capacity(capacity_rule) => {
                     // Canonical `cap:` slot key. A missing required metadata field blocks.
@@ -669,11 +691,11 @@ impl RuleQueryParams {
                     let threshold = capacity_rule.max_capacity;
                     slot_map
                         .entry(key)
-                        .and_modify(|(inc, thr)| {
+                        .and_modify(|(inc, thr, _kind)| {
                             *inc = charge;
                             *thr = (*thr).min(threshold);
                         })
-                        .or_insert((charge, threshold));
+                        .or_insert((charge, threshold, SlotKind::Capacity));
                 }
             }
         }
@@ -682,7 +704,7 @@ impl RuleQueryParams {
             // BTreeMap iterates in ascending key order → already sorted + deduped.
             slots: slot_map
                 .into_iter()
-                .map(|(k, (inc, thr))| (k, inc, thr))
+                .map(|(k, (inc, thr, kind))| (k, inc, thr, kind))
                 .collect(),
             capacity_charge: if has_capacity {
                 Some(capacity_charge)
@@ -699,7 +721,7 @@ impl RuleQueryParams {
 /// `Err` here and translated back to an `Ok(ClaimResult)` after the tx returns.
 enum ClaimTxAbort {
     /// A concurrency slot was at its limit, or capacity was blocked.
-    RuleBlocked,
+    RuleBlocked(Option<BlockedConcurrency>),
     /// The task left `pending` before the claim UPDATE (another worker won).
     AlreadyClaimed,
     /// A genuine DB error — surfaces to the caller as `Err`.
@@ -745,20 +767,42 @@ pub async fn claim_task_with_rules<'a>(
     conn: &mut Conn<'a>,
     t: &Task,
 ) -> Result<ClaimResult, DbError> {
+    Ok(claim_task_with_rules_detailed(conn, t).await?.result)
+}
+
+/// Detailed variant used by the scheduler. It performs the same single claim attempt as
+/// [`claim_task_with_rules`] but also reports the exact saturated Concurrency slot, when
+/// that is what blocked the transaction. No detail is returned for Capacity failures or
+/// for unevaluable rules, so those outcomes cannot contaminate the concurrency prefilter.
+pub(crate) async fn claim_task_with_rules_detailed<'a>(
+    conn: &mut Conn<'a>,
+    t: &Task,
+) -> Result<RuleClaimOutcome, DbError> {
     // No rules — just do a plain claim (no slot needed). A rule-less task never held a
     // capacity charge (start_condition is immutable), so capacity_charge stays NULL.
     if t.start_condition.0.is_empty() {
-        return match claim_task(conn, &t.id).await? {
-            true => Ok(ClaimResult::Claimed),
-            false => Ok(ClaimResult::AlreadyClaimed),
-        };
+        return Ok(match claim_task(conn, &t.id).await? {
+            true => RuleClaimOutcome {
+                result: ClaimResult::Claimed,
+                blocked_concurrency: None,
+            },
+            false => RuleClaimOutcome {
+                result: ClaimResult::AlreadyClaimed,
+                blocked_concurrency: None,
+            },
+        });
     }
 
     // Pre-compute everything we need before entering the transaction closure.
     let task_id = t.id;
     let params = match RuleQueryParams::from_task(t) {
         Ok(p) => p,
-        Err(result) => return Ok(result),
+        Err(result) => {
+            return Ok(RuleClaimOutcome {
+                result,
+                blocked_concurrency: None,
+            });
+        }
     };
 
     let RuleQueryParams {
@@ -778,7 +822,7 @@ pub async fn claim_task_with_rules<'a>(
                 #[allow(dead_code)]
                 used: i32,
             }
-            for (key, increment, threshold) in &slots {
+            for (key, increment, threshold, kind) in &slots {
                 let row: Option<SlotUsed> = diesel::sql_query(
                     "INSERT INTO rule_slot AS rs (lock_key, used) VALUES ($1, $2)
                      ON CONFLICT (lock_key) DO UPDATE SET used = rs.used + $2
@@ -792,7 +836,11 @@ pub async fn claim_task_with_rules<'a>(
                 .await
                 .optional()?;
                 if row.is_none() {
-                    return Err(ClaimTxAbort::RuleBlocked);
+                    let blocked = (*kind == SlotKind::Concurrency).then(|| BlockedConcurrency {
+                        key: key.clone(),
+                        threshold: *threshold,
+                    });
+                    return Err(ClaimTxAbort::RuleBlocked(blocked));
                 }
             }
 
@@ -801,7 +849,7 @@ pub async fn claim_task_with_rules<'a>(
             //    key or blocks), so `keys` is non-empty here. `capacity_charge` is bound
             //    NULL when the task carries no Capacity rule (explicit, paranoia against a
             //    stale value on a re-claim after release).
-            let keys: Vec<String> = slots.iter().map(|(k, _, _)| k.clone()).collect();
+            let keys: Vec<String> = slots.iter().map(|(k, _, _, _)| k.clone()).collect();
             let claimed_rows = diesel::sql_query(
                 "UPDATE task
                  SET status = 'claimed', last_updated = now(),
@@ -822,9 +870,18 @@ pub async fn claim_task_with_rules<'a>(
         .await;
 
     match tx {
-        Ok(()) => Ok(ClaimResult::Claimed),
-        Err(ClaimTxAbort::RuleBlocked) => Ok(ClaimResult::RuleBlocked),
-        Err(ClaimTxAbort::AlreadyClaimed) => Ok(ClaimResult::AlreadyClaimed),
+        Ok(()) => Ok(RuleClaimOutcome {
+            result: ClaimResult::Claimed,
+            blocked_concurrency: None,
+        }),
+        Err(ClaimTxAbort::RuleBlocked(blocked_concurrency)) => Ok(RuleClaimOutcome {
+            result: ClaimResult::RuleBlocked,
+            blocked_concurrency,
+        }),
+        Err(ClaimTxAbort::AlreadyClaimed) => Ok(RuleClaimOutcome {
+            result: ClaimResult::AlreadyClaimed,
+            blocked_concurrency: None,
+        }),
         Err(ClaimTxAbort::Db(e)) => Err(e),
     }
 }

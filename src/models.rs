@@ -113,7 +113,7 @@ impl From<TaskArchive> for Task {
     }
 }
 
-#[derive(Identifiable, Queryable, Associations, Selectable, PartialEq)]
+#[derive(Identifiable, Queryable, Associations, Selectable, PartialEq, Clone)]
 #[diesel(
     table_name = crate::schema::action,
     belongs_to(Task),
@@ -341,6 +341,9 @@ pub struct WebhookOutbox {
     pub next_attempt_at: chrono::DateTime<Utc>,
     /// Last delivery error message (for diagnostics; copied into the history row).
     pub last_error: Option<String>,
+    /// Fresh ownership token assigned by each leased claim. Marks carrying an older token
+    /// are ignored after the lease has been reclaimed by another worker.
+    pub lease_token: Option<uuid::Uuid>,
 }
 
 /// Task lifecycle status. See the API description for the full state machine.

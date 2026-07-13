@@ -2,7 +2,7 @@ use crate::{Conn, DbPool, db_operation, db_operation::DbError, metrics};
 use actix_web::rt;
 use dashmap::DashMap;
 use diesel_async::RunQueryDsl;
-use std::sync::{Arc, atomic::AtomicI32, atomic::Ordering};
+use std::sync::{Arc, atomic::AtomicI64, atomic::Ordering};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug)]
@@ -14,21 +14,25 @@ pub struct UpdateEvent {
 
 #[derive(Debug, Default)]
 struct Entry {
-    success: AtomicI32,
-    failures: AtomicI32,
+    success: AtomicI64,
+    failures: AtomicI64,
 }
 
 type CountMap = DashMap<uuid::Uuid, Entry>;
 
 /// A single pending counter delta for one task.
-type Update = (uuid::Uuid, i32, i32);
+type Update = (uuid::Uuid, i64, i64);
 
 /// Accumulate one incoming event into the shared map. A single `entry()` call
 /// holds the shard lock for both counter updates.
 fn apply_event(data: &CountMap, evt: &UpdateEvent) {
     let entry = data.entry(evt.task_id).or_default();
-    entry.success.fetch_add(evt.success, Ordering::Relaxed);
-    entry.failures.fetch_add(evt.failures, Ordering::Relaxed);
+    entry
+        .success
+        .fetch_add(i64::from(evt.success), Ordering::Relaxed);
+    entry
+        .failures
+        .fetch_add(i64::from(evt.failures), Ordering::Relaxed);
 }
 
 /// Re-add a set of counts to the map for a later retry (transient-failure path).
@@ -119,8 +123,8 @@ pub async fn batch_updater(
 
             // Cleanup zero entries periodically
             data.retain(|_, entry| {
-                AtomicI32::load(&entry.success, Ordering::Relaxed) != 0
-                    || AtomicI32::load(&entry.failures, Ordering::Relaxed) != 0
+                AtomicI64::load(&entry.success, Ordering::Relaxed) != 0
+                    || AtomicI64::load(&entry.failures, Ordering::Relaxed) != 0
             });
             metrics::set_batch_updater_pending_tasks(data.len());
         }
@@ -164,20 +168,16 @@ async fn flush_updates(updates: Vec<Update>, conn: &mut Conn<'_>, data: &CountMa
 
 /// Per-row recovery after a failed batch flush (anti-poison).
 ///
-/// Each row is applied on its own. Two outcomes:
-/// * **Every** row fails ⇒ the connection / DB is presumed down (a transient
-///   fault): re-queue all counts for the next iteration — no data loss.
-/// * **Some** rows succeed but others fail ⇒ the connection is demonstrably
-///   alive, so the failing rows are *deterministically* faulty (poison). They
-///   are dropped and logged (with a failure metric) so the pipeline keeps
-///   flowing; the succeeding rows are already persisted.
+/// Each row is applied on its own. A row that no longer matches because the task is
+/// terminal/missing is intentionally consumed. Every database error is re-queued,
+/// independently of sibling outcomes: one successful statement does not prove that
+/// another error is deterministic, and dropping it would lose acknowledged progress.
 async fn recover_per_row(updates: Vec<Update>, conn: &mut Conn<'_>, data: &CountMap) {
-    let mut succeeded = 0usize;
     let mut failed: Vec<(Update, DbError)> = Vec::new();
 
     for update in updates {
         match handle_one_with_counts(update.0, conn, update.1, update.2).await {
-            Ok(()) => succeeded += 1,
+            Ok(_) => {}
             Err(e) => failed.push((update, e)),
         }
     }
@@ -186,27 +186,17 @@ async fn recover_per_row(updates: Vec<Update>, conn: &mut Conn<'_>, data: &Count
         return;
     }
 
-    if succeeded == 0 {
-        // Whole connection appears down -> transient, keep the data for retry.
+    for ((task_id, success, failures), error) in &failed {
         log::error!(
-            "Per-row recovery: all {} rows failed (DB appears unavailable), re-queuing for retry",
-            failed.len()
+            "Per-row recovery failed for task={} (+{} success, +{} failures): {:?}; re-queuing",
+            task_id,
+            success,
+            failures,
+            error
         );
-        requeue(data, failed.into_iter().map(|(u, _)| u));
         metrics::record_batch_update_failure();
-    } else {
-        // Connection is alive but these specific rows keep failing -> poison.
-        for ((task_id, s, f), e) in failed {
-            log::error!(
-                "Dropping poison batch-update row task={} (+{} success, +{} failures): {:?}",
-                task_id,
-                s,
-                f,
-                e
-            );
-            metrics::record_batch_update_failure();
-        }
     }
+    requeue(data, failed.into_iter().map(|(update, _)| update));
 }
 
 /// Flush all remaining batch data to the database before shutdown.
@@ -260,15 +250,18 @@ async fn final_flush_batch_data(data: &CountMap, pool: &DbPool) {
 ///   `bigint` so `int + int` can never overflow, then clamped back to `int4`'s
 ///   max. Without the cast a large accumulated delta would raise `integer out of
 ///   range` and poison the flush forever.
-async fn handle_batch_with_counts(updates: &[Update], conn: &mut Conn<'_>) -> Result<(), DbError> {
+async fn handle_batch_with_counts(
+    updates: &[Update],
+    conn: &mut Conn<'_>,
+) -> Result<usize, DbError> {
     // A9: sort by task_id so the pre-lock (and the UPDATE it guards) acquire row
     // locks in the same canonical order `propagate_to_children` uses.
     let mut ordered: Vec<Update> = updates.to_vec();
     ordered.sort_by_key(|(id, _, _)| *id);
 
     let ids: Vec<uuid::Uuid> = ordered.iter().map(|(id, _, _)| *id).collect();
-    let successes: Vec<i32> = ordered.iter().map(|(_, s, _)| *s).collect();
-    let fail_counts: Vec<i32> = ordered.iter().map(|(_, _, f)| *f).collect();
+    let successes: Vec<i64> = ordered.iter().map(|(_, s, _)| *s).collect();
+    let fail_counts: Vec<i64> = ordered.iter().map(|(_, _, f)| *f).collect();
 
     // A9: pre-lock the target rows in id order, then apply the UNNEST update, in one
     // transaction so the locks are held together. A `40P01` on either statement rolls
@@ -314,18 +307,18 @@ async fn handle_batch_with_counts(updates: &[Update], conn: &mut Conn<'_>) -> Re
             .await?;
 
             // 3. Counter UPDATE.
-            diesel::sql_query(
+            let updated = diesel::sql_query(
                 "UPDATE task SET \
                     success = LEAST(task.success::bigint + batch.s, 2147483647), \
                     failures = LEAST(task.failures::bigint + batch.f, 2147483647), \
                     last_updated = NOW() \
-                FROM UNNEST($1::uuid[], $2::int[], $3::int[]) AS batch(id, s, f) \
+                FROM UNNEST($1::uuid[], $2::bigint[], $3::bigint[]) AS batch(id, s, f) \
                 WHERE task.id = batch.id \
                   AND task.status NOT IN ('success', 'failure', 'canceled')",
             )
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&successes)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&fail_counts)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&successes)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&fail_counts)
             .execute(&mut *conn)
             .await?;
 
@@ -369,7 +362,7 @@ async fn handle_batch_with_counts(updates: &[Update], conn: &mut Conn<'_>) -> Re
                 .await?;
             }
 
-            Ok(())
+            Ok(updated)
         })
     })
     .await
@@ -384,7 +377,11 @@ pub async fn run_counter_flush_once(
     conn: &mut Conn<'_>,
     updates: &[(uuid::Uuid, i32, i32)],
 ) -> Result<(), DbError> {
-    handle_batch_with_counts(updates, conn).await
+    let updates: Vec<Update> = updates
+        .iter()
+        .map(|(id, success, failures)| (*id, i64::from(*success), i64::from(*failures)))
+        .collect();
+    handle_batch_with_counts(&updates, conn).await.map(|_| ())
 }
 
 /// Apply counter update for a single task. Used by the per-row anti-poison
@@ -392,9 +389,9 @@ pub async fn run_counter_flush_once(
 async fn handle_one_with_counts(
     task_id: uuid::Uuid,
     conn: &mut Conn<'_>,
-    success_count: i32,
-    failure_count: i32,
-) -> Result<(), DbError> {
+    success_count: i64,
+    failure_count: i64,
+) -> Result<usize, DbError> {
     handle_batch_with_counts(&[(task_id, success_count, failure_count)], conn).await
 }
 
@@ -423,8 +420,28 @@ mod tests {
             },
         );
         let entry = data.get(&id).unwrap();
-        assert_eq!(AtomicI32::load(&entry.success, Ordering::Relaxed), 5);
-        assert_eq!(AtomicI32::load(&entry.failures, Ordering::Relaxed), 5);
+        assert_eq!(AtomicI64::load(&entry.success, Ordering::Relaxed), 5);
+        assert_eq!(AtomicI64::load(&entry.failures, Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn apply_event_accumulator_does_not_wrap_at_i32_max() {
+        let data = DashMap::new();
+        let id = uuid::Uuid::new_v4();
+        for _ in 0..2 {
+            apply_event(
+                &data,
+                &UpdateEvent {
+                    success: i32::MAX,
+                    failures: 0,
+                    task_id: id,
+                },
+            );
+        }
+        assert_eq!(
+            AtomicI64::load(&data.get(&id).unwrap().success, Ordering::Relaxed),
+            i64::from(i32::MAX) * 2
+        );
     }
 
     #[test]
@@ -456,7 +473,7 @@ mod tests {
 
         // After draining, the counters were swapped to zero.
         assert_eq!(
-            AtomicI32::load(&data.get(&a).unwrap().success, Ordering::Relaxed),
+            AtomicI64::load(&data.get(&a).unwrap().success, Ordering::Relaxed),
             0
         );
     }
@@ -479,15 +496,15 @@ mod tests {
         requeue(&data, vec![(a, 4, 0), (b, 0, 9)]);
 
         assert_eq!(
-            AtomicI32::load(&data.get(&a).unwrap().success, Ordering::Relaxed),
+            AtomicI64::load(&data.get(&a).unwrap().success, Ordering::Relaxed),
             5
         );
         assert_eq!(
-            AtomicI32::load(&data.get(&a).unwrap().failures, Ordering::Relaxed),
+            AtomicI64::load(&data.get(&a).unwrap().failures, Ordering::Relaxed),
             1
         );
         assert_eq!(
-            AtomicI32::load(&data.get(&b).unwrap().failures, Ordering::Relaxed),
+            AtomicI64::load(&data.get(&b).unwrap().failures, Ordering::Relaxed),
             9
         );
     }
@@ -528,7 +545,7 @@ mod tests {
         );
         for id in &ids {
             assert_eq!(
-                AtomicI32::load(&data.get(id).unwrap().success, Ordering::Relaxed),
+                AtomicI64::load(&data.get(id).unwrap().success, Ordering::Relaxed),
                 1
             );
         }

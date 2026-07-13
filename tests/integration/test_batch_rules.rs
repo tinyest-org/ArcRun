@@ -171,6 +171,73 @@ async fn test_update_batch_rules_skips_terminal_tasks() {
     );
 }
 
+/// Claimed/Running tasks may already hold slots derived from their original rules.
+/// Updating their rule JSON in place would make the visible policy disagree with the
+/// slots that will later be released, so only pre-claim states are mutable.
+#[tokio::test]
+async fn test_update_batch_rules_skips_claimed_tasks() {
+    let (_g, state) = setup_test_app().await;
+    let app = test_service!(state);
+
+    let created = create_tasks_ok(
+        &app,
+        &[
+            json!({
+                "id": "claimed",
+                "name": "Claimed",
+                "kind": "rule-active",
+                "timeout": 60,
+                "metadata": {},
+                "on_start": webhook_action()
+            }),
+            json!({
+                "id": "pending",
+                "name": "Pending",
+                "kind": "rule-active",
+                "timeout": 60,
+                "metadata": {},
+                "on_start": webhook_action()
+            }),
+        ],
+    )
+    .await;
+    let batch_id = created[0].batch_id.unwrap();
+
+    let mut conn = state.pool.get().await.unwrap();
+    assert!(
+        arcrun::db_operation::claim_task(&mut conn, &created[0].id)
+            .await
+            .unwrap()
+    );
+    drop(conn);
+
+    let req = actix_web::test::TestRequest::patch()
+        .uri(&format!("/batch/{}/rules", batch_id))
+        .set_json(&json!({
+            "kind": "rule-active",
+            "rules": [{
+                "type": "Concurency",
+                "max_concurency": 2,
+                "matcher": { "kind": "rule-active", "status": "Running", "fields": [] }
+            }]
+        }))
+        .to_request();
+    let response = actix_web::test::call_service(&app, req).await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    let body: UpdateBatchRulesResponseDto = actix_web::test::read_body_json(response).await;
+    assert_eq!(body.updated_count, 1, "only the Pending task is mutable");
+
+    assert!(
+        get_task_ok(&app, created[0].id).await.rules.0.is_empty(),
+        "Claimed task keeps its original rules"
+    );
+    assert_eq!(
+        get_task_ok(&app, created[1].id).await.rules.0.len(),
+        1,
+        "Pending task receives the new rules"
+    );
+}
+
 /// Empty rules array removes all rules for the specified kind.
 #[tokio::test]
 async fn test_update_batch_rules_with_empty_removes_rules() {

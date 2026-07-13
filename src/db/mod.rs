@@ -15,11 +15,14 @@ pub(crate) type DbError = crate::error::ArcRunError;
 
 // Re-exports from task_crud
 pub use crate::rule::concurrency_lock_key;
+pub(crate) use crate::rule::concurrency_slot_key;
 pub use task_crud::{
     ClaimResult, batch_claim_tasks, claim_task, claim_task_with_rules, mark_task_running,
     release_slots_for_tasks,
 };
-pub(crate) use task_crud::{find_detailed_task_by_id, insert_task_batch};
+pub(crate) use task_crud::{
+    claim_task_with_rules_detailed, find_detailed_task_by_id, insert_task_batch,
+};
 
 // Re-exports from task_lifecycle
 pub use task_lifecycle::{UpdateTaskResult, update_running_task};

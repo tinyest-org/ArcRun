@@ -111,7 +111,7 @@ pub async fn get_batch_stats(
     patch,
     path = "/batch/{batch_id}/rules",
     summary = "Update batch rules by kind",
-    description = "Update the concurrency/capacity rules for all non-terminal tasks of a given kind in a batch. Terminal tasks (Success, Failure, Canceled) are not modified. Pass an empty rules array to remove all rules.
+    description = "Update the concurrency/capacity rules for tasks that have not started yet (Waiting, Pending, or Paused) of a given kind in a batch. Claimed/Running tasks keep the rules and slots acquired when they started. Terminal tasks are not modified. Pass an empty rules array to remove all rules.
 
 This is useful when you need to adjust capacity limits or concurrency constraints after a batch has been created — for example, scaling up allowed concurrency mid-run. The `kind` field targets only tasks of that category within the batch.",
     params(("batch_id" = Uuid, Path, description = "The batch UUID (from the X-Batch-ID response header of POST /task)")),
@@ -123,7 +123,7 @@ This is useful when you need to adjust capacity limits or concurrency constraint
     ),
     tag = "batches"
 )]
-/// Update concurrency/capacity rules for non-terminal tasks of a given kind in a batch
+/// Update concurrency/capacity rules for not-yet-active tasks of a given kind in a batch
 pub async fn update_batch_rules(
     state: web::Data<AppState>,
     batch_id: web::Path<Uuid>,
@@ -173,6 +173,7 @@ pub async fn update_batch_rules(
     params(dtos::PaginationDto, dtos::BatchFilterDto),
     responses(
         (status = 200, description = "Paginated array of batch summaries", body = Vec<dtos::BatchSummaryDto>),
+        (status = 400, description = "A filter value is invalid (for example malformed metadata JSON)"),
     ),
     tag = "batches"
 )]
